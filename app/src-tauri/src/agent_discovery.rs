@@ -1,0 +1,1116 @@
+//! Bounded discovery of user-installed clients. Never launches an executable,
+//! reads a native configuration body, or creates a client profile directory.
+#![forbid(unsafe_code)]
+
+use crate::agent_configs::{AgentId, ExistingProfile};
+use serde::Serialize;
+use std::{
+    collections::{BTreeMap, HashSet},
+    ffi::OsString,
+    path::{Component, Path, PathBuf},
+    sync::OnceLock,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+pub(crate) const ORIGINAL_ENVIRONMENT_VARIABLES: &[&str] = &[
+    "HOME",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PATH",
+    "PATHEXT",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+    "CODEX_HOME",
+    "CLAUDE_CONFIG_DIR",
+    "HERMES_HOME",
+    "HERMES_DATA_DIR_SUFFIX",
+    "PI_CODING_AGENT_DIR",
+    "PI_CONFIG_DIR",
+    "OMP_PROFILE",
+    "PI_PROFILE",
+    "OPENCODE_CONFIG",
+    "OPENCODE_CONFIG_DIR",
+    "ZCODE_DATA_BASE_DIR",
+    "ZCODE_STORAGE_DIR",
+    "ZCODE_SESSION_DB_PATH",
+    "ZCODE_SESSION_DB",
+    "ZCODE_PERSONAL_PROVIDER_CONFIG_FILE",
+    "ZCODE_BUILTIN_PROVIDER_CONFIG_FILE",
+    "ZCODE_BETA",
+    "ZCODE_ENV",
+    "WORKBUDDY_CONFIG_DIR",
+    "CODEBUDDY_CONFIG_DIR",
+    "DSH_HOME",
+    "npm_config_prefix",
+    "npm_config_cache",
+    "PNPM_HOME",
+    "PIP_CACHE_DIR",
+    "UV_CACHE_DIR",
+    "PYTHONPYCACHEPREFIX",
+    "GIT_CONFIG_GLOBAL",
+    "CLAUDE_CODE_GIT_BASH_PATH",
+];
+
+const AGENTS: &[AgentId] = &[
+    AgentId::ClaudeCode,
+    AgentId::Codex,
+    AgentId::Hermes,
+    AgentId::OhMyPi,
+    AgentId::OpenCode,
+    AgentId::Zcode,
+    AgentId::WorkBuddy,
+    AgentId::DeepSeekHarness,
+];
+const MAX_PATH_DIRECTORIES: usize = 96;
+const MAX_NAMED_PROFILES: usize = 64;
+const MAX_CLIENTS: usize = 128;
+
+#[derive(Clone)]
+struct Context {
+    environment: BTreeMap<String, OsString>,
+    home: Option<PathBuf>,
+    workspace: Option<PathBuf>,
+    windows: bool,
+}
+
+static ORIGINAL_CONTEXT: OnceLock<Context> = OnceLock::new();
+static ORIGINAL_ENVIRONMENT_NAMES: OnceLock<HashSet<OsString>> = OnceLock::new();
+
+impl Context {
+    fn capture() -> Self {
+        let environment: BTreeMap<String, OsString> = ORIGINAL_ENVIRONMENT_VARIABLES
+            .iter()
+            .filter_map(|name| std::env::var_os(name).map(|value| ((*name).into(), value)))
+            .collect();
+        let home_variable = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        let home = environment
+            .get(home_variable)
+            .map(PathBuf::from)
+            .filter(|path| valid_absolute(path))
+            .or_else(dirs::home_dir);
+        Self {
+            environment,
+            home,
+            workspace: std::env::current_dir().ok(),
+            windows: cfg!(windows),
+        }
+    }
+
+    fn path(&self, variable: &str) -> Option<PathBuf> {
+        self.environment
+            .get(variable)
+            .map(PathBuf::from)
+            .filter(|path| valid_absolute(path))
+    }
+
+    fn name(&self, variable: &str) -> Option<String> {
+        self.environment
+            .get(variable)
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
+            .map(str::to_owned)
+    }
+}
+
+/// Called before portable bootstrap rewrites HOME, XDG, profile variables or PATH.
+pub fn capture_original_environment() {
+    ORIGINAL_ENVIRONMENT_NAMES.get_or_init(|| std::env::vars_os().map(|(name, _)| name).collect());
+    ORIGINAL_CONTEXT.get_or_init(Context::capture);
+}
+
+/// Presence only: never capture authentication, header, or inline-config values.
+pub(crate) fn original_environment_has(name: &str) -> bool {
+    let names = ORIGINAL_ENVIRONMENT_NAMES
+        .get_or_init(|| std::env::vars_os().map(|(name, _)| name).collect());
+    if cfg!(windows) {
+        names
+            .iter()
+            .any(|present| present.to_string_lossy().eq_ignore_ascii_case(name))
+    } else {
+        names.contains(std::ffi::OsStr::new(name))
+    }
+}
+
+/// Paths only: credentials and arbitrary inherited environment are never captured.
+pub(crate) fn original_environment() -> &'static BTreeMap<String, OsString> {
+    &ORIGINAL_CONTEXT.get_or_init(Context::capture).environment
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstalledAgentClient {
+    pub agent_id: AgentId,
+    pub executable_path: String,
+    pub profiles: Vec<ExistingProfile>,
+    pub source: String,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstalledAgentDiscovery {
+    pub clients: Vec<InstalledAgentClient>,
+    /// Milliseconds since Unix epoch, represented as text without a clock dependency.
+    pub scanned_at: String,
+    pub limited: bool,
+    pub notes: Vec<String>,
+}
+
+fn valid_absolute(path: &Path) -> bool {
+    path.is_absolute()
+        && !path
+            .as_os_str()
+            .to_string_lossy()
+            .chars()
+            .any(char::is_control)
+        && !path
+            .components()
+            .any(|part| matches!(part, Component::ParentDir | Component::CurDir))
+        && !path.as_os_str().to_string_lossy().starts_with("\\\\")
+}
+
+fn profile_path(path: &Path) -> bool {
+    if !valid_absolute(path) {
+        return false;
+    }
+    let mut ancestor = PathBuf::new();
+    for part in path.components() {
+        ancestor.push(part);
+        match std::fs::symlink_metadata(&ancestor) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return false;
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    if metadata.file_attributes() & 0x400 != 0 {
+                        return false;
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return false,
+        }
+    }
+    !path.exists() || path.is_dir()
+}
+
+fn command_names(agent: AgentId, windows: bool) -> Vec<String> {
+    let names: &[&str] = if agent == AgentId::WorkBuddy {
+        &["WorkBuddy", "workbuddy"]
+    } else {
+        &[agent.command()]
+    };
+    names
+        .iter()
+        .flat_map(|name| {
+            if windows {
+                vec![
+                    format!("{name}.exe"),
+                    format!("{name}.cmd"),
+                    format!("{name}.bat"),
+                    format!("{name}.ps1"),
+                ]
+            } else {
+                vec![(*name).into()]
+            }
+        })
+        .collect()
+}
+
+fn path_directories(context: &Context, limited: &mut bool) -> Vec<(PathBuf, &'static str)> {
+    let inherited: Vec<PathBuf> = context
+        .environment
+        .get("PATH")
+        .map(|value| std::env::split_paths(value).collect())
+        .unwrap_or_default();
+    if inherited.len() > MAX_PATH_DIRECTORIES || inherited.iter().any(|path| !valid_absolute(path))
+    {
+        *limited = true;
+    }
+    let mut directories: Vec<_> = inherited
+        .into_iter()
+        .take(MAX_PATH_DIRECTORIES)
+        .filter(|path| valid_absolute(path))
+        .map(|path| (path, "PATH"))
+        .collect();
+    if let Some(home) = &context.home {
+        for relative in [".local/bin", ".cargo/bin", ".bun/bin", ".npm-global/bin"] {
+            directories.push((home.join(relative), "known-user-installation"));
+        }
+    }
+    if let Some(prefix) = context.path("npm_config_prefix") {
+        directories.push((prefix.clone(), "npm-prefix"));
+        directories.push((prefix.join("bin"), "npm-prefix"));
+    }
+    if let Some(pnpm) = context.path("PNPM_HOME") {
+        directories.push((pnpm, "PNPM_HOME"));
+    }
+    if context.windows {
+        if let Some(roaming) = context.path("APPDATA") {
+            directories.push((roaming.join("npm"), "known-user-installation"));
+        }
+        if let Some(local) = context.path("LOCALAPPDATA") {
+            for relative in [
+                "Programs/WorkBuddy",
+                "Programs/workbuddy",
+                "WorkBuddy",
+                "hermes/bin",
+                "Programs/Claude",
+                "Programs/opencode",
+            ] {
+                directories.push((local.join(relative), "known-windows-installation"));
+            }
+        }
+        for variable in ["ProgramFiles", "ProgramFiles(x86)"] {
+            if let Some(root) = context.path(variable) {
+                for relative in ["WorkBuddy", "Tencent/WorkBuddy", "Claude", "OpenCode"] {
+                    directories.push((root.join(relative), "known-windows-installation"));
+                }
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    directories.retain(|(path, _)| seen.insert(path.clone()));
+    directories
+}
+
+fn profile(context: &Context, executable: &Path, directory: PathBuf) -> Option<ExistingProfile> {
+    let home = context.home.as_ref()?;
+    let workspace = context
+        .workspace
+        .as_ref()
+        .filter(|path| valid_absolute(path) && path.is_dir())?;
+    if !profile_path(&directory) || !profile_path(home) || !home.is_dir() {
+        return None;
+    }
+    Some(ExistingProfile {
+        directory: directory.to_string_lossy().into_owned(),
+        home_directory: home.to_string_lossy().into_owned(),
+        executable_path: executable.to_string_lossy().into_owned(),
+        workspace_directory: workspace.to_string_lossy().into_owned(),
+        xdg_config_directory: context
+            .path("XDG_CONFIG_HOME")
+            .map(|path| path.to_string_lossy().into_owned()),
+        xdg_data_directory: context
+            .path("XDG_DATA_HOME")
+            .map(|path| path.to_string_lossy().into_owned()),
+        xdg_state_directory: context
+            .path("XDG_STATE_HOME")
+            .map(|path| path.to_string_lossy().into_owned()),
+        xdg_cache_directory: context
+            .path("XDG_CACHE_HOME")
+            .map(|path| path.to_string_lossy().into_owned()),
+        ..ExistingProfile::default()
+    })
+}
+
+fn named_directories(root: &Path, limited: &mut bool) -> Vec<PathBuf> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(_) => {
+            *limited = true;
+            return Vec::new();
+        }
+    };
+    let mut result = Vec::new();
+    // List one documented profiles directory, never descend into histories.
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_NAMED_PROFILES {
+            *limited = true;
+            break;
+        }
+        if let Ok(entry) = entry {
+            let path = entry.path();
+            if path.is_dir() && profile_path(&path) {
+                result.push(path);
+            }
+        }
+    }
+    result.sort();
+    result
+}
+
+fn profiles(
+    context: &Context,
+    agent: AgentId,
+    executable: &Path,
+    limited: &mut bool,
+) -> (Vec<ExistingProfile>, Option<String>) {
+    let Some(home) = context.home.as_ref() else {
+        return (
+            Vec::new(),
+            Some("无法确定原用户 HOME，请手动选择实际配置目录".into()),
+        );
+    };
+    let path_variables: &[&str] = match agent {
+        AgentId::ClaudeCode => &["CLAUDE_CONFIG_DIR"],
+        AgentId::Codex => &["CODEX_HOME"],
+        AgentId::Hermes => &["HERMES_HOME"],
+        AgentId::OhMyPi => &["PI_CODING_AGENT_DIR"],
+        AgentId::OpenCode => &["OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR"],
+        AgentId::Zcode => &[
+            "ZCODE_DATA_BASE_DIR",
+            "ZCODE_STORAGE_DIR",
+            "ZCODE_PERSONAL_PROVIDER_CONFIG_FILE",
+            "ZCODE_BUILTIN_PROVIDER_CONFIG_FILE",
+        ],
+        AgentId::WorkBuddy => &["WORKBUDDY_CONFIG_DIR", "CODEBUDDY_CONFIG_DIR"],
+        AgentId::DeepSeekHarness => &["DSH_HOME"],
+    };
+    for &variable in path_variables {
+        if context.environment.contains_key(variable) && context.path(variable).is_none() {
+            return (
+                Vec::new(),
+                Some(format!(
+                    "原环境中的 {variable} 路径无法安全确认，请手动选择实际配置目录"
+                )),
+            );
+        }
+    }
+    let mut candidates = Vec::new();
+    let mut reason = None;
+    let mut push = |directory: PathBuf| {
+        if let Some(candidate) = profile(context, executable, directory) {
+            candidates.push(candidate);
+        }
+    };
+    match agent {
+        AgentId::ClaudeCode => push(
+            context
+                .path("CLAUDE_CONFIG_DIR")
+                .unwrap_or_else(|| home.join(".claude")),
+        ),
+        AgentId::Codex => push(
+            context
+                .path("CODEX_HOME")
+                .unwrap_or_else(|| home.join(".codex")),
+        ),
+        AgentId::Hermes => {
+            let suffix = context.name("HERMES_DATA_DIR_SUFFIX").unwrap_or_default();
+            if suffix.contains(['/', '\\']) {
+                return (
+                    Vec::new(),
+                    Some("Hermes 数据目录后缀无法安全确认，请手动选择实际配置目录".into()),
+                );
+            }
+            let root = context.path("HERMES_HOME").unwrap_or_else(|| {
+                if context.windows {
+                    context
+                        .path("LOCALAPPDATA")
+                        .unwrap_or_else(|| home.join("AppData/Local"))
+                        .join(format!("hermes{suffix}"))
+                } else {
+                    home.join(format!(".hermes{suffix}"))
+                }
+            });
+            push(root.clone());
+            for directory in named_directories(&root.join("profiles"), limited) {
+                push(directory);
+            }
+            if root.join("active_profile").is_file() {
+                reason = Some(
+                    "发现 Hermes 活动 profile 标记；为保护原会话，请选择客户端实际使用的配置目录"
+                        .into(),
+                );
+            }
+        }
+        AgentId::OhMyPi => {
+            let config_name = context
+                .name("PI_CONFIG_DIR")
+                .unwrap_or_else(|| ".omp".into());
+            let config_name = Path::new(&config_name);
+            if config_name.is_absolute()
+                || config_name
+                    .components()
+                    .any(|part| matches!(part, Component::ParentDir | Component::Prefix(_)))
+            {
+                return (
+                    Vec::new(),
+                    Some("OMP 配置目录名无法安全确认，请手动选择实际配置目录".into()),
+                );
+            }
+            let root = home.join(config_name);
+            let named = context
+                .name("OMP_PROFILE")
+                .or_else(|| context.name("PI_PROFILE"));
+            if named.as_ref().is_some_and(|name| {
+                name.contains(['/', '\\']) || matches!(name.as_str(), "." | "..")
+            }) {
+                return (
+                    Vec::new(),
+                    Some(
+                        "OMP 命名 profile 无效，未回退到其他配置目录；请手动选择实际 profile"
+                            .into(),
+                    ),
+                );
+            }
+            if let Some(name) = named {
+                push(root.join("profiles").join(&name).join("agent"));
+                if let Some(candidate) = candidates.last_mut() {
+                    candidate.profile_name = Some(name);
+                }
+            } else {
+                push(
+                    context
+                        .path("PI_CODING_AGENT_DIR")
+                        .unwrap_or_else(|| root.join("agent")),
+                );
+                for directory in named_directories(&root.join("profiles"), limited) {
+                    if let Some(mut candidate) =
+                        profile(context, executable, directory.join("agent"))
+                    {
+                        candidate.profile_name = directory
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned());
+                        candidates.push(candidate);
+                    }
+                }
+            }
+        }
+        AgentId::OpenCode => {
+            let root = context.path("OPENCODE_CONFIG_DIR").unwrap_or_else(|| {
+                context
+                    .path("XDG_CONFIG_HOME")
+                    .unwrap_or_else(|| home.join(".config"))
+                    .join("opencode")
+            });
+            let explicit = context.path("OPENCODE_CONFIG");
+            if let Some(file) = explicit {
+                if let Some(parent) = file.parent() {
+                    push(parent.to_path_buf());
+                }
+                if let Some(candidate) = candidates.last_mut() {
+                    candidate.config_file = Some(file.to_string_lossy().into_owned());
+                }
+            } else {
+                push(root.clone());
+                if root.join("opencode.jsonc").is_file() && !root.join("opencode.json").is_file() {
+                    if let Some(candidate) = candidates.last_mut() {
+                        candidate.config_file =
+                            Some(root.join("opencode.jsonc").to_string_lossy().into_owned());
+                    }
+                }
+            }
+            reason = Some(
+                "OpenCode 还可能使用项目配置、命令行参数或内联配置；请核对当前客户端实际配置"
+                    .into(),
+            );
+        }
+        AgentId::Zcode => {
+            let client_home = context.path("HOME").unwrap_or_else(|| home.clone());
+            let base = context
+                .path("ZCODE_DATA_BASE_DIR")
+                .unwrap_or_else(|| client_home.clone());
+            let storage = context
+                .path("ZCODE_STORAGE_DIR")
+                .unwrap_or_else(|| client_home.join(".zcode"));
+            let personal = context
+                .path("ZCODE_PERSONAL_PROVIDER_CONFIG_FILE")
+                .unwrap_or_else(|| base.join(".zcode/v2/provider_config.json"));
+            if let Some(directory) = personal.parent() {
+                push(directory.to_path_buf());
+            }
+            if let Some(candidate) = candidates.last_mut() {
+                candidate.home_directory = client_home.to_string_lossy().into_owned();
+                candidate.config_file = Some(personal.to_string_lossy().into_owned());
+                candidate.data_directory = Some(storage.to_string_lossy().into_owned());
+                candidate.builtin_config_file = context
+                    .path("ZCODE_BUILTIN_PROVIDER_CONFIG_FILE")
+                    .map(|path| path.to_string_lossy().into_owned());
+            }
+            reason = Some("ZCode 会话状态还可能由原配置中的 storage.dir 指定；未读取该配置内容，请核对实际存储目录".into());
+            if context
+                .path("ZCODE_PERSONAL_PROVIDER_CONFIG_FILE")
+                .is_some()
+                != context.path("ZCODE_BUILTIN_PROVIDER_CONFIG_FILE").is_some()
+            {
+                reason = Some("ZCode 显式 provider 路径未成对，实际运行时还可能补齐另一份路径；请核对 provider 路径和原 storage.dir，未读取配置内容".into());
+            }
+        }
+        AgentId::WorkBuddy => push(
+            context
+                .path("WORKBUDDY_CONFIG_DIR")
+                .or_else(|| context.path("CODEBUDDY_CONFIG_DIR"))
+                .unwrap_or_else(|| home.join(".workbuddy")),
+        ),
+        AgentId::DeepSeekHarness => {
+            let root = context
+                .path("DSH_HOME")
+                .unwrap_or_else(|| home.join(".dsh"));
+            for directory in named_directories(&root.join("profiles"), limited) {
+                if let Some(mut candidate) = profile(context, executable, directory.clone()) {
+                    candidate.profile_name = directory
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned());
+                    candidate.data_directory = Some(root.to_string_lossy().into_owned());
+                    candidates.push(candidate);
+                }
+            }
+            if candidates.is_empty() {
+                reason = Some("未发现 DeepSeek Harness 已有 profile；请先选择客户端实际使用的命名 profile，AE 不会默认新建 headless profile".into());
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    candidates.retain(|candidate| {
+        seen.insert((
+            candidate.directory.clone(),
+            candidate.config_file.clone(),
+            candidate.profile_name.clone(),
+        ))
+    });
+    if candidates.len() > 1 && reason.is_none() {
+        reason =
+            Some("发现多个配置目录；请选择客户端实际使用的目录，自动发现不会改写任何配置".into());
+    }
+    if candidates.is_empty() && reason.is_none() {
+        reason = Some("原用户目录或配置路径无法安全确认，请手动选择实际配置目录".into());
+    }
+    (candidates, reason)
+}
+
+fn discover_context(context: &Context) -> InstalledAgentDiscovery {
+    let mut result = InstalledAgentDiscovery {
+        clients: Vec::new(), scanned_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis().to_string(),
+        limited: false, notes: vec!["仅只读检查原用户环境、PATH 和已知安装位置；未运行客户端或读取密钥、配置内容、历史。自定义安装和运行中客户端的参数仍需核对。".into()],
+    };
+    let directories = path_directories(context, &mut result.limited);
+    let mut seen = HashSet::new();
+    for &agent in AGENTS {
+        for (directory, source) in &directories {
+            for name in command_names(agent, context.windows) {
+                let executable = directory.join(name);
+                if !executable.is_file() {
+                    continue;
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if std::fs::metadata(&executable)
+                        .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 == 0)
+                    {
+                        continue;
+                    }
+                }
+                let key = (
+                    agent.as_str(),
+                    executable
+                        .canonicalize()
+                        .unwrap_or_else(|_| executable.clone()),
+                );
+                if !seen.insert(key) {
+                    continue;
+                }
+                if result.clients.len() >= MAX_CLIENTS {
+                    result.limited = true;
+                    return result;
+                }
+                let (profiles, reason) = profiles(context, agent, &executable, &mut result.limited);
+                result.clients.push(InstalledAgentClient {
+                    agent_id: agent,
+                    executable_path: executable.to_string_lossy().into_owned(),
+                    profiles,
+                    source: (*source).into(),
+                    reason,
+                });
+            }
+        }
+    }
+    if result.limited {
+        result
+            .notes
+            .push("已达到有界扫描上限；未发现的自定义安装可手动选择。".into());
+    }
+    result
+}
+
+pub fn discover() -> InstalledAgentDiscovery {
+    #[cfg(feature = "qa-webview")]
+    if let Some(path) = std::env::var_os("UNI_SWITCH_QA_AGENT_DISCOVERY_CONTEXT") {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Fixture {
+            environment: BTreeMap<String, String>,
+            home_directory: String,
+            workspace_directory: String,
+        }
+        let path = PathBuf::from(path);
+        let fixture = crate::portable::validate_root(&path)
+            .ok()
+            .filter(|_| std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() <= 64 * 1024))
+            .and_then(|_| std::fs::read(path).ok())
+            .and_then(|bytes| serde_json::from_slice::<Fixture>(&bytes).ok());
+        if let Some(fixture) = fixture {
+            let environment = fixture
+                .environment
+                .into_iter()
+                .filter(|(name, _)| ORIGINAL_ENVIRONMENT_VARIABLES.contains(&name.as_str()))
+                .map(|(name, value)| (name, value.into()))
+                .collect();
+            let context = Context {
+                environment,
+                home: Some(fixture.home_directory.into()),
+                workspace: Some(fixture.workspace_directory.into()),
+                windows: cfg!(windows),
+            };
+            let safe_paths = context
+                .home
+                .as_ref()
+                .is_some_and(|path| crate::portable::validate_root(path).is_ok())
+                && context
+                    .workspace
+                    .as_ref()
+                    .is_some_and(|path| crate::portable::validate_root(path).is_ok())
+                && context.environment.iter().all(|(name, value)| {
+                    if [
+                        "PATHEXT",
+                        "HERMES_DATA_DIR_SUFFIX",
+                        "PI_CONFIG_DIR",
+                        "OMP_PROFILE",
+                        "PI_PROFILE",
+                        "ZCODE_BETA",
+                        "ZCODE_ENV",
+                    ]
+                    .contains(&name.as_str())
+                    {
+                        return true;
+                    }
+                    if name == "PATH" {
+                        return std::env::split_paths(value)
+                            .all(|path| crate::portable::validate_root(&path).is_ok());
+                    }
+                    crate::portable::validate_root(Path::new(value)).is_ok()
+                });
+            if safe_paths {
+                return discover_context(&context);
+            }
+        }
+        return InstalledAgentDiscovery {
+            clients: Vec::new(),
+            scanned_at: String::new(),
+            limited: true,
+            notes: vec!["测试专用发现上下文无效；未扫描真实用户环境。".into()],
+        };
+    }
+    discover_context(ORIGINAL_CONTEXT.get_or_init(Context::capture))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn context(root: &Path) -> Context {
+        let home = root.join("home");
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let mut environment = BTreeMap::new();
+        environment.insert("PATH".into(), std::env::join_paths([&bin]).unwrap());
+        environment.insert(
+            "LOCALAPPDATA".into(),
+            home.join("AppData/Local").into_os_string(),
+        );
+        Context {
+            environment,
+            home: Some(home),
+            workspace: Some(root.into()),
+            windows: cfg!(windows),
+        }
+    }
+
+    fn executable(context: &Context, agent: AgentId) -> PathBuf {
+        let directory = std::env::split_paths(&context.environment["PATH"])
+            .next()
+            .unwrap();
+        let path = directory.join(&command_names(agent, context.windows)[0]);
+        std::fs::write(&path, "Do not execute this discovery fixture").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn eight_clients_and_native_profiles_are_discovered_without_changes() {
+        let sandbox = tempfile::Builder::new()
+            .prefix("agent-discovery-")
+            .tempdir_in(std::env::temp_dir())
+            .unwrap();
+        let context = context(sandbox.path());
+        let home = context.home.as_ref().unwrap();
+        let roots = [
+            home.join(".claude"),
+            home.join(".codex"),
+            if context.windows {
+                home.join("AppData/Local/hermes")
+            } else {
+                home.join(".hermes")
+            },
+            home.join(".omp/agent"),
+            home.join(".config/opencode"),
+            home.join(".zcode/v2"),
+            home.join(".workbuddy"),
+            home.join(".dsh/profiles/my-existing-profile"),
+        ];
+        for (&agent, directory) in AGENTS.iter().zip(&roots) {
+            executable(&context, agent);
+            std::fs::create_dir_all(directory).unwrap();
+            std::fs::write(
+                directory.join("history-sentinel"),
+                "original-client-history",
+            )
+            .unwrap();
+        }
+        let result = discover_context(&context);
+        assert_eq!(result.clients.len(), 8);
+        assert!(!result.limited);
+        for (client, directory) in result.clients.iter().zip(&roots) {
+            assert_eq!(client.profiles.len(), 1);
+            assert_eq!(Path::new(&client.profiles[0].directory), directory);
+            assert_eq!(
+                std::fs::read(directory.join("history-sentinel")).unwrap(),
+                b"original-client-history"
+            );
+            assert_eq!(std::fs::read_dir(directory).unwrap().count(), 1);
+        }
+        let value = serde_json::to_value(result).unwrap();
+        assert!(value["clients"][0]["agentId"].is_string());
+        assert!(value["clients"][0]["profiles"][0]["executablePath"].is_string());
+        assert!(value["scannedAt"].is_string());
+        assert!(!value.to_string().contains("original-client-history"));
+    }
+
+    #[test]
+    fn profiles_without_client_installations_do_not_become_installed_clients() {
+        let sandbox = tempfile::Builder::new()
+            .prefix("agent-discovery-")
+            .tempdir_in(std::env::temp_dir())
+            .unwrap();
+        let context = context(sandbox.path());
+        std::fs::create_dir_all(context.home.as_ref().unwrap().join(".codex")).unwrap();
+        assert!(discover_context(&context).clients.is_empty());
+    }
+
+    #[test]
+    fn explicit_native_paths_and_named_profiles_are_preserved() {
+        let sandbox = tempfile::Builder::new()
+            .prefix("agent-discovery-")
+            .tempdir_in(std::env::temp_dir())
+            .unwrap();
+        let mut context = context(sandbox.path());
+        for &agent in AGENTS {
+            executable(&context, agent);
+        }
+        let custom = sandbox.path().join("custom-native");
+        std::fs::create_dir_all(&custom).unwrap();
+        context
+            .environment
+            .insert("CODEX_HOME".into(), custom.clone().into_os_string());
+        context
+            .environment
+            .insert("PI_CONFIG_DIR".into(), "custom-omp".into());
+        context
+            .environment
+            .insert("OMP_PROFILE".into(), "work".into());
+        context.environment.insert(
+            "PI_CODING_AGENT_DIR".into(),
+            sandbox.path().join("ignored-omp").into_os_string(),
+        );
+        context.environment.insert(
+            "OPENCODE_CONFIG".into(),
+            custom.join("custom.jsonc").into_os_string(),
+        );
+        context.environment.insert(
+            "ZCODE_PERSONAL_PROVIDER_CONFIG_FILE".into(),
+            custom.join("provider_config.json").into_os_string(),
+        );
+        let result = discover_context(&context);
+        let found = |agent| {
+            &result
+                .clients
+                .iter()
+                .find(|client| client.agent_id == agent)
+                .unwrap()
+                .profiles[0]
+        };
+        assert_eq!(Path::new(&found(AgentId::Codex).directory), custom);
+        assert_eq!(
+            Path::new(&found(AgentId::OhMyPi).directory),
+            context
+                .home
+                .as_ref()
+                .unwrap()
+                .join("custom-omp/profiles/work/agent")
+        );
+        assert_eq!(found(AgentId::OhMyPi).profile_name.as_deref(), Some("work"));
+        assert_eq!(
+            Path::new(found(AgentId::OpenCode).config_file.as_deref().unwrap()),
+            custom.join("custom.jsonc")
+        );
+        assert_eq!(
+            Path::new(found(AgentId::Zcode).config_file.as_deref().unwrap()),
+            custom.join("provider_config.json")
+        );
+        assert!(!sandbox.path().join("ignored-omp").exists());
+        assert!(result
+            .clients
+            .iter()
+            .find(|client| client.agent_id == AgentId::DeepSeekHarness)
+            .unwrap()
+            .profiles
+            .is_empty());
+        assert!(!context
+            .home
+            .as_ref()
+            .unwrap()
+            .join(".dsh/profiles/headless")
+            .exists());
+    }
+
+    #[test]
+    fn duplicate_search_paths_and_profile_scan_limits_are_explicit() {
+        let sandbox = tempfile::Builder::new()
+            .prefix("agent-discovery-")
+            .tempdir_in(std::env::temp_dir())
+            .unwrap();
+        let mut context = context(sandbox.path());
+        let codex = executable(&context, AgentId::Codex);
+        context.environment.insert(
+            "PATH".into(),
+            std::env::join_paths([codex.parent().unwrap(), codex.parent().unwrap()]).unwrap(),
+        );
+        assert_eq!(discover_context(&context).clients.len(), 1);
+        executable(&context, AgentId::DeepSeekHarness);
+        let profiles = context.home.as_ref().unwrap().join(".dsh/profiles");
+        for index in 0..(MAX_NAMED_PROFILES + 1) {
+            std::fs::create_dir_all(profiles.join(format!("profile-{index}"))).unwrap();
+        }
+        let result = discover_context(&context);
+        assert!(result.limited);
+        assert_eq!(
+            result
+                .clients
+                .iter()
+                .find(|client| client.agent_id == AgentId::DeepSeekHarness)
+                .unwrap()
+                .profiles
+                .len(),
+            MAX_NAMED_PROFILES
+        );
+    }
+
+    #[test]
+    fn malformed_explicit_paths_do_not_fall_back_to_another_profile() {
+        let sandbox = tempfile::Builder::new()
+            .prefix("agent-discovery-")
+            .tempdir_in(std::env::temp_dir())
+            .unwrap();
+        let mut context = context(sandbox.path());
+        executable(&context, AgentId::Codex);
+        context
+            .environment
+            .insert("CODEX_HOME".into(), "relative-profile".into());
+        let result = discover_context(&context);
+        assert_eq!(result.clients.len(), 1);
+        assert!(result.clients[0].profiles.is_empty());
+        assert!(result.clients[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("CODEX_HOME"));
+        assert!(!context.home.as_ref().unwrap().join(".codex").exists());
+    }
+
+    #[test]
+    fn hermes_suffix_and_profile_metadata_are_honored_without_reading_marker() {
+        let sandbox = tempfile::Builder::new()
+            .prefix("agent-discovery-")
+            .tempdir_in(std::env::temp_dir())
+            .unwrap();
+        let mut context = context(sandbox.path());
+        executable(&context, AgentId::Hermes);
+        context
+            .environment
+            .insert("HERMES_DATA_DIR_SUFFIX".into(), "-existing".into());
+        let home = context.home.as_ref().unwrap();
+        let root = if context.windows {
+            home.join("AppData/Local/hermes-existing")
+        } else {
+            home.join(".hermes-existing")
+        };
+        std::fs::create_dir_all(root.join("profiles/work")).unwrap();
+        std::fs::write(
+            root.join("active_profile"),
+            "private-marker-content-must-not-be-read",
+        )
+        .unwrap();
+        let result = discover_context(&context);
+        assert_eq!(result.clients.len(), 1);
+        assert_eq!(result.clients[0].profiles.len(), 2);
+        assert_eq!(Path::new(&result.clients[0].profiles[0].directory), root);
+        assert_eq!(
+            Path::new(&result.clients[0].profiles[1].directory),
+            root.join("profiles/work")
+        );
+        assert!(result.clients[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("活动 profile"));
+        assert!(!serde_json::to_string(&result)
+            .unwrap()
+            .contains("private-marker-content"));
+    }
+
+    #[test]
+    fn portable_bootstrap_preserves_original_discovery_environment() {
+        let sandbox = tempfile::Builder::new()
+            .prefix("agent-discovery-bootstrap-")
+            .tempdir_in(std::env::temp_dir())
+            .unwrap();
+        let context = context(sandbox.path());
+        let executable = executable(&context, AgentId::Codex);
+        let home = context.home.as_ref().unwrap();
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::write(home.join(".codex/history-sentinel"), "original-history").unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "agent_discovery::tests::portable_bootstrap_original_environment_child",
+                "--nocapture",
+            ])
+            .current_dir(sandbox.path())
+            .env("AE_DISCOVERY_SNAPSHOT_CHILD", "1")
+            .env("AE_SWITCH_PORTABLE_ROOT", sandbox.path().join("portable"))
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .env("APPDATA", home.join("AppData/Roaming"))
+            .env("LOCALAPPDATA", home.join("AppData/Local"))
+            .env("PATH", executable.parent().unwrap())
+            .env("ZCODE_BETA", "1")
+            .env("ZCODE_ENV", "beta")
+            .env("ANTHROPIC_AUTH_TOKEN", "fixture-value-must-not-be-captured")
+            .env(
+                "OPENCODE_CONFIG_CONTENT",
+                "fixture-value-must-not-be-captured",
+            )
+            .env(
+                "AE_SWITCH_DYNAMIC_CREDENTIAL_TEST",
+                "fixture-value-must-not-be-captured",
+            )
+            .env_remove("ProgramFiles")
+            .env_remove("ProgramFiles(x86)")
+            .env_remove("CODEX_HOME")
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .env_remove("UNI_SWITCH_QA_AGENT_DISCOVERY_CONTEXT")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(
+            std::fs::read(home.join(".codex/history-sentinel")).unwrap(),
+            b"original-history"
+        );
+        assert_eq!(std::fs::read_dir(home.join(".codex")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn portable_bootstrap_original_environment_child() {
+        if std::env::var("AE_DISCOVERY_SNAPSHOT_CHILD").ok().as_deref() != Some("1") {
+            return;
+        }
+        let before = PathBuf::from(std::env::var_os("HOME").unwrap());
+        crate::portable::initialize().unwrap();
+        for name in [
+            "ANTHROPIC_AUTH_TOKEN",
+            "OPENCODE_CONFIG_CONTENT",
+            "AE_SWITCH_DYNAMIC_CREDENTIAL_TEST",
+        ] {
+            std::env::remove_var(name);
+            assert!(original_environment_has(name));
+            assert!(!original_environment().contains_key(name));
+            #[cfg(windows)]
+            assert!(original_environment_has(&name.to_ascii_lowercase()));
+        }
+        assert!(!original_environment_has(
+            "AE_SWITCH_MISSING_CREDENTIAL_TEST"
+        ));
+        assert_eq!(original_environment()["ZCODE_BETA"], "1");
+        assert_eq!(original_environment()["ZCODE_ENV"], "beta");
+        assert_ne!(std::env::var_os("HOME").unwrap(), before.as_os_str());
+        assert_eq!(
+            original_environment().get("HOME").unwrap(),
+            before.as_os_str()
+        );
+        let result = discover();
+        let codex = result
+            .clients
+            .iter()
+            .find(|client| client.agent_id == AgentId::Codex)
+            .unwrap();
+        assert_eq!(codex.profiles.len(), 1);
+        assert_eq!(Path::new(&codex.profiles[0].home_directory), before);
+        assert_eq!(
+            Path::new(&codex.profiles[0].directory),
+            before.join(".codex")
+        );
+        assert!(codex.source == "PATH");
+    }
+
+    #[test]
+    fn invalid_named_omp_profile_is_never_replaced_by_default() {
+        let sandbox = tempfile::Builder::new()
+            .prefix("agent-discovery-")
+            .tempdir_in(std::env::temp_dir())
+            .unwrap();
+        let mut context = context(sandbox.path());
+        executable(&context, AgentId::OhMyPi);
+        context
+            .environment
+            .insert("OMP_PROFILE".into(), "../other-profile".into());
+        let result = discover_context(&context);
+        assert_eq!(result.clients.len(), 1);
+        assert!(result.clients[0].profiles.is_empty());
+        assert!(result.clients[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("未回退"));
+        assert!(!context.home.as_ref().unwrap().join(".omp/agent").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_native_profile_is_not_proposed_for_configuration() {
+        let sandbox = tempfile::Builder::new()
+            .prefix("agent-discovery-")
+            .tempdir_in(std::env::temp_dir())
+            .unwrap();
+        let context = context(sandbox.path());
+        executable(&context, AgentId::Codex);
+        let outside = sandbox.path().join("separate-history");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, context.home.as_ref().unwrap().join(".codex"))
+            .unwrap();
+        let result = discover_context(&context);
+        assert_eq!(result.clients.len(), 1);
+        assert!(result.clients[0].profiles.is_empty());
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+    }
+}

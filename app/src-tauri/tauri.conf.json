@@ -1,0 +1,50 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "AE Switch",
+  "version": "0.1.0",
+  "identifier": "io.ae-switch.portable",
+  "build": {
+    "beforeDevCommand": "corepack pnpm dev:web",
+    "beforeBuildCommand": "corepack pnpm build",
+    "devUrl": "http://127.0.0.1:1420",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "AE Switch",
+        "width": 1120,
+        "height": 780,
+        "minWidth": 760,
+        "minHeight": 600,
+        "center": true,
+        "decorations": false,
+        "shadow": true,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": false,
+    "targets": [],
+    "icon": ["icons/icon.ico", "icons/icon.png"],
+    "resources": {
+      "../LICENSE": "LICENSE",
+      "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md",
+      "../third-party/codex/LICENSE": "licenses/codex-LICENSE",
+      "../third-party/dependency-licenses.txt": "licenses/dependency-licenses.txt",
+      "../NOTICE": "NOTICE"
+    },
+    "windows": {
+      "nsis": {
+        "installerHooks": "windows/hooks.nsh",
+        "displayLanguageSelector": false,
+        "languages": ["SimpChinese"],
+        "installMode": "currentUser"
+      }
+    }
+  }
+}

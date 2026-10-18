@@ -1,0 +1,4249 @@
+use super::*;
+use serde_json::{json, Value};
+use std::path::Path;
+use tempfile::TempDir;
+
+fn fixture() -> (TempDir, Store) {
+    let temp = tempfile::tempdir().unwrap();
+    let mut store = Store::open(temp.path().join("数据 目录")).unwrap();
+    for target in [Target::Codex, Target::ClaudeDesktop, Target::ClaudeCli] {
+        store
+            .set_directory(
+                target,
+                temp.path().join(target.id()).to_string_lossy().into(),
+            )
+            .unwrap();
+    }
+    (temp, store)
+}
+
+#[test]
+fn release_core_provider_used_by_agent_cannot_be_deleted() {
+    let (_temp, mut store) = fixture();
+    let provider = store
+        .save(input(Family::Codex, "Agent connection"))
+        .unwrap();
+    let path = store.data_directory.join("agent-selection.json");
+    let selection = json!({"codex":{"providerId":provider.id,"model":provider.model}});
+    put(&path, &selection.to_string());
+    let before = std::fs::read(&path).unwrap();
+    assert_eq!(store.delete(&provider.id).unwrap_err().code, "in_use");
+    assert!(store.provider(&provider.id).is_ok());
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    put(&path, "{}");
+    store.delete(&provider.id).unwrap();
+    assert!(store.provider(&provider.id).is_err());
+}
+
+#[test]
+fn release_core_corrupt_agent_selection_blocks_provider_deletion() {
+    let (_temp, mut store) = fixture();
+    let provider = store
+        .save(input(Family::Codex, "Agent connection"))
+        .unwrap();
+    put(
+        &store.data_directory.join("agent-selection.json"),
+        "{broken",
+    );
+    assert_eq!(
+        store.delete(&provider.id).unwrap_err().code,
+        "invalid_state"
+    );
+    assert!(store.provider(&provider.id).is_ok());
+}
+
+#[test]
+#[cfg(windows)]
+fn release_core_portable_target_paths_reject_parent_junctions_and_siblings() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("portable-3p");
+    std::fs::create_dir_all(&root).unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "store::tests::release_core_owned_path_subprocess_helper",
+            "--nocapture",
+        ])
+        .env("AE_SWITCH_PORTABLE_ROOT", &root)
+        .env("AE_RELEASE_TEST_ROOT", temp.path())
+        .env("CODEX_HOME", root.join("data/home/.codex"))
+        .env("CLAUDE_CONFIG_DIR", root.join("data/home/.claude"))
+        .env("LOCALAPPDATA", root.join("data/home/AppData/Local"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "isolated portable-path child; run by the parent regression"]
+#[cfg(windows)]
+fn release_core_owned_path_subprocess_helper() {
+    let outer = PathBuf::from(std::env::var_os("AE_RELEASE_TEST_ROOT").unwrap());
+    let root = PathBuf::from(std::env::var_os("AE_SWITCH_PORTABLE_ROOT").unwrap());
+    assert!(root.starts_with(&outer));
+    assert!(!root
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .starts_with("c:"));
+    let outside = outer.join("outside");
+    let target = root.join("codex");
+    put(&outside.join("config.toml"), "model='outside-original'\n");
+    std::fs::create_dir_all(&target).unwrap();
+    let mut store = Store::open(root.join("data")).unwrap();
+    store
+        .set_directory(Target::Codex, target.to_string_lossy().into())
+        .unwrap();
+    let provider = store.save(input(Family::Codex, "Owned path")).unwrap();
+    std::fs::remove_dir(&target).unwrap();
+    let output = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command", "New-Item -ItemType Junction -Path $env:AE_RELEASE_LINK -Target $env:AE_RELEASE_LINK_TARGET -ErrorAction Stop | Out-Null"])
+        .env("AE_RELEASE_LINK", &target).env("AE_RELEASE_LINK_TARGET", &outside)
+        .output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let applied = store.apply(Target::Codex, &provider.id);
+    std::fs::remove_dir(&target).unwrap();
+    assert!(
+        applied.is_err(),
+        "parent junction must be rejected before writing"
+    );
+    assert_eq!(
+        std::fs::read_to_string(outside.join("config.toml")).unwrap(),
+        "model='outside-original'\n"
+    );
+    assert!(writer::write(&outside.join("config.toml"), Some("changed")).is_err());
+    assert_eq!(
+        std::fs::read_to_string(outside.join("config.toml")).unwrap(),
+        "model='outside-original'\n"
+    );
+    put(&root.join("claude_desktop_config.json"), "{}");
+    let sibling = outer.join("portable").join("claude_desktop_config.json");
+    put(&sibling, "{\"deploymentMode\":\"original\"}");
+    store
+        .set_directory(Target::ClaudeDesktop, root.to_string_lossy().into())
+        .unwrap();
+    let claude = store.save(input(Family::Claude, "Sibling guard")).unwrap();
+    assert!(
+        store.apply(Target::ClaudeDesktop, &claude.id).is_err(),
+        "derived desktop sibling must remain inside the portable root"
+    );
+    assert_eq!(
+        std::fs::read_to_string(sibling).unwrap(),
+        "{\"deploymentMode\":\"original\"}"
+    );
+}
+
+fn quick_input(provider: Provider, target: Target) -> QuickModelInput {
+    QuickModelInput {
+        model: provider.model.clone(),
+        models: vec![ProviderModel {
+            id: provider.model.clone(),
+            context_window: Some(256_000),
+            reasoning_efforts: vec![],
+            enabled: true,
+        }],
+        expected: provider,
+        target,
+        synced_at: None,
+        repair_reasoning_levels: None,
+        edited_context_model_ids: vec![],
+    }
+}
+
+const OPTIONAL_CODEX_SETTINGS: &[&str] = &[
+    "model_reasoning_effort",
+    "service_tier",
+    "features.fast_mode",
+    "model_context_window",
+    "model_auto_compact_token_limit",
+    adapters::REASONING_DISPLAY_KEY,
+];
+
+fn codex_optional_settings(path: &Path) -> Vec<Option<String>> {
+    let doc: toml_edit::DocumentMut = std::fs::read_to_string(path).unwrap().parse().unwrap();
+    OPTIONAL_CODEX_SETTINGS
+        .iter()
+        .map(|key| {
+            let value = if let Some((parent, child)) = key.split_once('.') {
+                doc.get(parent).and_then(|table| table.get(child))
+            } else {
+                doc.get(key)
+            };
+            value.map(ToString::to_string)
+        })
+        .collect()
+}
+
+fn assert_optional_settings_unmanaged(store: &Store) {
+    let (_, _, baseline) = store.target_record(Target::Codex).unwrap();
+    let files = baseline.unwrap();
+    let config = files.iter().find(|file| file.format == "toml").unwrap();
+    for key in OPTIONAL_CODEX_SETTINGS {
+        assert!(
+            !config.keys.iter().any(|managed| managed == key),
+            "unexpected ownership: {key}"
+        );
+    }
+}
+
+#[test]
+fn client_preferences_explicit_context_edit_uses_per_model_lengths_and_restores_global() {
+    let (temp, mut store) = fixture();
+    let config = temp.path().join("codex/config.toml");
+    put(&config, "model='original'\nmodel_context_window=64000\nmodel_auto_compact_token_limit=50000\nservice_tier='flex'\n");
+    let mut value = input(Family::Codex, "Explicit per-model context");
+    value.codex_options.context_window = Some(64000);
+    value.codex_options.auto_compact_token_limit = Some(50000);
+    value.codex_options.models = [("test-model", 256000), ("other-model", 512000)]
+        .into_iter()
+        .map(|(id, size)| ProviderModel {
+            id: id.into(),
+            context_window: Some(size),
+            reasoning_efforts: vec![],
+            enabled: true,
+        })
+        .collect();
+    let provider = store.commit_provider(value, Target::Codex, true).unwrap();
+    let mut edit = quick_input(provider.clone(), Target::Codex);
+    edit.models = provider.codex_options.models;
+    edit.models[1].context_window = Some(768000);
+    edit.edited_context_model_ids = vec!["other-model".into()];
+    let edited = store.quick_model_settings(edit).unwrap().provider;
+    assert!(edited.codex_options.per_model_context);
+    assert_eq!(edited.codex_options.context_window, None);
+    let doc: toml_edit::DocumentMut = std::fs::read_to_string(&config).unwrap().parse().unwrap();
+    assert!(doc.get("model_context_window").is_none());
+    assert_eq!(
+        doc["model_auto_compact_token_limit"].as_integer(),
+        Some(50000)
+    );
+    assert_eq!(doc["service_tier"].as_str(), Some("flex"));
+    let catalog = read_json(&temp.path().join("codex/uni-switch-models.json"));
+    assert_eq!(catalog["models"][0]["context_window"], 256000);
+    assert_eq!(catalog["models"][1]["context_window"], 768000);
+    assert_eq!(store.status(Target::Codex).unwrap().state, "applied");
+    let data = store.data_directory.clone();
+    drop(store);
+    let mut reopened = Store::open(data).unwrap();
+    assert!(
+        reopened
+            .provider(&edited.id)
+            .unwrap()
+            .summary
+            .codex_options
+            .per_model_context
+    );
+    reopened.apply(Target::Codex, &edited.id).unwrap();
+    reopened.restore(Target::Codex).unwrap();
+    let restored: toml_edit::DocumentMut =
+        std::fs::read_to_string(&config).unwrap().parse().unwrap();
+    assert_eq!(restored["model_context_window"].as_integer(), Some(64000));
+    assert_eq!(
+        restored["model_auto_compact_token_limit"].as_integer(),
+        Some(50000)
+    );
+}
+
+#[test]
+fn client_preferences_inactive_context_intent_is_validated_and_applies_later() {
+    let (temp, mut store) = fixture();
+    let config = temp.path().join("codex/config.toml");
+    let original =
+        "model='original'\nmodel_context_window=64000\nmodel_auto_compact_token_limit=50000\n";
+    put(&config, original);
+    let mut value = input(Family::Codex, "Inactive context intent");
+    value.codex_options.context_window = Some(64000);
+    value.codex_options.models = vec![ProviderModel {
+        id: "test-model".into(),
+        context_window: Some(128000),
+        reasoning_efforts: vec![],
+        enabled: true,
+    }];
+    value.edited_context_model_ids = vec!["test-model".into()];
+    let saved = store
+        .commit_provider(value.clone(), Target::Codex, false)
+        .unwrap();
+    assert!(saved.codex_options.per_model_context);
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
+    store.apply(Target::Codex, &saved.id).unwrap();
+    let applied: toml_edit::DocumentMut =
+        std::fs::read_to_string(&config).unwrap().parse().unwrap();
+    assert!(applied.get("model_context_window").is_none());
+    store.restore(Target::Codex).unwrap();
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
+
+    for invalid in ["unknown-model", "disabled-model"] {
+        let mut rejected = value.clone();
+        rejected.edited_context_model_ids = vec![invalid.into()];
+        rejected.codex_options.models.push(ProviderModel {
+            id: "disabled-model".into(),
+            context_window: Some(128000),
+            reasoning_efforts: vec![],
+            enabled: false,
+        });
+        assert_eq!(
+            store.save(rejected).unwrap_err().code,
+            "invalid_context_intent"
+        );
+    }
+    let mut missing_context = value.clone();
+    missing_context.codex_options.models[0].context_window = None;
+    assert_eq!(
+        store.save(missing_context).unwrap_err().code,
+        "invalid_context_intent"
+    );
+    let mut invalid_context = value.clone();
+    invalid_context.codex_options.models[0].context_window = Some(0);
+    assert_eq!(
+        store.save(invalid_context).unwrap_err().code,
+        "invalid_context_intent"
+    );
+    let mut missing_quick_context = quick_input(saved.clone(), Target::Codex);
+    missing_quick_context.models[0].context_window = None;
+    missing_quick_context.edited_context_model_ids = vec!["test-model".into()];
+    assert_eq!(
+        store
+            .quick_model_settings(missing_quick_context)
+            .unwrap_err()
+            .code,
+        "invalid_context_intent"
+    );
+    assert_eq!(
+        store
+            .commit_provider(value, Target::ClaudeCli, false)
+            .unwrap_err()
+            .code,
+        "invalid_context_intent"
+    );
+    let mut invalid_quick = quick_input(saved, Target::ClaudeCli);
+    invalid_quick.edited_context_model_ids = vec!["test-model".into()];
+    assert_eq!(
+        store.quick_model_settings(invalid_quick).unwrap_err().code,
+        "invalid_context_intent"
+    );
+}
+
+#[test]
+fn client_preferences_explicit_context_rejects_profile_override_without_any_writes() {
+    let (temp, mut store) = fixture();
+    let config = temp.path().join("codex/config.toml");
+    let original =
+        "model='original'\nprofile='custom'\n[profiles.custom]\nmodel_context_window=64000\n";
+    put(&config, original);
+    let mut value = input(Family::Codex, "Profile context conflict");
+    value.codex_options.models = vec![ProviderModel {
+        id: "test-model".into(),
+        context_window: Some(128000),
+        reasoning_efforts: vec![],
+        enabled: true,
+    }];
+    value.edited_context_model_ids = vec!["test-model".into()];
+    assert_eq!(
+        store
+            .commit_provider(value, Target::Codex, true)
+            .unwrap_err()
+            .code,
+        "profile_override"
+    );
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
+    assert!(!temp.path().join("codex/uni-switch-models.json").exists());
+    assert!(store.list().unwrap().is_empty());
+}
+
+#[test]
+fn client_preferences_survive_endpoint_apply_switch_sync_and_restore() {
+    let (temp, mut store) = fixture();
+    let config = temp.path().join("codex/config.toml");
+    put(&config, concat!(
+        "# user settings\nmodel = 'original'\nmodel_reasoning_effort = 'max' # keep effort\n",
+        "service_tier = 'flex'\nmodel_context_window = 64000\nmodel_auto_compact_token_limit = 50000\n",
+        "[features]\nfast_mode = false # keep feature\nother = true\n",
+        "[desktop]\nenabled-reasoning-efforts = ['high'] # keep display\ntheme = 'dark'\n",
+    ));
+    let original = codex_optional_settings(&config);
+    let first = store
+        .commit_provider(input(Family::Codex, "First endpoint"), Target::Codex, true)
+        .unwrap();
+    assert_eq!(codex_optional_settings(&config), original);
+    assert_optional_settings_unmanaged(&store);
+
+    let mut current: toml_edit::DocumentMut =
+        std::fs::read_to_string(&config).unwrap().parse().unwrap();
+    current["model_context_window"] = toml_edit::value(96000);
+    current["model_auto_compact_token_limit"] = toml_edit::value(72000);
+    current["features"]["fast_mode"] = toml_edit::value(true);
+    put(&config, &current.to_string());
+    let client_choices = codex_optional_settings(&config);
+    assert_eq!(store.status(Target::Codex).unwrap().state, "applied");
+
+    let second = store.save(input(Family::Codex, "Second endpoint")).unwrap();
+    store.apply(Target::Codex, &second.id).unwrap();
+    assert_eq!(codex_optional_settings(&config), client_choices);
+    assert_optional_settings_unmanaged(&store);
+    let mut edited = input(Family::Codex, "Second endpoint");
+    edited.id = Some(second.id.clone());
+    edited.api_key = Some("updated-endpoint-key".into());
+    store.save(edited).unwrap();
+    store.sync_connection(Target::Codex, &second.id).unwrap();
+    assert_eq!(codex_optional_settings(&config), client_choices);
+    assert_optional_settings_unmanaged(&store);
+    store.apply(Target::Codex, &first.id).unwrap();
+    let data = store.data_directory.clone();
+    drop(store);
+    let mut reopened = Store::open(data).unwrap();
+    reopened.restore(Target::Codex).unwrap();
+    assert_eq!(codex_optional_settings(&config), client_choices);
+    let restored: toml_edit::DocumentMut =
+        std::fs::read_to_string(config).unwrap().parse().unwrap();
+    assert_eq!(restored["model"].as_str(), Some("original"));
+}
+
+#[test]
+fn client_preferences_defaults_leave_optional_settings_unowned() {
+    let (temp, mut store) = fixture();
+    let provider = store
+        .commit_provider(input(Family::Codex, "Defaults"), Target::Codex, true)
+        .unwrap();
+    let config = temp.path().join("codex/config.toml");
+    assert!(codex_optional_settings(&config).iter().all(Option::is_none));
+    assert_optional_settings_unmanaged(&store);
+    let catalog = read_json(&temp.path().join("codex/uni-switch-models.json"));
+    assert!(catalog["models"][0]["supported_reasoning_levels"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    store.apply(Target::Codex, &provider.id).unwrap();
+    assert!(codex_optional_settings(&config).iter().all(Option::is_none));
+}
+
+#[test]
+fn client_preferences_follow_client_releases_prior_ownership() {
+    let (temp, mut store) = fixture();
+    let config = temp.path().join("codex/config.toml");
+    put(&config, "model='original'\nmodel_reasoning_effort='low'\nservice_tier='flex'\nmodel_context_window=32000\nmodel_auto_compact_token_limit=24000\n[features]\nfast_mode=false\n");
+    let mut explicit = input(Family::Codex, "Explicit options");
+    explicit.reasoning_effort = Some("high".into());
+    explicit.codex_options.fast_mode = Some(false);
+    explicit.codex_options.context_window = Some(128000);
+    explicit.codex_options.auto_compact_token_limit = Some(100000);
+    let provider = store
+        .commit_provider(explicit, Target::Codex, true)
+        .unwrap();
+    let mut current: toml_edit::DocumentMut =
+        std::fs::read_to_string(&config).unwrap().parse().unwrap();
+    assert_eq!(current["model_reasoning_effort"].as_str(), Some("high"));
+    assert_eq!(current["service_tier"].as_str(), Some("default"));
+    assert_eq!(current["features"]["fast_mode"].as_bool(), Some(true));
+    assert_eq!(current["model_context_window"].as_integer(), Some(128000));
+    current["model_context_window"] = toml_edit::value(192000);
+    current["model_auto_compact_token_limit"] = toml_edit::value(150000);
+    put(&config, &current.to_string());
+    let client_choices = codex_optional_settings(&config);
+    let mut follow = input(Family::Codex, "Follow client");
+    follow.id = Some(provider.id);
+    store.commit_provider(follow, Target::Codex, true).unwrap();
+    assert_eq!(codex_optional_settings(&config), client_choices);
+    assert_optional_settings_unmanaged(&store);
+    store.restore(Target::Codex).unwrap();
+    assert_eq!(codex_optional_settings(&config), client_choices);
+}
+
+#[test]
+fn client_preferences_model_edits_keep_global_context_overrides() {
+    let (temp, mut store) = fixture();
+    let mut value = input(Family::Codex, "Context overrides");
+    value.codex_options.context_window = Some(64000);
+    value.codex_options.auto_compact_token_limit = Some(50000);
+    let mut provider = store.commit_provider(value, Target::Codex, true).unwrap();
+    let config = temp.path().join("codex/config.toml");
+    let before = codex_optional_settings(&config);
+    let mut request = quick_input(provider.clone(), Target::Codex);
+    request.models[0].context_window = Some(128000);
+    provider = store.quick_model_settings(request).unwrap().provider;
+    assert_eq!(provider.codex_options.context_window, Some(64000));
+    assert_eq!(provider.codex_options.auto_compact_token_limit, Some(50000));
+    assert_eq!(codex_optional_settings(&config), before);
+    let result = store
+        .update_provider_models(ModelWriteInput {
+            connection: ConnectionInput {
+                provider_id: Some(provider.id),
+                base_url: provider.base_url,
+                api_key: None,
+                balance_access_token: None,
+            },
+            auth_mode: provider.auth_mode,
+            model: provider.model,
+            models: provider.codex_options.models,
+            synced_at: 123,
+        })
+        .unwrap();
+    assert_eq!(result.provider.codex_options.context_window, Some(64000));
+    assert_eq!(
+        result.provider.codex_options.auto_compact_token_limit,
+        Some(50000)
+    );
+    assert_eq!(codex_optional_settings(&config), before);
+}
+
+#[test]
+fn client_preferences_optional_profile_overrides_do_not_block_endpoints() {
+    let (temp, mut store) = fixture();
+    let config = temp.path().join("codex/config.toml");
+    let original = concat!(
+        "model='original'\nprofile='personal'\n[profiles.personal]\n",
+        "model_reasoning_effort='future-effort'\nservice_tier='future-tier'\n",
+        "model_context_window=96000\nmodel_auto_compact_token_limit=72000\n",
+        "[profiles.personal.features]\nfast_mode=false\n",
+        "[profiles.personal.desktop]\nenabled-reasoning-efforts=['future-effort']\n",
+    );
+    put(&config, original);
+    let provider = store
+        .commit_provider(
+            input(Family::Codex, "Profile endpoint"),
+            Target::Codex,
+            true,
+        )
+        .unwrap();
+    assert_optional_settings_unmanaged(&store);
+    let before = std::fs::read(&config).unwrap();
+    let mut explicit = input(Family::Codex, "Profile endpoint");
+    explicit.id = Some(provider.id.clone());
+    explicit.codex_options.fast_mode = Some(true);
+    assert_eq!(
+        store
+            .commit_provider(explicit, Target::Codex, true)
+            .unwrap_err()
+            .code,
+        "profile_override"
+    );
+    assert_eq!(std::fs::read(&config).unwrap(), before);
+    assert_eq!(
+        json(&store.provider(&provider.id).unwrap().summary).unwrap(),
+        json(&provider).unwrap()
+    );
+    store.restore(Target::Codex).unwrap();
+    assert_eq!(std::fs::read_to_string(config).unwrap(), original);
+}
+
+#[test]
+fn client_preferences_future_unmanaged_values_allow_valid_model_menu_changes() {
+    let (temp, mut store) = fixture();
+    let config = temp.path().join("codex/config.toml");
+    put(
+        &config,
+        "model='original'\nmodel_reasoning_effort='future-effort'\nservice_tier='future-tier'\n",
+    );
+    let mut value = input(Family::Codex, "Future preferences");
+    value.codex_options.models = ["test-model", "other-model"]
+        .iter()
+        .map(|id| ProviderModel {
+            id: (*id).into(),
+            context_window: None,
+            reasoning_efforts: vec![],
+            enabled: true,
+        })
+        .collect();
+    let provider = store.commit_provider(value, Target::Codex, true).unwrap();
+    let mut doc: toml_edit::DocumentMut =
+        std::fs::read_to_string(&config).unwrap().parse().unwrap();
+    doc["model"] = toml_edit::value("other-model");
+    put(&config, &doc.to_string());
+    assert_eq!(store.status(Target::Codex).unwrap().state, "applied");
+    store.apply(Target::Codex, &provider.id).unwrap();
+    store.restore(Target::Codex).unwrap();
+    let restored: toml_edit::DocumentMut =
+        std::fs::read_to_string(config).unwrap().parse().unwrap();
+    assert_eq!(
+        restored["model_reasoning_effort"].as_str(),
+        Some("future-effort")
+    );
+    assert_eq!(restored["service_tier"].as_str(), Some("future-tier"));
+}
+
+#[test]
+fn client_preferences_ownership_only_release_and_reacquire_keep_revision_and_new_baseline() {
+    let (temp, mut store) = fixture();
+    let config = temp.path().join("codex/config.toml");
+    put(&config, "model='original'\nmodel_reasoning_effort='low'\n");
+    let mut explicit = input(Family::Codex, "Release ownership");
+    explicit.reasoning_effort = Some("high".into());
+    let provider = store
+        .commit_provider(explicit, Target::Codex, true)
+        .unwrap();
+    let revision = store.status(Target::Codex).unwrap().configuration_revision;
+    let before = std::fs::read(&config).unwrap();
+    let mut follow = input(Family::Codex, "Release ownership");
+    follow.id = Some(provider.id.clone());
+    store.save(follow).unwrap();
+    assert_eq!(store.status(Target::Codex).unwrap().state, "saved_changes");
+    store.apply(Target::Codex, &provider.id).unwrap();
+    assert_optional_settings_unmanaged(&store);
+    assert_eq!(std::fs::read(&config).unwrap(), before);
+    assert_eq!(
+        store.status(Target::Codex).unwrap().configuration_revision,
+        revision
+    );
+    let mut current: toml_edit::DocumentMut =
+        std::fs::read_to_string(&config).unwrap().parse().unwrap();
+    current["model_reasoning_effort"] = toml_edit::value("ultra");
+    put(&config, &current.to_string());
+    let mut explicit = input(Family::Codex, "Release ownership");
+    explicit.id = Some(provider.id);
+    explicit.reasoning_effort = Some("high".into());
+    store
+        .commit_provider(explicit, Target::Codex, true)
+        .unwrap();
+    store.restore(Target::Codex).unwrap();
+    let restored: toml_edit::DocumentMut =
+        std::fs::read_to_string(config).unwrap().parse().unwrap();
+    assert_eq!(restored["model"].as_str(), Some("original"));
+    assert_eq!(restored["model_reasoning_effort"].as_str(), Some("ultra"));
+}
+
+#[test]
+fn client_preferences_legacy_journal_releases_unrequested_keys_without_writing_values() {
+    let (temp, mut store) = fixture();
+    let config = temp.path().join("codex/config.toml");
+    put(&config, "model='original'\nmodel_context_window=64000\n[desktop]\nenabled-reasoning-efforts=['high']\n");
+    let provider = store
+        .commit_provider(input(Family::Codex, "Old journal"), Target::Codex, true)
+        .unwrap();
+    let (_, _, baseline) = store.target_record(Target::Codex).unwrap();
+    let mut legacy = baseline.unwrap();
+    let managed = legacy
+        .iter_mut()
+        .find(|file| file.format == "toml")
+        .unwrap();
+    managed
+        .keys
+        .extend(OPTIONAL_CODEX_SETTINGS.iter().map(|key| (*key).into()));
+    store
+        .conn
+        .execute(
+            "UPDATE targets SET baseline=?1 WHERE id='codex'",
+            [json(&legacy).unwrap()],
+        )
+        .unwrap();
+    let mut current: toml_edit::DocumentMut =
+        std::fs::read_to_string(&config).unwrap().parse().unwrap();
+    current["model_context_window"] = toml_edit::value(96000);
+    put(&config, &current.to_string());
+    let client_values = codex_optional_settings(&config);
+    store.apply(Target::Codex, &provider.id).unwrap();
+    assert_optional_settings_unmanaged(&store);
+    store.restore(Target::Codex).unwrap();
+    assert_eq!(codex_optional_settings(&config), client_values);
+}
+
+#[test]
+fn conversion_preferences_are_per_target_and_block_incompatible_writes() {
+    let (temp, mut store) = fixture();
+    let value = input(Family::Codex, "Shared OpenAI");
+    let original = store.save(value).unwrap();
+    assert!(original.conversion_enabled(Target::ClaudeCli));
+    let saved = store
+        .set_protocol_conversion(original.clone(), Target::ClaudeCli, false)
+        .unwrap();
+    assert!(!saved.restored);
+    assert!(!saved.provider.conversion_enabled(Target::ClaudeCli));
+    assert!(saved.provider.conversion_enabled(Target::ClaudeDesktop));
+    assert!(store.apply(Target::Codex, &original.id).is_ok());
+    let config_before = adapters::read(&temp.path().join("claude_cli/settings.json")).unwrap();
+    assert_eq!(
+        store
+            .apply(Target::ClaudeCli, &original.id)
+            .unwrap_err()
+            .code,
+        "conversion_required"
+    );
+    assert_eq!(
+        adapters::read(&temp.path().join("claude_cli/settings.json")).unwrap(),
+        config_before
+    );
+    let enabled = store
+        .set_protocol_conversion(saved.provider, Target::ClaudeCli, true)
+        .unwrap();
+    assert!(enabled.provider.conversion_enabled(Target::ClaudeCli));
+    assert_eq!(store.status(Target::Codex).unwrap().state, "applied");
+    assert_eq!(
+        store
+            .set_protocol_conversion(enabled.provider, Target::Codex, false)
+            .unwrap_err()
+            .code,
+        "conversion_not_required"
+    );
+}
+
+#[test]
+fn disabling_applied_conversion_restores_only_that_client_and_persists() {
+    for target in [Target::Codex, Target::ClaudeDesktop, Target::ClaudeCli] {
+        let (temp, mut store) = fixture();
+        let (route, _listener) = crate::bridge::Route::bind(&store.data_directory).unwrap();
+        store.set_bridge_route(route);
+        let mut value = input(
+            if target == Target::Codex {
+                Family::Claude
+            } else {
+                Family::Codex
+            },
+            "Converted",
+        );
+        let other = if target == Target::Codex {
+            Target::ClaudeCli
+        } else {
+            Target::Codex
+        };
+        value.codex_options.upstream_protocol = Some(if target == Target::Codex {
+            CodexProtocol::Anthropic
+        } else {
+            CodexProtocol::Openai
+        });
+        let provider = store.save(value).unwrap();
+        let directory = temp.path().join(target.id());
+        let originals: Vec<_> = adapters::specifications(target, &directory)
+            .iter()
+            .map(|(p, _, _)| (p.clone(), adapters::read(p).unwrap()))
+            .collect();
+        store.apply(target, &provider.id).unwrap();
+        store.apply(other, &provider.id).unwrap();
+        let before_revision = store.status(target).unwrap().configuration_revision;
+        let other_before: Vec<_> = adapters::specifications(other, &temp.path().join(other.id()))
+            .iter()
+            .map(|(p, _, _)| (p.clone(), adapters::read(p).unwrap()))
+            .collect();
+        let saved = store
+            .set_protocol_conversion(provider, target, false)
+            .unwrap();
+        assert!(saved.restored);
+        assert!(store.status(target).unwrap().active_provider_id.is_none());
+        assert!(store.status(target).unwrap().configuration_revision > before_revision);
+        assert!(store.bridge_record(target).unwrap().is_none());
+        for (path, original) in originals {
+            assert_eq!(adapters::read(&path).unwrap(), original);
+        }
+        for (path, original) in other_before {
+            assert_eq!(adapters::read(&path).unwrap(), original);
+        }
+        assert_eq!(store.status(other).unwrap().state, "applied");
+        drop(store);
+        let mut store = Store::open(temp.path().join("数据 目录")).unwrap();
+        assert_eq!(
+            store.apply(target, &saved.provider.id).unwrap_err().code,
+            "conversion_required"
+        );
+        let enabled = store
+            .set_protocol_conversion(saved.provider, target, true)
+            .unwrap();
+        assert!(enabled.provider.conversion_enabled(target));
+        assert!(store.status(target).unwrap().active_provider_id.is_none());
+    }
+}
+
+#[test]
+fn disabling_desktop_conversion_after_model_fast_and_sync_preserves_other_target_statuses() {
+    let (_temp, mut store) = fixture();
+    let (route, _listener) = crate::bridge::Route::bind(&store.data_directory).unwrap();
+    store.set_bridge_route(route);
+    let targets = [Target::Codex, Target::ClaudeDesktop, Target::ClaudeCli];
+    let mut value = input(Family::Codex, "Shared OpenAI lifecycle");
+    value.codex_options.models = vec![
+        ProviderModel {
+            id: value.model.clone(),
+            context_window: Some(256_000),
+            reasoning_efforts: vec![],
+            enabled: true,
+        },
+        ProviderModel {
+            id: "quick-selected-model".into(),
+            context_window: Some(256_000),
+            reasoning_efforts: vec![],
+            enabled: true,
+        },
+    ];
+    let mut provider = store.save(value.clone()).unwrap();
+    for target in targets {
+        store.apply(target, &provider.id).unwrap();
+    }
+
+    let mut quick = quick_input(provider.clone(), Target::Codex);
+    quick.model = "quick-selected-model".into();
+    quick.models = provider.codex_options.models.clone();
+    provider = store.quick_model_settings(quick).unwrap().provider;
+    let mut context = quick_input(provider.clone(), Target::Codex);
+    context.models = provider.codex_options.models.clone();
+    context.models[1].context_window = Some(128_000);
+    provider = store.quick_model_settings(context).unwrap().provider;
+    for enabled in [true, false] {
+        provider = store
+            .set_provider_fast_mode(&provider.id, enabled)
+            .unwrap()
+            .provider;
+    }
+    for target in targets {
+        store.apply(target, &provider.id).unwrap();
+    }
+
+    // The UI first saves an active connection, then explicitly synchronizes
+    // the other clients while retaining their applied model/context choices.
+    for key in ["rotated-synthetic-key", "test-key-1234"] {
+        let mut edit = value.clone();
+        edit.id = Some(provider.id.clone());
+        edit.model = provider.model.clone();
+        edit.codex_options = provider.codex_options.clone();
+        edit.api_key = Some(key.into());
+        provider = store.commit_provider(edit, Target::Codex, true).unwrap();
+        for target in [Target::ClaudeDesktop, Target::ClaudeCli] {
+            assert_eq!(store.status(target).unwrap().state, "saved_changes");
+        }
+        for target in targets {
+            store.sync_connection(target, &provider.id).unwrap();
+            assert_eq!(store.status(target).unwrap().state, "applied");
+        }
+    }
+    let before: Vec<_> = targets
+        .into_iter()
+        .map(|target| {
+            let status = store.status(target).unwrap();
+            assert_eq!(status.state, "applied");
+            let files: Vec<_> = store
+                .target_record(target)
+                .unwrap()
+                .2
+                .unwrap()
+                .into_iter()
+                .map(|file| {
+                    let bytes = std::fs::read(&file.path).ok();
+                    (file.path, bytes)
+                })
+                .collect();
+            (target, serde_json::to_value(status).unwrap(), files)
+        })
+        .collect();
+    let original_source = store.provider(&provider.id).unwrap();
+    assert!(original_source
+        .summary
+        .codex_options
+        .conversion_disabled_targets
+        .is_empty());
+    let source_before = Store::source_signature(&original_source).unwrap();
+    for preferences in [
+        vec![Target::ClaudeDesktop],
+        vec![Target::ClaudeCli],
+        vec![Target::ClaudeDesktop, Target::ClaudeCli],
+        vec![Target::ClaudeCli, Target::ClaudeDesktop],
+        vec![],
+    ] {
+        let mut candidate = original_source.clone();
+        candidate.summary.codex_options.conversion_disabled_targets = preferences;
+        assert_eq!(
+            Store::source_signature(&candidate).unwrap(),
+            source_before,
+            "adding, switching or reordering conversion preferences must not change the source"
+        );
+    }
+    let disabled = store
+        .set_protocol_conversion(provider, Target::ClaudeDesktop, false)
+        .unwrap();
+    assert!(disabled.restored);
+    assert_eq!(
+        Store::source_signature(&store.provider(&disabled.provider.id).unwrap()).unwrap(),
+        source_before
+    );
+    for (target, status, files) in before {
+        if target == Target::ClaudeDesktop {
+            assert!(store.status(target).unwrap().active_provider_id.is_none());
+            continue;
+        }
+        assert_eq!(
+            serde_json::to_value(store.status(target).unwrap()).unwrap(),
+            status,
+            "disabling Desktop conversion must preserve the entire {target:?} status"
+        );
+        for (path, bytes) in files {
+            assert_eq!(std::fs::read(path).ok(), bytes);
+        }
+    }
+    assert_eq!(
+        store
+            .apply(Target::ClaudeDesktop, &disabled.provider.id)
+            .unwrap_err()
+            .code,
+        "conversion_required"
+    );
+    for change_model in [true, false] {
+        let mut saved = value.clone();
+        saved.id = Some(disabled.provider.id.clone());
+        saved.model = disabled.provider.model.clone();
+        saved.codex_options = disabled.provider.codex_options.clone();
+        store.save(saved.clone()).unwrap();
+        for target in [Target::Codex, Target::ClaudeCli] {
+            assert_eq!(store.status(target).unwrap().state, "applied");
+        }
+        if change_model {
+            saved.model = value.model.clone();
+        } else {
+            saved.api_key = Some("new-pending-synthetic-key".into());
+        }
+        store.save(saved).unwrap();
+        assert_ne!(
+            Store::source_signature(&store.provider(&disabled.provider.id).unwrap()).unwrap(),
+            source_before,
+            "a genuine model or key edit must still change the source signature"
+        );
+        for target in [Target::Codex, Target::ClaudeCli] {
+            assert_eq!(store.status(target).unwrap().state, "saved_changes");
+        }
+    }
+}
+
+#[test]
+fn conversion_toggle_rejects_stale_supplier_and_external_changes_without_mutation() {
+    let (temp, mut store) = fixture();
+    let (route, _listener) = crate::bridge::Route::bind(&store.data_directory).unwrap();
+    store.set_bridge_route(route);
+    let p = store
+        .save(input(Family::Claude, "Claude upstream"))
+        .unwrap();
+    store.apply(Target::Codex, &p.id).unwrap();
+    let path = temp.path().join("codex/config.toml");
+    let mut config = adapters::read(&path)
+        .unwrap()
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    config["model"] = toml_edit::value("externally-changed");
+    put(&path, &config.to_string());
+    assert_eq!(
+        store
+            .set_protocol_conversion(p.clone(), Target::Codex, false)
+            .unwrap_err()
+            .code,
+        "configuration_changed"
+    );
+    assert_eq!(adapters::read(&path).unwrap().unwrap(), config.to_string());
+    assert!(store
+        .provider(&p.id)
+        .unwrap()
+        .summary
+        .conversion_enabled(Target::Codex));
+    let mut stale = p.clone();
+    stale.name = "stale supplier".into();
+    assert_eq!(
+        store
+            .set_protocol_conversion(stale, Target::Codex, false)
+            .unwrap_err()
+            .code,
+        "provider_changed"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn failed_conversion_restore_keeps_switch_and_active_snapshot_enabled() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+    let (temp, mut store) = fixture();
+    let (route, _listener) = crate::bridge::Route::bind(&store.data_directory).unwrap();
+    store.set_bridge_route(route);
+    let path = temp.path().join("codex/config.toml");
+    put(&path, "model='original'\n");
+    let provider = store.save(input(Family::Claude, "Converted")).unwrap();
+    store.apply(Target::Codex, &provider.id).unwrap();
+    let before: Vec<_> = adapters::specifications(Target::Codex, &temp.path().join("codex"))
+        .iter()
+        .map(|(p, _, _)| (p.clone(), adapters::read(p).unwrap()))
+        .collect();
+    let revision = store.status(Target::Codex).unwrap().configuration_revision;
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(&path)
+        .unwrap();
+    assert!(store
+        .set_protocol_conversion(provider.clone(), Target::Codex, false)
+        .is_err());
+    drop(held);
+    for (path, content) in before {
+        assert_eq!(adapters::read(&path).unwrap(), content);
+    }
+    assert!(store
+        .provider(&provider.id)
+        .unwrap()
+        .summary
+        .conversion_enabled(Target::Codex));
+    assert_eq!(
+        store
+            .status(Target::Codex)
+            .unwrap()
+            .active_provider_id
+            .as_deref(),
+        Some(provider.id.as_str())
+    );
+    assert_eq!(
+        store.status(Target::Codex).unwrap().configuration_revision,
+        revision
+    );
+    assert!(store.bridge_record(Target::Codex).unwrap().is_some());
+    assert!(
+        store
+            .set_protocol_conversion(provider, Target::Codex, false)
+            .unwrap()
+            .restored
+    );
+    assert_eq!(
+        adapters::read(&path)
+            .unwrap()
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap()["model"]
+            .as_str(),
+        Some("original")
+    );
+}
+
+#[test]
+fn protocol_detection_uses_saved_key_and_retains_models_preferences_and_live_files() {
+    let (temp, mut store) = fixture();
+    let mut value = input(Family::Codex, "Detected connection");
+    value.codex_options.conversion_disabled_targets = vec![Target::ClaudeCli];
+    let p = store.save(value).unwrap();
+    store.apply(Target::Codex, &p.id).unwrap();
+    let path = temp.path().join("codex/config.toml");
+    let before = adapters::read(&path).unwrap();
+    let (base, key, protocol, auth) = store.protocol_probe_connection(&p).unwrap();
+    assert_eq!(base, p.base_url);
+    assert_eq!(key, "test-key-1234");
+    assert!(protocol.is_none() && auth.is_none());
+    let result = ModelSyncResult {
+        models: vec![],
+        synced_at: 1234,
+        protocol: CodexProtocol::Openai,
+        auth_mode: p.auth_mode.clone(),
+        base_url: p.base_url.clone(),
+    };
+    let detected = store.accept_protocol_detection(p.clone(), result).unwrap();
+    assert_eq!(detected.codex_options.protocol_detected_at, Some(1234));
+    assert_eq!(
+        detected.codex_options.conversion_disabled_targets,
+        vec![Target::ClaudeCli]
+    );
+    assert_eq!(
+        json(&detected.codex_options.models).unwrap(),
+        json(&p.codex_options.models).unwrap()
+    );
+    assert_eq!(before, adapters::read(&path).unwrap());
+    assert_eq!(store.status(Target::Codex).unwrap().state, "applied");
+    assert_eq!(
+        store.protocol_probe_connection(&p).unwrap_err().code,
+        "provider_changed"
+    );
+}
+
+fn assert_automatic_reasoning(directory: &Path) {
+    let config = std::fs::read_to_string(directory.join("config.toml"))
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    let display = config["desktop"]["enabled-reasoning-efforts"]
+        .as_array()
+        .unwrap();
+    let catalog = read_json(&directory.join("uni-switch-models.json"));
+    assert!(!catalog["models"].as_array().unwrap().is_empty());
+    for effort in [
+        "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+    ] {
+        assert!(display.iter().any(|v| v.as_str() == Some(effort)));
+        for model in catalog["models"].as_array().unwrap() {
+            assert_eq!(
+                model["supported_reasoning_levels"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|v| v["effort"] == effort)
+                    .count(),
+                1
+            );
+        }
+    }
+}
+
+fn hide_max(directory: &Path) {
+    let config = directory.join("config.toml");
+    let mut doc = std::fs::read_to_string(&config)
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    let mut display = toml_edit::Array::new();
+    display.push("high");
+    doc["desktop"]["enabled-reasoning-efforts"] = toml_edit::value(display);
+    put(&config, &doc.to_string());
+    let path = directory.join("uni-switch-models.json");
+    let mut catalog = read_json(&path);
+    for model in catalog["models"].as_array_mut().unwrap() {
+        model["supported_reasoning_levels"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|entry| entry["effort"] != "max");
+    }
+    put(&path, &serde_json::to_string_pretty(&catalog).unwrap());
+}
+
+#[test]
+fn explicit_reasoning_repair_is_opt_in_for_legacy_and_shared_providers() {
+    for family in [Family::Codex, Family::Claude] {
+        let (temp, mut store) = fixture();
+        store.set_bridge_route(crate::bridge::Route {
+            port: 19881,
+            token: "d".repeat(64),
+        });
+        let provider = store.save(input(family, "Automatic")).unwrap();
+        assert!(!provider.codex_options.repair_reasoning_levels);
+        store.apply(Target::Codex, &provider.id).unwrap();
+        assert_optional_settings_unmanaged(&store);
+        let catalog = read_json(&temp.path().join("codex/uni-switch-models.json"));
+        assert!(catalog["models"][0]["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let mut explicit = input(family, "Explicit repair");
+        explicit.id = Some(provider.id.clone());
+        explicit.codex_options.repair_reasoning_levels = true;
+        let repaired = store
+            .commit_provider(explicit, Target::Codex, true)
+            .unwrap();
+        assert_automatic_reasoning(&temp.path().join("codex"));
+        assert_eq!(
+            json(&store.provider(&provider.id).unwrap().summary).unwrap(),
+            json(&repaired).unwrap()
+        );
+        let revision = store.status(Target::Codex).unwrap().configuration_revision;
+        store.apply(Target::Codex, &provider.id).unwrap();
+        assert_eq!(
+            store.status(Target::Codex).unwrap().configuration_revision,
+            revision
+        );
+        hide_max(&temp.path().join("codex"));
+        store.restore(Target::Codex).unwrap();
+        assert!(!temp.path().join("codex/config.toml").exists());
+        assert!(!temp.path().join("codex/uni-switch-models.json").exists());
+    }
+}
+
+#[test]
+fn explicit_reasoning_repair_survives_model_updates_and_fast_does_not_repair() {
+    let (temp, mut store) = fixture();
+    let dir = temp.path().join("codex");
+    let mut value = input(Family::Codex, "Automatic updates");
+    value.codex_options.repair_reasoning_levels = true;
+    value.codex_options.models = vec![ProviderModel {
+        id: value.model.clone(),
+        enabled: true,
+        reasoning_efforts: vec![],
+        context_window: Some(256_000),
+    }];
+    let mut provider = store.commit_provider(value, Target::Codex, true).unwrap();
+    for action in ["context", "default", "sync", "fast", "same"] {
+        hide_max(&dir);
+        assert_eq!(store.status(Target::Codex).unwrap().state, "applied");
+        let revision = store.status(Target::Codex).unwrap().configuration_revision;
+        match action {
+            "fast" => {
+                let before_display = codex_optional_settings(&dir.join("config.toml"))[5].clone();
+                provider = store
+                    .set_provider_fast_mode(&provider.id, true)
+                    .unwrap()
+                    .provider;
+                assert_eq!(
+                    codex_optional_settings(&dir.join("config.toml"))[5],
+                    before_display
+                );
+                provider = store
+                    .repair_reasoning_levels(&provider.id)
+                    .unwrap()
+                    .provider;
+            }
+            "sync" => {
+                store.sync_connection(Target::Codex, &provider.id).unwrap();
+            }
+            _ => {
+                let mut request = quick_input(provider.clone(), Target::Codex);
+                request.models = provider.codex_options.models.clone();
+                if action == "context" {
+                    request.models[0].context_window = Some(192_000);
+                }
+                if action == "default" {
+                    request.model = "gpt-next".into();
+                    request.models.push(ProviderModel {
+                        id: request.model.clone(),
+                        enabled: true,
+                        reasoning_efforts: vec![],
+                        context_window: Some(256_000),
+                    });
+                }
+                provider = store.quick_model_settings(request).unwrap().provider;
+            }
+        }
+        assert_automatic_reasoning(&dir);
+        assert!(store.status(Target::Codex).unwrap().configuration_revision > revision);
+    }
+    let revision = store.status(Target::Codex).unwrap().configuration_revision;
+    let mut request = quick_input(provider.clone(), Target::Codex);
+    request.models = provider.codex_options.models.clone();
+    store.quick_model_settings(request).unwrap();
+    store.set_provider_fast_mode(&provider.id, true).unwrap();
+    assert_eq!(
+        store.status(Target::Codex).unwrap().configuration_revision,
+        revision
+    );
+}
+
+#[test]
+fn explicit_reasoning_repair_rejects_other_catalog_changes_without_partial_writes() {
+    for field in ["context_window", "description", "reasoning_description"] {
+        let (temp, mut store) = fixture();
+        let mut value = input(Family::Codex, "Guard");
+        value.codex_options.repair_reasoning_levels = true;
+        let provider = store.commit_provider(value, Target::Codex, true).unwrap();
+        let dir = temp.path().join("codex");
+        hide_max(&dir);
+        let path = dir.join("uni-switch-models.json");
+        let mut catalog = read_json(&path);
+        if field == "reasoning_description" {
+            catalog["models"][0]["supported_reasoning_levels"][0]["description"] =
+                json!("External");
+        } else {
+            catalog["models"][0][field] = json!("External");
+        }
+        put(&path, &serde_json::to_string_pretty(&catalog).unwrap());
+        let before = std::fs::read(&path).unwrap();
+        let config_before = std::fs::read(dir.join("config.toml")).unwrap();
+        assert_eq!(
+            store
+                .set_provider_fast_mode(&provider.id, true)
+                .unwrap_err()
+                .code,
+            "external_change"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            std::fs::read(dir.join("config.toml")).unwrap(),
+            config_before
+        );
+        assert_eq!(
+            json(&store.provider(&provider.id).unwrap().summary).unwrap(),
+            json(&provider).unwrap()
+        );
+    }
+}
+
+#[test]
+fn fast_upgrade_keeps_unowned_display_preferences_and_captures_only_fast_fields() {
+    let (temp, mut store) = fixture();
+    let provider = store
+        .commit_provider(input(Family::Codex, "Old baseline"), Target::Codex, true)
+        .unwrap();
+    let dir = temp.path().join("codex");
+    let (_, _, baseline) = store.target_record(Target::Codex).unwrap();
+    let mut baseline = baseline.unwrap();
+    // A 0.5.8 provider without the optional repair had no catalog and did not
+    // own desktop display preferences. Fast must not start managing them.
+    for file in &mut baseline {
+        if file.format == "toml" {
+            let mut legacy = file
+                .expected
+                .as_ref()
+                .unwrap()
+                .parse::<toml_edit::DocumentMut>()
+                .unwrap();
+            legacy.as_table_mut().remove("model_catalog_json");
+            let mut choices = toml_edit::Array::new();
+            choices.push("high");
+            legacy["desktop"]["enabled-reasoning-efforts"] = toml_edit::value(choices);
+            legacy["desktop"]["theme"] = toml_edit::value("dark");
+            file.expected = Some(legacy.to_string());
+            file.keys.retain(|k| k != adapters::REASONING_DISPLAY_KEY);
+            put(&file.path, file.expected.as_ref().unwrap());
+        }
+        if file.format == "catalog" {
+            file.expected = None;
+            file.original = None;
+            std::fs::remove_file(&file.path).unwrap();
+        }
+    }
+    baseline.retain(|file| file.format != "catalog");
+    store
+        .conn
+        .execute(
+            "UPDATE targets SET baseline=?1 WHERE id='codex'",
+            [json(&baseline).unwrap()],
+        )
+        .unwrap();
+    let mut pending = input(Family::Codex, "Old baseline");
+    pending.id = Some(provider.id.clone());
+    pending.api_key = Some("unconfirmed-key".into());
+    pending.model = "unconfirmed-model".into();
+    store.save(pending).unwrap();
+    store.set_provider_fast_mode(&provider.id, true).unwrap();
+    let doc: toml_edit::DocumentMut = std::fs::read_to_string(dir.join("config.toml"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        doc["desktop"]["enabled-reasoning-efforts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let (_, _, current) = store.target_record(Target::Codex).unwrap();
+    assert!(!current
+        .unwrap()
+        .iter()
+        .flat_map(|file| &file.keys)
+        .any(|key| key == adapters::REASONING_DISPLAY_KEY));
+    let text = std::fs::read_to_string(dir.join("config.toml")).unwrap();
+    assert!(!text.contains("unconfirmed"));
+    assert_eq!(store.status(Target::Codex).unwrap().state, "saved_changes");
+    store.restore(Target::Codex).unwrap();
+    let restored = std::fs::read_to_string(dir.join("config.toml"))
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    let display = restored["desktop"]["enabled-reasoning-efforts"]
+        .as_array()
+        .unwrap();
+    assert_eq!(display.len(), 1);
+    assert_eq!(display.get(0).unwrap().as_str(), Some("high"));
+    assert_eq!(restored["desktop"]["theme"].as_str(), Some("dark"));
+    assert!(!dir.join("uni-switch-models.json").exists());
+}
+
+#[test]
+fn inline_rename_preserves_credentials_files_revision_and_active_status() {
+    let (temp, mut store) = fixture();
+    let provider = store
+        .commit_provider(input(Family::Codex, "Before"), Target::Codex, true)
+        .unwrap();
+    let before = std::fs::read(temp.path().join("codex/config.toml")).unwrap();
+    let revision = store.status(Target::Codex).unwrap().configuration_revision;
+    let renamed = store
+        .rename_provider(provider.clone(), " 新名称 ".into())
+        .unwrap();
+    assert_eq!(renamed.name, "新名称");
+    assert_eq!(store.status(Target::Codex).unwrap().state, "applied");
+    assert_eq!(
+        store.status(Target::Codex).unwrap().configuration_revision,
+        revision
+    );
+    assert_eq!(
+        std::fs::read(temp.path().join("codex/config.toml")).unwrap(),
+        before
+    );
+    assert_eq!(
+        store.provider(&renamed.id).unwrap().api_key,
+        "test-key-1234"
+    );
+    assert_eq!(
+        store
+            .rename_provider(provider, "Stale".into())
+            .unwrap_err()
+            .code,
+        "provider_changed"
+    );
+}
+
+#[test]
+fn inline_models_keep_other_shared_targets_independent_and_work_with_claude_on_codex() {
+    let (temp, mut store) = fixture();
+    store.set_bridge_route(crate::bridge::Route {
+        port: 19881,
+        token: "d".repeat(64),
+    });
+    let provider = store.save(input(Family::Claude, "Shared Claude")).unwrap();
+    for target in [Target::Codex, Target::ClaudeDesktop, Target::ClaudeCli] {
+        store.apply(target, &provider.id).unwrap();
+    }
+    let cli_before = std::fs::read(temp.path().join("claude_cli/settings.json")).unwrap();
+    let desktop_files = store.status(Target::ClaudeDesktop).unwrap().files;
+    let desktop_before: Vec<_> = desktop_files
+        .iter()
+        .map(|path| std::fs::read(path).ok())
+        .collect();
+    let mut request = quick_input(provider.clone(), Target::Codex);
+    request.models[0].context_window = Some(192_000);
+    request.repair_reasoning_levels = Some(true);
+    let saved = store.quick_model_settings(request).unwrap();
+    assert!(saved.applied);
+    assert_eq!(saved.provider.family, Family::Claude);
+    let catalog = read_json(&temp.path().join("codex/uni-switch-models.json"));
+    assert_eq!(catalog["models"][0]["context_window"], 192_000);
+    assert_eq!(
+        std::fs::read(temp.path().join("claude_cli/settings.json")).unwrap(),
+        cli_before
+    );
+    assert_eq!(
+        desktop_files
+            .iter()
+            .map(|path| std::fs::read(path).ok())
+            .collect::<Vec<_>>(),
+        desktop_before
+    );
+    assert_eq!(store.status(Target::Codex).unwrap().state, "applied");
+    assert_eq!(
+        store.status(Target::ClaudeCli).unwrap().applied_model,
+        Some(provider.model)
+    );
+}
+
+#[test]
+fn model_refresh_replaces_catalog_and_removed_client_selection_without_reintroducing_ids() {
+    // Cover both a retired default and a retired model selected inside Codex.
+    for retire_default in [false, true] {
+        let (temp, mut store) = fixture();
+        let mut value = input(Family::Codex, "Refreshed catalog");
+        let initial = ["gpt-kept", "gpt-retired", "gpt-off"];
+        value.model = if retire_default {
+            "gpt-retired"
+        } else {
+            "gpt-kept"
+        }
+        .into();
+        value.codex_options.fast_mode = Some(true);
+        value.codex_options.models = initial
+            .iter()
+            .map(|id| ProviderModel {
+                id: (*id).into(),
+                context_window: Some(512_000),
+                reasoning_efforts: vec![],
+                enabled: *id != "gpt-off",
+            })
+            .collect();
+        let provider = store.commit_provider(value, Target::Codex, true).unwrap();
+        let config_path = temp.path().join("codex/config.toml");
+        let mut config = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        config["model"] = toml_edit::value("gpt-retired");
+        config["model_reasoning_effort"] = toml_edit::value("max");
+        std::fs::write(&config_path, config.to_string()).unwrap();
+        let mut request = quick_input(provider.clone(), Target::Codex);
+        request.model = "gpt-kept".into();
+        request.models = vec![
+            ProviderModel {
+                id: "gpt-kept".into(),
+                context_window: Some(512_000),
+                reasoning_efforts: vec![],
+                enabled: true,
+            },
+            ProviderModel {
+                id: "gpt-new".into(),
+                context_window: Some(256_000),
+                reasoning_efforts: vec![],
+                enabled: true,
+            },
+            ProviderModel {
+                id: "gpt-off".into(),
+                context_window: Some(512_000),
+                reasoning_efforts: vec![],
+                enabled: false,
+            },
+        ];
+        request.synced_at = Some(456);
+        let saved = store.quick_model_settings(request).unwrap();
+        assert!(saved.applied);
+        assert!(!saved
+            .provider
+            .codex_options
+            .models
+            .iter()
+            .any(|m| m.id == "gpt-retired"));
+        let catalog_path = temp.path().join("codex/uni-switch-models.json");
+        let catalog = read_json(&catalog_path);
+        assert_eq!(
+            catalog["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["slug"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["gpt-kept", "gpt-new"]
+        );
+        assert_eq!(catalog["models"][0]["context_window"], 512_000);
+        let config = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        assert_eq!(config["model"].as_str(), Some("gpt-kept"));
+        assert_eq!(config["model_reasoning_effort"].as_str(), Some("max"));
+        assert_eq!(config["service_tier"].as_str(), Some("priority"));
+        assert_eq!(
+            Path::new(config["model_catalog_json"].as_str().unwrap())
+                .canonicalize()
+                .unwrap(),
+            catalog_path.canonicalize().unwrap()
+        );
+        assert_eq!(store.status(Target::Codex).unwrap().state, "applied");
+        let data_dir = store.data_directory.clone();
+        drop(store);
+        let mut store = Store::open(data_dir).unwrap();
+        let provider = store.provider(&provider.id).unwrap().summary;
+        let mut repeat = quick_input(provider.clone(), Target::Codex);
+        repeat.models = provider.codex_options.models;
+        store.quick_model_settings(repeat).unwrap();
+        assert!(!std::fs::read_to_string(catalog_path)
+            .unwrap()
+            .contains("gpt-retired"));
+    }
+}
+
+#[test]
+fn inline_model_settings_apply_to_each_active_client_and_preserve_other_settings() {
+    for target in [Target::Codex, Target::ClaudeDesktop, Target::ClaudeCli] {
+        let (temp, mut store) = fixture();
+        let mut value = input(target.family(), "Inline");
+        value.codex_options.models = vec![ProviderModel {
+            id: value.model.clone(),
+            context_window: Some(256_000),
+            reasoning_efforts: vec![],
+            enabled: true,
+        }];
+        let provider = store.commit_provider(value, target, true).unwrap();
+        let before = store.status(target).unwrap().configuration_revision;
+        let mut request = quick_input(provider.clone(), target);
+        request.model = if target == Target::Codex {
+            "gpt-next".into()
+        } else {
+            "claude-opus-4-6".into()
+        };
+        request.models.push(ProviderModel {
+            id: request.model.clone(),
+            context_window: Some(512_000),
+            reasoning_efforts: vec![],
+            enabled: true,
+        });
+        let saved = store.quick_model_settings(request).unwrap();
+        assert!(saved.applied);
+        assert!(store.status(target).unwrap().configuration_revision > before);
+        assert_eq!(
+            store.status(target).unwrap().applied_model.as_deref(),
+            Some(saved.provider.model.as_str())
+        );
+        assert_eq!(
+            store.provider(&provider.id).unwrap().api_key,
+            "test-key-1234"
+        );
+        assert_eq!(saved.provider.base_url, provider.base_url);
+        if target == Target::Codex {
+            let catalog = read_json(&temp.path().join("codex/uni-switch-models.json"));
+            assert_eq!(catalog["models"][1]["context_window"], 512_000);
+        }
+    }
+}
+
+#[test]
+fn inline_inactive_selection_does_not_switch_or_write_client_and_applies_later() {
+    let (temp, mut store) = fixture();
+    let active = store
+        .commit_provider(input(Family::Codex, "Active"), Target::Codex, true)
+        .unwrap();
+    let other = store.save(input(Family::Codex, "Other")).unwrap();
+    let before = std::fs::read(temp.path().join("codex/config.toml")).unwrap();
+    let mut request = quick_input(other.clone(), Target::Codex);
+    request.models[0].context_window = Some(128_000);
+    request.repair_reasoning_levels = Some(true);
+    let saved = store.quick_model_settings(request).unwrap();
+    assert!(!saved.applied);
+    assert_eq!(
+        std::fs::read(temp.path().join("codex/config.toml")).unwrap(),
+        before
+    );
+    assert_eq!(
+        store.status(Target::Codex).unwrap().active_provider_id,
+        Some(active.id)
+    );
+    store.apply(Target::Codex, &other.id).unwrap();
+    let catalog = read_json(&temp.path().join("codex/uni-switch-models.json"));
+    assert_eq!(catalog["models"][0]["context_window"], 128_000);
+}
+
+#[test]
+fn inline_rejects_stale_provider_empty_selection_and_external_changes_atomically() {
+    let (temp, mut store) = fixture();
+    let provider = store
+        .commit_provider(input(Family::Codex, "Guard"), Target::Codex, true)
+        .unwrap();
+    let mut stale = quick_input(provider.clone(), Target::Codex);
+    stale.expected.name = "Old view".into();
+    assert_eq!(
+        store.quick_model_settings(stale).unwrap_err().code,
+        "provider_changed"
+    );
+    let mut invalid = quick_input(provider.clone(), Target::Codex);
+    invalid.models[0].enabled = false;
+    assert_eq!(
+        store.quick_model_settings(invalid).unwrap_err().code,
+        "no_enabled_models"
+    );
+    let config = temp.path().join("codex/config.toml");
+    let external = std::fs::read_to_string(&config)
+        .unwrap()
+        .replace("test-model", "external-model");
+    std::fs::write(&config, &external).unwrap();
+    assert_eq!(
+        store
+            .quick_model_settings(quick_input(provider.clone(), Target::Codex))
+            .unwrap_err()
+            .code,
+        "configuration_changed"
+    );
+    assert_eq!(std::fs::read_to_string(config).unwrap(), external);
+    assert_eq!(
+        json(&store.provider(&provider.id).unwrap().summary).unwrap(),
+        json(&provider).unwrap()
+    );
+}
+
+#[test]
+fn inline_context_and_repair_preserve_client_model_effort_and_fast_without_noop_prompt() {
+    let (temp, mut store) = fixture();
+    let mut value = input(Family::Codex, "Choices");
+    value.codex_options.models = vec![ProviderModel {
+        id: value.model.clone(),
+        context_window: Some(256_000),
+        reasoning_efforts: vec![],
+        enabled: true,
+    }];
+    let provider = store.commit_provider(value, Target::Codex, true).unwrap();
+    let config = temp.path().join("codex/config.toml");
+    let mut doc = std::fs::read_to_string(&config)
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    doc["model_reasoning_effort"] = toml_edit::value("max");
+    doc["service_tier"] = toml_edit::value("flex");
+    std::fs::write(&config, doc.to_string()).unwrap();
+    let mut request = quick_input(provider, Target::Codex);
+    request.models[0].context_window = Some(128_000);
+    request.repair_reasoning_levels = Some(true);
+    let saved = store.quick_model_settings(request).unwrap().provider;
+    let after = std::fs::read_to_string(&config)
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    assert_eq!(after["model_reasoning_effort"].as_str(), Some("max"));
+    assert_eq!(after["service_tier"].as_str(), Some("flex"));
+    let revision = store.status(Target::Codex).unwrap().configuration_revision;
+    let mut same = quick_input(saved, Target::Codex);
+    same.models[0].context_window = Some(128_000);
+    same.repair_reasoning_levels = Some(true);
+    store.quick_model_settings(same).unwrap();
+    assert_eq!(
+        store.status(Target::Codex).unwrap().configuration_revision,
+        revision
+    );
+}
+#[test]
+fn overview_exposes_actual_configuration_write_revision_without_process_inspection() {
+    let (_temp, mut store) = fixture();
+    assert_eq!(
+        store.status(Target::Codex).unwrap().configuration_revision,
+        0
+    );
+    let p = store
+        .save(input(Family::Codex, "write notification"))
+        .unwrap();
+    assert_eq!(
+        store.status(Target::Codex).unwrap().configuration_revision,
+        0
+    );
+    store.apply(Target::Codex, &p.id).unwrap();
+    let revision = store.status(Target::Codex).unwrap().configuration_revision;
+    assert!(revision > 0);
+    assert_eq!(revision, store.runtime_context(Target::Codex).unwrap().1);
+    store.apply(Target::Codex, &p.id).unwrap();
+    assert_eq!(
+        store.status(Target::Codex).unwrap().configuration_revision,
+        revision
+    );
+    store.set_provider_fast_mode(&p.id, true).unwrap();
+    assert!(store.status(Target::Codex).unwrap().configuration_revision > revision);
+    let revision = store.status(Target::Codex).unwrap().configuration_revision;
+    store.restore(Target::Codex).unwrap();
+    let codex = store
+        .overview()
+        .unwrap()
+        .targets
+        .into_iter()
+        .find(|s| s.target == Target::Codex)
+        .unwrap();
+    assert!(codex.configuration_revision > revision);
+    assert!(codex.active_provider_id.is_none());
+}
+#[test]
+fn claude_restart_revisions_follow_real_writes_and_restore_independently() {
+    for target in [Target::ClaudeDesktop, Target::ClaudeCli] {
+        let (temp, mut store) = fixture();
+        let p = store.save(input(Family::Claude, "Claude restart")).unwrap();
+        assert_eq!(store.runtime_context(target).unwrap().1, 0);
+        store.apply(target, &p.id).unwrap();
+        let revision = store.runtime_context(target).unwrap().1;
+        assert!(revision > 0);
+        store.apply(target, &p.id).unwrap();
+        assert_eq!(store.runtime_context(target).unwrap().1, revision);
+        assert_eq!(
+            store
+                .runtime_context(if target == Target::ClaudeCli {
+                    Target::ClaudeDesktop
+                } else {
+                    Target::ClaudeCli
+                })
+                .unwrap()
+                .1,
+            0
+        );
+        store.restore(target).unwrap();
+        assert!(store.runtime_context(target).unwrap().1 > revision);
+        store
+            .set_directory(
+                target,
+                temp.path()
+                    .join("another-directory")
+                    .to_string_lossy()
+                    .into(),
+            )
+            .unwrap();
+        assert_eq!(store.runtime_context(target).unwrap().1, 0);
+    }
+}
+fn input(family: Family, name: &str) -> ProviderInput {
+    ProviderInput {
+        id: None,
+        edited_context_model_ids: vec![],
+        family,
+        name: name.into(),
+        base_url: "https://gateway.example.test/v1/".into(),
+        api_key: Some("test-key-1234".into()),
+        balance_access_token: None,
+        model: if family == Family::Claude {
+            "claude-sonnet-4-6".into()
+        } else {
+            "test-model".into()
+        },
+        auth_mode: "bearer".into(),
+        reasoning_effort: None,
+        codex_options: CodexOptions::default(),
+    }
+}
+fn put(path: &Path, text: &str) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, text).unwrap();
+}
+fn read_json(path: &Path) -> Value {
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+#[test]
+fn codex_restore_preserves_original_comments_and_key_order() {
+    let original = concat!(
+        "# AE native QA baseline\n",
+        "model = \"baseline-native-model\"\n",
+        "model_provider = \"baseline_provider\"\n",
+        "model_reasoning_effort = \"medium\"\n",
+        "service_tier = \"flex\"\n",
+        "[model_providers.baseline_provider]\n",
+        "name = \"Synthetic baseline\"\n",
+        "base_url = \"http://127.0.0.1:9/v1\"\n",
+        "wire_api = \"responses\"\n",
+        "[projects.\"native-ui-keep\"]\n",
+        "trust_level = \"trusted\"\n",
+        "[features]\n",
+        "# original fast preference\n",
+        "fast_mode = false\n",
+        "keep = true\n",
+    );
+    for unrelated_edit in [false, true] {
+        let (temp, mut store) = fixture();
+        let config = temp.path().join("codex/config.toml");
+        put(&config, original);
+        let provider = store
+            .commit_provider(
+                input(Family::Codex, "Restore formatting"),
+                Target::Codex,
+                true,
+            )
+            .unwrap();
+        if unrelated_edit {
+            let applied = std::fs::read_to_string(&config).unwrap();
+            put(
+                &config,
+                &applied.replace(
+                    "keep = true\n",
+                    "# edited while managed\nkeep = false\nadded = true\n",
+                ),
+            );
+            // Reapplying captures an accepted current document as the expected snapshot.
+            store.set_provider_fast_mode(&provider.id, true).unwrap();
+            store.set_provider_fast_mode(&provider.id, false).unwrap();
+        }
+        store.restore(Target::Codex).unwrap();
+        let restored = std::fs::read_to_string(&config).unwrap();
+        let expected = if unrelated_edit {
+            original.replace(
+                "keep = true\n",
+                "# edited while managed\nkeep = false\nadded = true\n",
+            )
+        } else {
+            original.to_string()
+        };
+        let lines = |text: &str| {
+            text.lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(lines(&restored), lines(&expected));
+    }
+}
+
+#[test]
+fn applied_codex_model_context_edits_preserve_other_config_lines() {
+    let (temp, mut store) = fixture();
+    let config_path = temp.path().join("codex/config.toml");
+    put(&config_path, concat!(
+        "# AE native QA baseline\nmodel = \"baseline-native-model\"\n",
+        "model_provider = \"baseline_provider\"\nmodel_reasoning_effort = \"medium\"\nservice_tier = \"flex\"\n",
+        "[model_providers.baseline_provider]\nname = \"Synthetic baseline\"\nbase_url = \"http://127.0.0.1:9/v1\"\nwire_api = \"responses\"\n",
+        "[projects.\"native-ui-keep\"]\ntrust_level = \"trusted\"\n[features]\nfast_mode = false\nkeep = true\n",
+    ));
+    let mut value = input(Family::Codex, "Applied model context preservation");
+    value.model = "gpt-native-business-applied".into();
+    value.codex_options.fast_mode = Some(false);
+    value.codex_options.models = ["gpt-native-business-applied", "gpt-native-business-saved"]
+        .into_iter()
+        .map(|id| ProviderModel {
+            id: id.into(),
+            context_window: Some(256_000),
+            reasoning_efforts: vec![],
+            enabled: true,
+        })
+        .collect();
+    let mut provider = store.commit_provider(value, Target::Codex, true).unwrap();
+    let stable_lines = |text: &str| {
+        let mut section = String::new();
+        text.lines()
+            .filter_map(|line| {
+                let trimmed = line.trim();
+                if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                    section = trimmed[1..trimmed.len() - 1].into();
+                }
+                if trimmed.is_empty()
+                    || (section.is_empty()
+                        && (trimmed.starts_with("model =")
+                            || trimmed.starts_with("service_tier =")))
+                    || (section == "features" && trimmed.starts_with("fast_mode ="))
+                {
+                    None
+                } else {
+                    Some(trimmed.to_owned())
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let baseline = std::fs::read_to_string(&config_path).unwrap();
+    for fast in [true, false] {
+        provider = store
+            .set_provider_fast_mode(&provider.id, fast)
+            .unwrap()
+            .provider;
+        assert_eq!(
+            stable_lines(&std::fs::read_to_string(&config_path).unwrap()),
+            stable_lines(&baseline)
+        );
+    }
+    for context in [128_000, 96_000] {
+        let mut request = quick_input(provider.clone(), Target::Codex);
+        request.model = "gpt-native-business-saved".into();
+        request.models = provider.codex_options.models.clone();
+        request
+            .models
+            .iter_mut()
+            .find(|model| model.id == request.model)
+            .unwrap()
+            .context_window = Some(context);
+        provider = store.quick_model_settings(request).unwrap().provider;
+        assert_eq!(
+            stable_lines(&std::fs::read_to_string(&config_path).unwrap()),
+            stable_lines(&baseline)
+        );
+    }
+}
+
+#[test]
+fn codex_restore_preserves_inline_features_and_unrelated_order() {
+    let (temp, mut store) = fixture();
+    let config = temp.path().join("codex/config.toml");
+    put(
+        &config,
+        concat!(
+            "# inline baseline\n",
+            "model = 'original'\n",
+            "features = { fast_mode = false, keep = true, other = 2 }\n",
+            "# remove while managed\n",
+            "unowned = true\n",
+        ),
+    );
+    store
+        .commit_provider(input(Family::Codex, "Inline restore"), Target::Codex, true)
+        .unwrap();
+    let applied = std::fs::read_to_string(&config).unwrap();
+    put(
+        &config,
+        &applied
+            .replace(
+                "keep = true, other = 2",
+                "other = 3, keep = false, added = true",
+            )
+            .replace("# remove while managed\nunowned = true\n", ""),
+    );
+    store.restore(Target::Codex).unwrap();
+    let restored = std::fs::read_to_string(&config).unwrap();
+    assert!(restored.starts_with("# inline baseline\nmodel = 'original'\n"));
+    let doc: toml_edit::DocumentMut = restored.parse().unwrap();
+    assert!(doc["features"].is_inline_table());
+    assert_eq!(doc["features"]["fast_mode"].as_bool(), Some(false));
+    assert_eq!(doc["features"]["keep"].as_bool(), Some(false));
+    assert_eq!(doc["features"]["other"].as_integer(), Some(3));
+    assert_eq!(doc["features"]["added"].as_bool(), Some(true));
+    assert!(doc.get("unowned").is_none());
+    assert!(restored.find("other = 3").unwrap() < restored.find("keep = false").unwrap());
+    assert!(restored.find("fast_mode = false").unwrap() < restored.find("keep = false").unwrap());
+}
+
+#[test]
+fn codex_restore_preserves_new_key_order_when_restoring_original_setting() {
+    let (temp, mut store) = fixture();
+    let config = temp.path().join("codex/config.toml");
+    put(
+        &config,
+        "model = 'original'\n[features]\nfast_mode = false\n",
+    );
+    let mut value = input(Family::Codex, "Lone original key");
+    value.codex_options.fast_mode = Some(true);
+    store.commit_provider(value, Target::Codex, true).unwrap();
+    let applied = std::fs::read_to_string(&config).unwrap();
+    put(
+        &config,
+        &applied.replace("[features]\n", "[features]\nadded = true\n"),
+    );
+    store.restore(Target::Codex).unwrap();
+    let restored = std::fs::read_to_string(&config).unwrap();
+    assert!(
+        restored.contains("[features]\nadded = true\nfast_mode = false\n"),
+        "{restored}"
+    );
+}
+
+#[test]
+fn fast_toggle_preserves_client_choices_catalog_and_restores_original() {
+    let (temp, mut store) = fixture();
+    let config = temp.path().join("codex/config.toml");
+    let original = "# original\nmodel='original'\nservice_tier='flex'\n[features]\nfast_mode=false\nother=true\n";
+    put(&config, original);
+    let mut value = input(Family::Codex, "Fast test");
+    value.codex_options.repair_reasoning_levels = true;
+    value.codex_options.models = ["test-model", "other-model"]
+        .iter()
+        .map(|id| ProviderModel {
+            id: (*id).into(),
+            context_window: Some(128_000),
+            reasoning_efforts: vec!["low".into()],
+            enabled: true,
+        })
+        .collect();
+    let p = store.commit_provider(value, Target::Codex, true).unwrap();
+    let mut current: toml_edit::DocumentMut =
+        std::fs::read_to_string(&config).unwrap().parse().unwrap();
+    current["model"] = toml_edit::value("other-model");
+    let text = current.to_string();
+    put(
+        &config,
+        &format!("model_reasoning_effort = 'max'\n{text}\n[extra]\nkeep=true\n"),
+    );
+    let catalog_path = temp.path().join("codex/uni-switch-models.json");
+    let before = read_json(&catalog_path);
+    for enabled in [true, false, true] {
+        let result = store.set_provider_fast_mode(&p.id, enabled).unwrap();
+        assert!(result.applied);
+        assert_eq!(result.provider.codex_options.fast_mode, Some(enabled));
+        let doc: toml_edit::DocumentMut =
+            std::fs::read_to_string(&config).unwrap().parse().unwrap();
+        assert_eq!(
+            doc["service_tier"].as_str(),
+            Some(if enabled { "priority" } else { "default" })
+        );
+        assert_eq!(doc["features"]["fast_mode"].as_bool(), Some(true));
+        assert_eq!(doc["features"]["other"].as_bool(), Some(true));
+        assert_eq!(doc["model"].as_str(), Some("other-model"));
+        assert_eq!(doc["model_reasoning_effort"].as_str(), Some("max"));
+        assert_eq!(doc["extra"]["keep"].as_bool(), Some(true));
+        let catalog = read_json(&catalog_path);
+        for (i, model) in catalog["models"].as_array().unwrap().iter().enumerate() {
+            let mut unchanged = model.clone();
+            unchanged["service_tiers"] = before["models"][i]["service_tiers"].clone();
+            unchanged["additional_speed_tiers"] =
+                before["models"][i]["additional_speed_tiers"].clone();
+            assert_eq!(unchanged, before["models"][i]);
+            assert_eq!(
+                model["service_tiers"].as_array().unwrap().len(),
+                usize::from(enabled)
+            );
+            assert_eq!(
+                model["additional_speed_tiers"],
+                if enabled { json!(["fast"]) } else { json!([]) }
+            );
+        }
+        assert_eq!(store.status(Target::Codex).unwrap().state, "applied");
+    }
+    let data = store.data_directory.clone();
+    drop(store);
+    let mut reopened = Store::open(data).unwrap();
+    assert_eq!(
+        reopened
+            .provider(&p.id)
+            .unwrap()
+            .summary
+            .codex_options
+            .fast_mode,
+        Some(true)
+    );
+    assert_eq!(reopened.status(Target::Codex).unwrap().state, "applied");
+    reopened.restore(Target::Codex).unwrap();
+    let doc: toml_edit::DocumentMut = std::fs::read_to_string(config).unwrap().parse().unwrap();
+    assert_eq!(doc["service_tier"].as_str(), Some("flex"));
+    assert_eq!(doc["features"]["fast_mode"].as_bool(), Some(false));
+    assert!(!catalog_path.exists());
+}
+
+#[test]
+fn inactive_fast_toggle_saves_without_switching_then_applies_on_use() {
+    let (temp, mut store) = fixture();
+    let active = store
+        .commit_provider(input(Family::Codex, "Active"), Target::Codex, true)
+        .unwrap();
+    let other = store.save(input(Family::Codex, "Other")).unwrap();
+    let config = temp.path().join("codex/config.toml");
+    let before = std::fs::read(&config).unwrap();
+    let result = store.set_provider_fast_mode(&other.id, true).unwrap();
+    assert!(!result.applied);
+    assert_eq!(std::fs::read(&config).unwrap(), before);
+    assert_eq!(
+        store
+            .status(Target::Codex)
+            .unwrap()
+            .active_provider_id
+            .as_deref(),
+        Some(active.id.as_str())
+    );
+    store.apply(Target::Codex, &other.id).unwrap();
+    let doc: toml_edit::DocumentMut = std::fs::read_to_string(config).unwrap().parse().unwrap();
+    assert_eq!(doc["service_tier"].as_str(), Some("priority"));
+}
+
+#[test]
+fn fast_toggle_does_not_apply_pending_connection_or_model_edits() {
+    let (temp, mut store) = fixture();
+    let p = store
+        .commit_provider(input(Family::Codex, "Original"), Target::Codex, true)
+        .unwrap();
+    let mut edited = input(Family::Codex, "Edited");
+    edited.id = Some(p.id.clone());
+    edited.model = "pending-model".into();
+    edited.api_key = Some("pending-key".into());
+    store.save(edited).unwrap();
+    assert_eq!(store.status(Target::Codex).unwrap().state, "saved_changes");
+    store.set_provider_fast_mode(&p.id, true).unwrap();
+    let doc: toml_edit::DocumentMut =
+        std::fs::read_to_string(temp.path().join("codex/config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+    assert_eq!(doc["service_tier"].as_str(), Some("priority"));
+    assert_eq!(doc["model"].as_str(), Some("test-model"));
+    assert_eq!(
+        doc["model_providers"]["uni_switch"]["experimental_bearer_token"].as_str(),
+        Some("test-key-1234")
+    );
+    assert_eq!(
+        store.provider(&p.id).unwrap().summary.model,
+        "pending-model"
+    );
+    assert_eq!(store.status(Target::Codex).unwrap().state, "saved_changes");
+}
+
+#[test]
+fn fast_toggle_rejects_external_changes_without_partial_save() {
+    for corrupt_catalog in [false, true] {
+        let (temp, mut store) = fixture();
+        let mut value = input(Family::Codex, "Protected");
+        value.codex_options.models = vec![ProviderModel {
+            id: "test-model".into(),
+            context_window: Some(256_000),
+            reasoning_efforts: vec![],
+            enabled: true,
+        }];
+        let p = store.commit_provider(value, Target::Codex, true).unwrap();
+        let config = temp.path().join("codex/config.toml");
+        let catalog = temp.path().join("codex/uni-switch-models.json");
+        if corrupt_catalog {
+            let mut changed = read_json(&catalog);
+            changed["models"][0]["context_window"] = json!(512_000);
+            put(&catalog, &changed.to_string());
+        } else {
+            let changed = std::fs::read_to_string(&config)
+                .unwrap()
+                .replace("gateway.example.test", "external.example.test");
+            put(&config, &changed);
+        }
+        let before = (
+            std::fs::read(&config).unwrap(),
+            std::fs::read(&catalog).unwrap(),
+        );
+        assert_eq!(
+            store.set_provider_fast_mode(&p.id, true).unwrap_err().code,
+            "external_change"
+        );
+        assert_eq!(
+            (
+                std::fs::read(&config).unwrap(),
+                std::fs::read(&catalog).unwrap()
+            ),
+            before
+        );
+        assert_eq!(
+            store
+                .provider(&p.id)
+                .unwrap()
+                .summary
+                .codex_options
+                .fast_mode,
+            None
+        );
+    }
+}
+
+#[test]
+fn fast_toggle_rejects_anthropic_upstream_and_supports_shared_openai_provider() {
+    let (temp, mut store) = fixture();
+    let native = store.save(input(Family::Claude, "Native Claude")).unwrap();
+    assert_eq!(
+        store
+            .set_provider_fast_mode(&native.id, true)
+            .unwrap_err()
+            .code,
+        "anthropic_fast"
+    );
+    assert_eq!(
+        store
+            .provider(&native.id)
+            .unwrap()
+            .summary
+            .codex_options
+            .fast_mode,
+        None
+    );
+    let mut value = input(Family::Claude, "Shared GPT");
+    value.model = "gpt-5.5".into();
+    value.codex_options.upstream_protocol = Some(CodexProtocol::Openai);
+    value.codex_options.claude_protocol = ClaudeProtocol::Openai;
+    let shared = store.save(value).unwrap();
+    store.apply(Target::Codex, &shared.id).unwrap();
+    let config = temp.path().join("codex/config.toml");
+    let original = std::fs::read_to_string(&config).unwrap();
+    put(
+        &config,
+        &format!("model_reasoning_effort='max'\n{original}"),
+    );
+    assert_eq!(store.status(Target::Codex).unwrap().state, "applied");
+    assert!(
+        store
+            .set_provider_fast_mode(&shared.id, true)
+            .unwrap()
+            .applied
+    );
+    let catalog = read_json(&temp.path().join("codex/uni-switch-models.json"));
+    assert_eq!(catalog["models"][0]["slug"], "gpt-5.5");
+    assert_eq!(
+        catalog["models"][0]["additional_speed_tiers"],
+        json!(["fast"])
+    );
+    let doc: toml_edit::DocumentMut = std::fs::read_to_string(config).unwrap().parse().unwrap();
+    assert_eq!(doc["model_reasoning_effort"].as_str(), Some("max"));
+}
+
+#[test]
+fn fast_toggle_keeps_shared_claude_snapshots_current_without_writing_them() {
+    let (temp, mut store) = fixture();
+    let (route, _listener) = crate::bridge::Route::start(&temp.path().join("bridge")).unwrap();
+    store.set_bridge_route(route);
+    let p = store.save(input(Family::Codex, "Shared")).unwrap();
+    for target in [Target::Codex, Target::ClaudeDesktop, Target::ClaudeCli] {
+        store.apply(target, &p.id).unwrap();
+    }
+    let before: Vec<_> = [Target::ClaudeDesktop, Target::ClaudeCli]
+        .into_iter()
+        .flat_map(|target| store.target_record(target).unwrap().2.unwrap())
+        .map(|file| {
+            let content = std::fs::read(&file.path).unwrap();
+            (file.path, content)
+        })
+        .collect();
+    for enabled in [true, false] {
+        store.set_provider_fast_mode(&p.id, enabled).unwrap();
+        for (path, bytes) in &before {
+            assert_eq!(&std::fs::read(path).unwrap(), bytes);
+        }
+        for target in [Target::Codex, Target::ClaudeDesktop, Target::ClaudeCli] {
+            assert_eq!(store.status(target).unwrap().state, "applied");
+        }
+    }
+    store.restore(Target::Codex).unwrap();
+    assert!(!store.set_provider_fast_mode(&p.id, true).unwrap().applied);
+    for (path, bytes) in &before {
+        assert_eq!(&std::fs::read(path).unwrap(), bytes);
+    }
+    for target in [Target::ClaudeDesktop, Target::ClaudeCli] {
+        assert_eq!(store.status(target).unwrap().state, "applied");
+    }
+    let mut pending = input(Family::Codex, "Pending connection");
+    pending.id = Some(p.id.clone());
+    pending.api_key = Some("pending-key".into());
+    store.save(pending).unwrap();
+    store.set_provider_fast_mode(&p.id, false).unwrap();
+    for target in [Target::ClaudeDesktop, Target::ClaudeCli] {
+        assert_eq!(store.status(target).unwrap().state, "saved_changes");
+    }
+}
+
+#[test]
+fn configuration_revision_changes_only_after_real_client_writes_and_restore() {
+    let (temp, mut store) = fixture();
+    assert_eq!(store.runtime_context(Target::Codex).unwrap().1, 0);
+    let p = store.save(input(Family::Codex, "Saved only")).unwrap();
+    assert_eq!(store.runtime_context(Target::Codex).unwrap().1, 0);
+    store.apply(Target::Codex, &p.id).unwrap();
+    let first = store.runtime_context(Target::Codex).unwrap().1;
+    assert!(first > 0);
+    store.apply(Target::Codex, &p.id).unwrap();
+    assert_eq!(store.runtime_context(Target::Codex).unwrap().1, first);
+    store.set_provider_fast_mode(&p.id, true).unwrap();
+    let fast = store.runtime_context(Target::Codex).unwrap().1;
+    assert!(fast > first);
+    store.set_provider_fast_mode(&p.id, true).unwrap();
+    assert_eq!(store.runtime_context(Target::Codex).unwrap().1, fast);
+    store.restore(Target::Codex).unwrap();
+    assert!(store.runtime_context(Target::Codex).unwrap().1 > fast);
+    assert_eq!(store.status(Target::Codex).unwrap().state, "unmanaged");
+    store
+        .set_directory(
+            Target::Codex,
+            temp.path()
+                .join("another-codex-directory")
+                .to_string_lossy()
+                .into(),
+        )
+        .unwrap();
+    assert_eq!(
+        store.runtime_context(Target::Codex).unwrap().1,
+        0,
+        "old directory writes must not require restarting a different directory"
+    );
+}
+
+#[test]
+fn configured_directory_ignores_nested_config_copies() {
+    let (temp, mut store) = fixture();
+    let current = temp.path().join("codex");
+    let duplicate = current.join("browser/config.toml");
+    put(&duplicate, "model='copy-model'\n");
+    let provider = store
+        .commit_provider(
+            input(Family::Codex, "Current directory"),
+            Target::Codex,
+            true,
+        )
+        .unwrap();
+    assert_eq!(
+        PathBuf::from(store.status(Target::Codex).unwrap().directory),
+        current
+    );
+    assert_eq!(
+        std::fs::read_to_string(&duplicate).unwrap(),
+        "model='copy-model'\n"
+    );
+    store.apply(Target::Codex, &provider.id).unwrap();
+    let data = store.data_directory.clone();
+    drop(store);
+    let reopened = Store::open(data).unwrap();
+    assert_eq!(
+        PathBuf::from(reopened.status(Target::Codex).unwrap().directory),
+        current
+    );
+    assert_eq!(reopened.status(Target::Codex).unwrap().state, "applied");
+    assert_eq!(
+        std::fs::read_to_string(duplicate).unwrap(),
+        "model='copy-model'\n"
+    );
+}
+
+#[test]
+fn duplicate_connection_reuses_record_without_overwriting_model_choices() {
+    let (_temp, mut store) = fixture();
+    let first = store
+        .commit_provider(input(Family::Codex, "First"), Target::Codex, true)
+        .unwrap();
+    let duplicate = input(Family::Codex, "Duplicate");
+    let (reused, matched) = store
+        .commit_unique_provider(duplicate, Target::Codex, true)
+        .unwrap();
+    assert!(matched);
+    assert_eq!(reused.id, first.id);
+    assert_eq!(reused.model, first.model);
+    assert_eq!(store.list().unwrap().len(), 1);
+    let mut model_variant = input(Family::Codex, "Different model settings");
+    model_variant.model = "other-model".into();
+    assert!(
+        !store
+            .commit_unique_provider(model_variant, Target::Codex, false)
+            .unwrap()
+            .1
+    );
+    let mut different = input(Family::Codex, "Another key");
+    different.api_key = Some("another-private-key".into());
+    assert!(
+        !store
+            .commit_unique_provider(different, Target::Codex, false)
+            .unwrap()
+            .1
+    );
+    assert_eq!(store.list().unwrap().len(), 3);
+}
+
+#[test]
+fn syncing_connection_preserves_target_model_and_survives_restart() {
+    let (temp, mut store) = fixture();
+    let first = store
+        .commit_provider(input(Family::Codex, "Original"), Target::Codex, true)
+        .unwrap();
+    let mut edit = input(Family::Codex, "Edited");
+    edit.id = Some(first.id.clone());
+    edit.api_key = Some("changed-key-1234".into());
+    edit.model = "new-shared-model".into();
+    edit.codex_options.fast_mode = Some(true);
+    store.save(edit).unwrap();
+    assert_eq!(store.status(Target::Codex).unwrap().state, "saved_changes");
+    store.sync_connection(Target::Codex, &first.id).unwrap();
+    let doc: toml_edit::DocumentMut =
+        std::fs::read_to_string(temp.path().join("codex/config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+    assert_eq!(doc["model"].as_str(), Some("test-model"));
+    assert_eq!(
+        doc["model_providers"]["uni_switch"]["experimental_bearer_token"].as_str(),
+        Some("changed-key-1234")
+    );
+    assert_eq!(store.status(Target::Codex).unwrap().state, "applied");
+    let data = store.data_directory.clone();
+    drop(store);
+    let reopened = Store::open(data).unwrap();
+    assert_eq!(reopened.status(Target::Codex).unwrap().state, "applied");
+}
+
+#[test]
+fn syncing_upgraded_direct_configuration_recovers_model_snapshot_from_client() {
+    let (temp, mut store) = fixture();
+    let first = store
+        .commit_provider(input(Family::Codex, "Legacy"), Target::Codex, true)
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE targets SET applied_summary=NULL,accepted_source=NULL WHERE id='codex'",
+            [],
+        )
+        .unwrap();
+    let mut updated = input(Family::Codex, "Updated");
+    updated.id = Some(first.id.clone());
+    updated.model = "different-new-model".into();
+    updated.api_key = Some("new-key".into());
+    store.save(updated).unwrap();
+    store.sync_connection(Target::Codex, &first.id).unwrap();
+    let doc: toml_edit::DocumentMut =
+        std::fs::read_to_string(temp.path().join("codex/config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+    assert_eq!(doc["model"].as_str(), Some("test-model"));
+    assert_eq!(
+        store
+            .status(Target::Codex)
+            .unwrap()
+            .applied_model
+            .as_deref(),
+        Some("test-model")
+    );
+    assert_eq!(store.status(Target::Codex).unwrap().state, "applied");
+}
+
+#[test]
+fn confirm_failure_keeps_supplier_and_client_unchanged_and_retry_inserts_once() {
+    let (temp, mut store) = fixture();
+    let original = store
+        .commit_provider(input(Family::Codex, "Original"), Target::Codex, true)
+        .unwrap();
+    let config = temp.path().join("codex/config.toml");
+    let before = std::fs::read_to_string(&config).unwrap();
+    let changed = before.replace("gateway.example.test", "outside.example.test");
+    put(&config, &changed);
+    let mut edit = input(Family::Codex, "Unconfirmed");
+    edit.id = Some(original.id.clone());
+    edit.api_key = Some("new-unconfirmed-key".into());
+    assert_eq!(
+        store
+            .commit_provider(edit, Target::Codex, true)
+            .unwrap_err()
+            .code,
+        "external_change"
+    );
+    assert_eq!(
+        json(&store.provider(&original.id).unwrap().summary).unwrap(),
+        json(&original).unwrap()
+    );
+    assert_eq!(
+        store.provider(&original.id).unwrap().api_key,
+        "test-key-1234"
+    );
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), changed);
+    assert_eq!(
+        store
+            .commit_provider(input(Family::Codex, "New"), Target::Codex, true)
+            .unwrap_err()
+            .code,
+        "external_change"
+    );
+    assert_eq!(store.list().unwrap().len(), 1);
+    put(&config, &before);
+    let added = store
+        .commit_provider(input(Family::Codex, "New"), Target::Codex, true)
+        .unwrap();
+    assert_eq!(store.list().unwrap().len(), 2);
+    assert_eq!(
+        store.status(Target::Codex).unwrap().active_provider_id,
+        Some(added.id)
+    );
+}
+
+#[test]
+fn one_shared_supplier_has_independent_client_snapshots_and_pending_edits() {
+    let (temp, mut store) = fixture();
+    store.set_bridge_route(crate::bridge::Route {
+        port: 19880,
+        token: "c".repeat(64),
+    });
+    let mut value = input(Family::Codex, "Shared GPT");
+    value.model = "gpt-5.4".into();
+    value.codex_options.upstream_protocol = Some(CodexProtocol::Openai);
+    value.codex_options.models = vec![ProviderModel {
+        id: value.model.clone(),
+        context_window: Some(256000),
+        reasoning_efforts: vec![],
+        enabled: true,
+    }];
+    let p = store
+        .commit_provider(value.clone(), Target::Codex, true)
+        .unwrap();
+    for target in [Target::ClaudeDesktop, Target::ClaudeCli] {
+        assert_eq!(store.apply(target, &p.id).unwrap().state, "applied");
+        let snapshot = store.claude_bridge_provider(target, &p.id).unwrap();
+        assert_eq!(snapshot.api_key, "test-key-1234");
+        assert_eq!(snapshot.summary.model, "gpt-5.4");
+    }
+    assert_eq!(store.list().unwrap().len(), 1);
+    value.id = Some(p.id.clone());
+    value.api_key = Some("changed-shared-key".into());
+    value.name = "Edited from Claude".into();
+    store
+        .commit_provider(value, Target::ClaudeCli, true)
+        .unwrap();
+    assert_eq!(store.status(Target::ClaudeCli).unwrap().state, "applied");
+    assert_eq!(store.status(Target::Codex).unwrap().state, "saved_changes");
+    assert_eq!(
+        store.status(Target::ClaudeDesktop).unwrap().state,
+        "saved_changes"
+    );
+    assert_eq!(
+        store
+            .claude_bridge_provider(Target::ClaudeDesktop, &p.id)
+            .unwrap()
+            .api_key,
+        "test-key-1234"
+    );
+    assert_eq!(
+        store
+            .claude_bridge_provider(Target::ClaudeCli, &p.id)
+            .unwrap()
+            .api_key,
+        "changed-shared-key"
+    );
+    assert!(!read_json(&temp.path().join("claude_cli/settings.json"))
+        .to_string()
+        .contains("changed-shared-key"));
+    assert!(store.runtime_context(Target::Codex).unwrap().1 > 0);
+    store.restore(Target::ClaudeCli).unwrap();
+    assert!(store.runtime_context(Target::ClaudeCli).unwrap().1 > 0);
+    assert_eq!(
+        store.status(Target::Codex).unwrap().active_provider_id,
+        Some(p.id)
+    );
+}
+
+#[test]
+fn legacy_claude_supplier_reuses_native_targets_and_creates_codex_catalog() {
+    let (temp, mut store) = fixture();
+    store.set_bridge_route(crate::bridge::Route {
+        port: 19881,
+        token: "d".repeat(64),
+    });
+    let p = store.save(input(Family::Claude, "Legacy Claude")).unwrap();
+    for target in [Target::Codex, Target::ClaudeDesktop, Target::ClaudeCli] {
+        assert_eq!(store.apply(target, &p.id).unwrap().state, "applied");
+    }
+    assert_eq!(store.list().unwrap().len(), 1);
+    let catalog = read_json(&temp.path().join("codex/uni-switch-models.json"));
+    assert_eq!(catalog["models"][0]["slug"], "claude-sonnet-4-6");
+    assert_eq!(catalog["models"][0]["context_window"], 256000);
+    assert_eq!(
+        store
+            .bridge_provider(&p.id)
+            .unwrap()
+            .summary
+            .upstream_protocol(),
+        CodexProtocol::Anthropic
+    );
+    assert_eq!(
+        read_json(&temp.path().join("claude_cli/settings.json"))["env"]["ANTHROPIC_AUTH_TOKEN"],
+        "test-key-1234"
+    );
+}
+
+#[test]
+fn completed_confirm_journal_recovers_a_new_provider_only_after_all_files_exist() {
+    let (temp, mut store) = fixture();
+    let mut value = input(Family::Codex, "Recovered new supplier");
+    value.codex_options.models = vec![ProviderModel {
+        id: value.model.clone(),
+        context_window: Some(256000),
+        reasoning_efforts: vec![],
+        enabled: true,
+    }];
+    let stored = store.prepare_provider(value).unwrap();
+    let files = store
+        .plan(Target::Codex, &temp.path().join("codex"), &stored)
+        .unwrap();
+    let pending = Pending {
+        target: Target::Codex,
+        changes: files
+            .iter()
+            .map(|f| Change {
+                path: f.path.clone(),
+                before: f.original.clone(),
+                after: f.expected.clone(),
+            })
+            .collect(),
+        baseline: Some(files),
+        active: Some(stored.summary.id.clone()),
+        provider_update: Some(stored.clone()),
+        applied_summary: None,
+        accepted_source: None,
+    };
+    store
+        .conn
+        .execute(
+            "INSERT INTO operations VALUES('new-confirm','pending',?1,0)",
+            [json(&pending).unwrap()],
+        )
+        .unwrap();
+    writer::write(
+        &pending.changes[0].path,
+        pending.changes[0].after.as_deref(),
+    )
+    .unwrap();
+    store.recover().unwrap();
+    assert!(store.list().unwrap().is_empty());
+    assert!(!pending.changes[0].path.exists());
+    store
+        .conn
+        .execute(
+            "INSERT INTO operations VALUES('completed-confirm','pending',?1,0)",
+            [json(&pending).unwrap()],
+        )
+        .unwrap();
+    for change in &pending.changes {
+        writer::write(&change.path, change.after.as_deref()).unwrap();
+    }
+    store.recover().unwrap();
+    assert_eq!(store.list().unwrap().len(), 1);
+    assert_eq!(
+        store.provider(&stored.summary.id).unwrap().api_key,
+        stored.api_key
+    );
+    assert_eq!(store.status(Target::Codex).unwrap().state, "applied");
+}
+
+#[test]
+fn codex_x_api_key_configuration_preserves_shared_authentication() {
+    let (temp, mut store) = fixture();
+    let mut value = input(Family::Codex, "Header gateway");
+    value.auth_mode = "x-api-key".into();
+    value.codex_options.upstream_protocol = Some(CodexProtocol::Openai);
+    let p = store.commit_provider(value, Target::Codex, true).unwrap();
+    let config = std::fs::read_to_string(temp.path().join("codex/config.toml")).unwrap();
+    assert!(config.contains("x-api-key"));
+    assert!(!config.contains("experimental_bearer_token"));
+    let doc: toml_edit::DocumentMut = config.parse().unwrap();
+    let id = doc["model_provider"].as_str().unwrap();
+    assert_eq!(
+        doc["model_providers"][id]["http_headers"]["x-api-key"].as_str(),
+        Some(store.provider(&p.id).unwrap().api_key.as_str())
+    );
+    assert_eq!(
+        store.provider(&p.id).unwrap().summary.auth_mode,
+        "x-api-key"
+    );
+    assert_eq!(store.list().unwrap().len(), 1);
+}
+
+#[test]
+fn directory_binding_persists_and_rejects_stale_or_managed_changes() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+    let mut store = Store::open(data.clone()).unwrap();
+    let target = Target::Codex;
+    let (initial, chosen) = store.directory_discovery_context(target).unwrap();
+    assert!(!chosen);
+    let new = temp
+        .path()
+        .join("Codex 中文")
+        .to_string_lossy()
+        .into_owned();
+    store
+        .select_detected_directory(target, new.clone(), &initial.to_string_lossy(), true)
+        .unwrap();
+    assert!(!store.directory_discovery_context(target).unwrap().1);
+    assert!(
+        !Path::new(&new).exists(),
+        "binding cannot create client files"
+    );
+    assert_eq!(
+        store
+            .select_detected_directory(target, new.clone(), &initial.to_string_lossy(), false)
+            .unwrap_err()
+            .code,
+        "directory_changed"
+    );
+    store.set_directory(target, new.clone()).unwrap();
+    drop(store);
+    let mut store = Store::open(data).unwrap();
+    assert!(store.directory_discovery_context(target).unwrap().1);
+    assert_eq!(
+        store
+            .select_detected_directory(target, new.clone(), &new, true)
+            .unwrap_err()
+            .code,
+        "directory_selected"
+    );
+    let provider = store.save(input(Family::Codex, "test")).unwrap();
+    store.apply(target, &provider.id).unwrap();
+    assert_eq!(
+        store
+            .select_detected_directory(
+                target,
+                temp.path().join("other").to_string_lossy().into_owned(),
+                &new,
+                false
+            )
+            .unwrap_err()
+            .code,
+        "managed_directory"
+    );
+}
+
+#[test]
+fn old_database_custom_directories_migrate_as_manually_selected() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let conn = Connection::open(data.join("uni-switch.db")).unwrap();
+    conn.execute_batch("CREATE TABLE targets (id TEXT PRIMARY KEY, directory TEXT NOT NULL, active TEXT, baseline TEXT);").unwrap();
+    let custom = temp.path().join("custom");
+    conn.execute(
+        "INSERT INTO targets(id,directory) VALUES('codex',?1)",
+        [custom.to_string_lossy().as_ref()],
+    )
+    .unwrap();
+    drop(conn);
+    let store = Store::open(data).unwrap();
+    let (path, selected) = store.directory_discovery_context(Target::Codex).unwrap();
+    assert!(crate::discovery::same_directory(&path, &custom));
+    assert!(selected);
+    assert!(
+        !store
+            .directory_discovery_context(Target::ClaudeCli)
+            .unwrap()
+            .1
+    );
+}
+
+#[test]
+fn bridge_routes_use_private_applied_snapshot_and_restore_transactionally() {
+    let (temp, mut store) = fixture();
+    let route = crate::bridge::Route {
+        port: 19871,
+        token: "a".repeat(64),
+    };
+    store.set_bridge_route(route.clone());
+    let mut value = input(Family::Codex, "Claude in Codex");
+    value.codex_options.protocol = CodexProtocol::Anthropic;
+    value.codex_options.models = vec![ProviderModel {
+        id: value.model.clone(),
+        context_window: Some(256_000),
+        reasoning_efforts: vec![],
+        enabled: true,
+    }];
+    value.auth_mode = "x-api-key".into();
+    let provider = store.save(value.clone()).unwrap();
+    let status = store.apply(Target::Codex, &provider.id).unwrap();
+    assert_eq!(status.state, "applied");
+    let config = std::fs::read_to_string(temp.path().join("codex/config.toml")).unwrap();
+    assert!(config.contains(&route.base_url(&provider.id)));
+    assert!(config.contains("web_search = \"disabled\""));
+    let catalog = read_json(&temp.path().join("codex/uni-switch-models.json"));
+    assert_eq!(catalog["models"][0]["apply_patch_tool_type"], "freeform");
+    assert!(!config.contains("test-key-1234"));
+    assert_eq!(
+        store.bridge_provider(&provider.id).unwrap().api_key,
+        "test-key-1234"
+    );
+    assert!(store.bridge_required());
+    assert_eq!(
+        store
+            .bridge_provider(&provider.id)
+            .unwrap()
+            .summary
+            .base_url,
+        "https://gateway.example.test/v1"
+    );
+    store.repair_reasoning_levels(&provider.id).unwrap();
+    assert_eq!(store.status(Target::Codex).unwrap().state, "applied");
+    assert!(
+        store
+            .bridge_provider(&provider.id)
+            .unwrap()
+            .summary
+            .codex_options
+            .repair_reasoning_levels
+    );
+    value.id = Some(provider.id.clone());
+    value.api_key = Some("new-private-key".into());
+    store.save(value).unwrap();
+    assert_eq!(store.status(Target::Codex).unwrap().state, "saved_changes");
+    assert_eq!(
+        store.bridge_provider(&provider.id).unwrap().api_key,
+        "test-key-1234",
+        "unapplied key changes cannot affect active requests"
+    );
+    store.repair_reasoning_levels(&provider.id).unwrap();
+    assert_eq!(
+        store.bridge_provider(&provider.id).unwrap().api_key,
+        "test-key-1234",
+        "repair cannot activate a pending credential edit"
+    );
+    store.apply(Target::Codex, &provider.id).unwrap();
+    assert_eq!(
+        store.bridge_provider(&provider.id).unwrap().api_key,
+        "new-private-key"
+    );
+    let direct = store.save(input(Family::Codex, "direct")).unwrap();
+    store.apply(Target::Codex, &direct.id).unwrap();
+    assert!(
+        !std::fs::read_to_string(temp.path().join("codex/config.toml"))
+            .unwrap()
+            .contains("web_search")
+    );
+    assert!(!store.bridge_required());
+    assert!(store.bridge_provider(&provider.id).is_err());
+    store.apply(Target::Codex, &provider.id).unwrap();
+    store.restore(Target::Codex).unwrap();
+    assert!(!store.data_directory.join("bridge-active.json").exists());
+    assert!(!store.bridge_required());
+    let remaining: toml_edit::DocumentMut =
+        std::fs::read_to_string(temp.path().join("codex/config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+    assert!(remaining.get("model_provider").is_none());
+    assert!(remaining.get("model_providers").is_none());
+    // The intermediate direct endpoint released display ownership and kept
+    // its current value. Reacquiring it cannot erase that client preference.
+    assert!(remaining["desktop"]["enabled-reasoning-efforts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|value| value.as_str() == Some("max")));
+}
+
+#[test]
+fn reverse_bridges_have_independent_snapshots_aliases_and_restore_cli_environment() {
+    let (temp, mut store) = fixture();
+    let route = crate::bridge::Route {
+        port: 19872,
+        token: "b".repeat(64),
+    };
+    store.set_bridge_route(route.clone());
+    let cli = temp.path().join("claude_cli/settings.json");
+    put(
+        &cli,
+        "{\"env\":{\"ENABLE_TOOL_SEARCH\":\"auto:10\",\"CUSTOM\":\"preserve\"},\"hooks\":{}}",
+    );
+    let mut value = input(Family::Claude, "GPT in Claude");
+    value.model = "gpt-5.4".into();
+    value.codex_options.claude_protocol = ClaudeProtocol::Openai;
+    value.codex_options.models = ["gpt-5.4", "gpt-4.1"]
+        .iter()
+        .map(|id| ProviderModel {
+            id: (*id).into(),
+            context_window: Some(256000),
+            reasoning_efforts: vec![],
+            enabled: true,
+        })
+        .collect();
+    let first = store.save(value.clone()).unwrap();
+    assert_eq!(
+        store.apply(Target::ClaudeDesktop, &first.id).unwrap().state,
+        "applied"
+    );
+    assert_eq!(
+        store.apply(Target::ClaudeCli, &first.id).unwrap().state,
+        "applied"
+    );
+    let settings = read_json(&cli);
+    assert_eq!(settings["env"]["ANTHROPIC_MODEL"], "gpt-5.4");
+    assert_eq!(settings["env"]["ENABLE_TOOL_SEARCH"], "false");
+    assert!(!settings.to_string().contains("test-key-1234"));
+    let desktop_dir = temp.path().join("claude_desktop");
+    let profile = adapters::plan(
+        Target::ClaudeDesktop,
+        &desktop_dir,
+        &store.provider(&first.id).unwrap(),
+    );
+    assert!(profile.is_err(), "Direct adapter rejects unaliased GPT IDs");
+    assert_eq!(
+        store
+            .claude_bridge_provider(Target::ClaudeDesktop, &first.id)
+            .unwrap()
+            .summary
+            .model,
+        "gpt-5.4"
+    );
+    assert_eq!(
+        store
+            .claude_bridge_provider(Target::ClaudeCli, &first.id)
+            .unwrap()
+            .summary
+            .base_url,
+        "https://gateway.example.test/v1"
+    );
+    value.id = None;
+    value.model = "gpt-4.1".into();
+    value.api_key = Some("second-upstream-key".into());
+    let second = store.save(value).unwrap();
+    assert_eq!(
+        store.apply(Target::ClaudeCli, &second.id).unwrap().state,
+        "applied"
+    );
+    assert_eq!(
+        store
+            .claude_bridge_provider(Target::ClaudeDesktop, &first.id)
+            .unwrap()
+            .api_key,
+        "test-key-1234"
+    );
+    assert_eq!(
+        store
+            .claude_bridge_provider(Target::ClaudeCli, &second.id)
+            .unwrap()
+            .api_key,
+        "second-upstream-key"
+    );
+    assert!(store
+        .claude_bridge_provider(Target::ClaudeCli, &first.id)
+        .is_err());
+    let native = store.save(input(Family::Claude, "native")).unwrap();
+    store.apply(Target::ClaudeCli, &native.id).unwrap();
+    assert_eq!(read_json(&cli)["env"]["ENABLE_TOOL_SEARCH"], "auto:10");
+    assert!(store.bridge_required(), "Desktop route remains active");
+    store.restore(Target::ClaudeDesktop).unwrap();
+    assert!(!store.bridge_required());
+    store.restore(Target::ClaudeCli).unwrap();
+    assert_eq!(read_json(&cli)["env"]["ENABLE_TOOL_SEARCH"], "auto:10");
+    assert_eq!(read_json(&cli)["env"]["CUSTOM"], "preserve");
+}
+
+#[test]
+fn reasoning_repair_preserves_client_choices_and_survives_sync_and_restore() {
+    let (temp, mut store) = fixture();
+    let dir = temp.path().join("codex");
+    let config = dir.join("config.toml");
+    let original = "# original\nmodel = \"original-model\"\nmodel_reasoning_effort = \"medium\"\n";
+    put(&config, original);
+    let mut value = input(Family::Codex, "修复测试");
+    value.codex_options.models = ["test-model", "other-model"]
+        .iter()
+        .map(|id| ProviderModel {
+            id: (*id).into(),
+            context_window: Some(128000),
+            reasoning_efforts: vec!["low".into()],
+            enabled: true,
+        })
+        .collect();
+    let p = store.save(value.clone()).unwrap();
+    store.apply(Target::Codex, &p.id).unwrap();
+    let text = std::fs::read_to_string(&config)
+        .unwrap()
+        .replace("model = \"test-model\"", "model = \"other-model\"");
+    let text = text.replace(
+        "model_reasoning_effort = \"medium\"",
+        "model_reasoning_effort = \"max\"",
+    );
+    let text = format!("service_tier = \"priority\"\n{text}\n[extra]\nkeep = true\n");
+    put(&config, &text);
+    let result = store.repair_reasoning_levels(&p.id).unwrap();
+    assert!(result.applied);
+    let after = std::fs::read_to_string(&config).unwrap();
+    assert!(after.starts_with(&text));
+    let repaired_config = after.parse::<toml_edit::DocumentMut>().unwrap();
+    assert!(repaired_config["desktop"]["enabled-reasoning-efforts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v.as_str() == Some("max")));
+    let catalog_path = dir.join("uni-switch-models.json");
+    let repaired = read_json(&catalog_path);
+    for model in repaired["models"].as_array().unwrap() {
+        assert_eq!(model["default_reasoning_level"], "low");
+        assert_eq!(model["context_window"], 128000);
+        assert_eq!(
+            model["supported_reasoning_levels"]
+                .as_array()
+                .unwrap()
+                .len(),
+            8
+        );
+        assert!(model["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["effort"] == "max"));
+    }
+    assert_eq!(store.status(Target::Codex).unwrap().state, "applied");
+    store.repair_reasoning_levels(&p.id).unwrap();
+    assert_eq!(read_json(&catalog_path), repaired);
+    value.id = Some(p.id.clone());
+    value.api_key = None;
+    value.codex_options.models[0].reasoning_efforts.clear();
+    store.save(value).unwrap();
+    assert!(
+        store
+            .provider(&p.id)
+            .unwrap()
+            .summary
+            .codex_options
+            .repair_reasoning_levels
+    );
+    store.apply(Target::Codex, &p.id).unwrap();
+    assert!(
+        read_json(&catalog_path)["models"][0]["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["effort"] == "max")
+    );
+    store.restore(Target::Codex).unwrap();
+    let restored = std::fs::read_to_string(&config).unwrap();
+    assert!(restored.contains("model_reasoning_effort = \"max\""));
+    assert!(restored.contains("keep = true"));
+    assert!(!catalog_path.exists());
+}
+
+#[test]
+fn reasoning_repair_inactive_does_not_switch_provider_and_legacy_catalog_is_created() {
+    let (temp, mut store) = fixture();
+    let active = store.save(input(Family::Codex, "正在使用")).unwrap();
+    store.apply(Target::Codex, &active.id).unwrap();
+    let other = store.save(input(Family::Codex, "其他配置")).unwrap();
+    let config = temp.path().join("codex/config.toml");
+    let text = std::fs::read_to_string(&config).unwrap();
+    assert!(!store.repair_reasoning_levels(&other.id).unwrap().applied);
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), text);
+    assert_eq!(
+        store.status(Target::Codex).unwrap().active_provider_id,
+        Some(active.id.clone())
+    );
+    assert!(store.repair_reasoning_levels(&active.id).unwrap().applied);
+    let repaired = std::fs::read_to_string(&config).unwrap();
+    assert!(repaired.contains("model_catalog_json"));
+    assert!(repaired.contains("model = \"test-model\""));
+    assert!(
+        read_json(&temp.path().join("codex/uni-switch-models.json"))["models"][0]
+            ["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["effort"] == "max")
+    );
+    assert_eq!(store.status(Target::Codex).unwrap().state, "applied");
+    store.restore(Target::Codex).unwrap();
+    assert!(!config.exists());
+}
+
+#[test]
+fn reasoning_repair_rejects_external_changes_without_persisting_success() {
+    let (temp, mut store) = fixture();
+    let p = store.save(input(Family::Codex, "外部修改")).unwrap();
+    store.apply(Target::Codex, &p.id).unwrap();
+    let config = temp.path().join("codex/config.toml");
+    let text = std::fs::read_to_string(&config)
+        .unwrap()
+        .replace("gateway.example.test", "changed.example.test");
+    put(&config, &text);
+    assert_eq!(
+        store.repair_reasoning_levels(&p.id).unwrap_err().code,
+        "external_change"
+    );
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), text);
+    assert!(
+        !store
+            .provider(&p.id)
+            .unwrap()
+            .summary
+            .codex_options
+            .repair_reasoning_levels
+    );
+    let clean = text.replace("changed.example.test", "gateway.example.test");
+    let profile = format!(
+        "profile = \"override\"\n{clean}\n[profiles.override]\nmodel = \"override-model\"\n"
+    );
+    put(&config, &profile);
+    assert_eq!(
+        store.repair_reasoning_levels(&p.id).unwrap_err().code,
+        "profile_override"
+    );
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), profile);
+    assert!(
+        !store
+            .provider(&p.id)
+            .unwrap()
+            .summary
+            .codex_options
+            .repair_reasoning_levels
+    );
+    let claude = store.save(input(Family::Claude, "Claude")).unwrap();
+    assert!(store.repair_reasoning_levels(&claude.id).is_err());
+}
+
+#[test]
+fn reasoning_catalog_repair_retains_custom_presets_and_default() {
+    let mut no_default =
+        json!({"models": [{"slug": "no-default", "default_reasoning_level": null}]});
+    adapters::repair_reasoning_catalog(&mut no_default).unwrap();
+    assert!(no_default["models"][0]["default_reasoning_level"].is_null());
+    let mut catalog = json!({"models": [{"slug": "custom", "default_reasoning_level": "persistent", "supported_reasoning_levels": [{"effort": "persistent", "description": "keep"}, {"effort": "max", "description": "Original max"}], "extra": 42}]});
+    adapters::repair_reasoning_catalog(&mut catalog).unwrap();
+    let once = catalog.clone();
+    adapters::repair_reasoning_catalog(&mut catalog).unwrap();
+    assert_eq!(catalog, once);
+    assert_eq!(
+        catalog["models"][0]["default_reasoning_level"],
+        "persistent"
+    );
+    assert_eq!(
+        catalog["models"][0]["supported_reasoning_levels"][1]["description"],
+        "Original max"
+    );
+    assert_eq!(catalog["models"][0]["extra"], 42);
+}
+
+#[test]
+fn interrupted_reasoning_repair_commits_provider_only_with_all_files() {
+    let (temp, mut store) = fixture();
+    let p = store.save(input(Family::Codex, "修复事务")).unwrap();
+    store.apply(Target::Codex, &p.id).unwrap();
+    let dir = temp.path().join("codex");
+    // Remove the repair outputs so both writes are required.
+    let mut legacy = std::fs::read_to_string(dir.join("config.toml"))
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    legacy.as_table_mut().remove("desktop");
+    legacy.as_table_mut().remove("model_catalog_json");
+    put(&dir.join("config.toml"), &legacy.to_string());
+    std::fs::remove_file(dir.join("uni-switch-models.json")).unwrap();
+    let mut updated = store.provider(&p.id).unwrap();
+    updated.summary.codex_options.repair_reasoning_levels = true;
+    updated.summary.codex_options.models = vec![ProviderModel {
+        id: "test-model".into(),
+        context_window: None,
+        reasoning_efforts: vec![],
+        enabled: true,
+    }];
+    let files = adapters::reasoning_repair_files(&dir, &updated).unwrap();
+    assert_eq!(files.len(), 2);
+    let (_, _, baseline) = store.target_record(Target::Codex).unwrap();
+    let mut baseline = baseline.unwrap();
+    for file in &files {
+        if let Some(previous) = baseline.iter_mut().find(|old| old.path == file.path) {
+            for key in &file.keys {
+                if !previous.keys.contains(key) {
+                    previous.keys.push(key.clone());
+                }
+            }
+            previous.expected = file.expected.clone();
+        } else {
+            baseline.push(file.clone());
+        }
+    }
+    let applied_summary = Some(updated.summary.clone());
+    let accepted_source = Some(Store::source_signature(&updated).unwrap());
+    let pending = Pending {
+        target: Target::Codex,
+        changes: files
+            .iter()
+            .map(|f| Change {
+                path: f.path.clone(),
+                before: f.original.clone(),
+                after: f.expected.clone(),
+            })
+            .collect(),
+        baseline: Some(baseline),
+        active: Some(p.id.clone()),
+        provider_update: Some(updated),
+        applied_summary,
+        accepted_source,
+    };
+    store
+        .conn
+        .execute(
+            "INSERT INTO operations VALUES('repair-crash','pending',?1,0)",
+            [json(&pending).unwrap()],
+        )
+        .unwrap();
+    writer::write(
+        &pending.changes[0].path,
+        pending.changes[0].after.as_deref(),
+    )
+    .unwrap();
+    store.recover().unwrap();
+    assert!(
+        !store
+            .provider(&p.id)
+            .unwrap()
+            .summary
+            .codex_options
+            .repair_reasoning_levels
+    );
+    assert!(!dir.join("uni-switch-models.json").exists());
+    store
+        .conn
+        .execute(
+            "INSERT INTO operations VALUES('repair-complete','pending',?1,1)",
+            [json(&pending).unwrap()],
+        )
+        .unwrap();
+    for change in &pending.changes {
+        writer::write(&change.path, change.after.as_deref()).unwrap();
+    }
+    store.recover().unwrap();
+    assert!(
+        store
+            .provider(&p.id)
+            .unwrap()
+            .summary
+            .codex_options
+            .repair_reasoning_levels
+    );
+    assert_eq!(store.status(Target::Codex).unwrap().state, "applied");
+}
+
+#[test]
+fn desktop_display_repair_captures_original_preferences_preserves_other_settings_and_restores() {
+    let (temp, mut store) = fixture();
+    let config = temp.path().join("codex/config.toml");
+    put(&config, "model = \"original\"\nmodel_reasoning_effort = \"medium\"\n[desktop]\nenabled-reasoning-efforts = [\"low\", \"medium\", \"high\", \"xhigh\"]\ntheme = \"dark\"\n");
+    let mut value = input(Family::Codex, "菜单修复");
+    value.codex_options.models = vec![ProviderModel {
+        id: "test-model".into(),
+        context_window: None,
+        reasoning_efforts: vec![],
+        enabled: true,
+    }];
+    let p = store.save(value).unwrap();
+    store.apply(Target::Codex, &p.id).unwrap();
+    let mut before = std::fs::read_to_string(&config)
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    let mut choices = toml_edit::Array::new();
+    choices.push("high");
+    before["desktop"]["enabled-reasoning-efforts"] = toml_edit::value(choices);
+    before["model_reasoning_effort"] = toml_edit::value("max");
+    put(&config, &before.to_string());
+    store.repair_reasoning_levels(&p.id).unwrap();
+    let after = std::fs::read_to_string(&config)
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    assert_eq!(after["model_reasoning_effort"].as_str(), Some("max"));
+    assert_eq!(after["desktop"]["theme"].as_str(), Some("dark"));
+    assert!(after["desktop"]["enabled-reasoning-efforts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v.as_str() == Some("max")));
+    assert_eq!(store.status(Target::Codex).unwrap().state, "applied");
+    // Codex may hide max again through its UI. The repair must remain usable.
+    let mut hidden = after;
+    let mut array = toml_edit::Array::new();
+    array.push("high");
+    hidden["desktop"]["enabled-reasoning-efforts"] = toml_edit::value(array);
+    put(&config, &hidden.to_string());
+    store.repair_reasoning_levels(&p.id).unwrap();
+    let repaired: toml_edit::DocumentMut =
+        std::fs::read_to_string(&config).unwrap().parse().unwrap();
+    let released_display = repaired["desktop"]["enabled-reasoning-efforts"].to_string();
+    let other = store.save(input(Family::Codex, "另一供应商")).unwrap();
+    store.apply(Target::Codex, &other.id).unwrap();
+    store.restore(Target::Codex).unwrap();
+    let restored = std::fs::read_to_string(&config)
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    assert_eq!(restored["model"].as_str(), Some("original"));
+    assert_eq!(restored["model_reasoning_effort"].as_str(), Some("max"));
+    assert_eq!(restored["desktop"]["theme"].as_str(), Some("dark"));
+    assert_eq!(
+        restored["desktop"]["enabled-reasoning-efforts"].to_string(),
+        released_display
+    );
+}
+
+#[test]
+fn malformed_desktop_display_preferences_prevent_all_repair_writes() {
+    let (temp, mut store) = fixture();
+    let p = store.save(input(Family::Codex, "异常设置")).unwrap();
+    store.apply(Target::Codex, &p.id).unwrap();
+    let config = temp.path().join("codex/config.toml");
+    let catalog_before = std::fs::read(temp.path().join("codex/uni-switch-models.json")).unwrap();
+    let mut doc = std::fs::read_to_string(&config)
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    doc["desktop"]["enabled-reasoning-efforts"] = toml_edit::value(false);
+    let before = doc.to_string();
+    put(&config, &before);
+    assert_eq!(
+        store.repair_reasoning_levels(&p.id).unwrap_err().code,
+        "invalid_reasoning_display"
+    );
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
+    assert_eq!(
+        std::fs::read(temp.path().join("codex/uni-switch-models.json")).unwrap(),
+        catalog_before
+    );
+    assert!(
+        !store
+            .provider(&p.id)
+            .unwrap()
+            .summary
+            .codex_options
+            .repair_reasoning_levels
+    );
+}
+
+#[test]
+fn codex_model_refresh_writes_per_model_context_without_changing_client_choices_and_restores() {
+    let (temp, mut store) = fixture();
+    let config = temp.path().join("codex/config.toml");
+    put(&config, "model = \"original\"\nmodel_context_window = 64000\nmodel_auto_compact_token_limit = 50000\n");
+    let mut value = input(Family::Codex, "自动模型");
+    value.codex_options.models = vec![
+        ProviderModel {
+            id: "test-model".into(),
+            context_window: Some(256_000),
+            reasoning_efforts: vec![],
+            enabled: true,
+        },
+        ProviderModel {
+            id: "second".into(),
+            context_window: Some(512_000),
+            reasoning_efforts: vec![],
+            enabled: true,
+        },
+    ];
+    let p = store.save(value).unwrap();
+    store.apply(Target::Codex, &p.id).unwrap();
+    let original_applied = std::fs::read_to_string(&config).unwrap();
+    put(
+        &config,
+        &original_applied.replace("model = \"test-model\"", "model = \"second\""),
+    );
+    put(
+        &config,
+        &format!(
+            "model_reasoning_effort = \"max\"\nservice_tier = \"flex\"\n{}\n[other]\nkeep = true\n",
+            std::fs::read_to_string(&config).unwrap()
+        ),
+    );
+    let mut models = store.provider(&p.id).unwrap().summary.codex_options.models;
+    models[0].context_window = Some(128_000);
+    models.push(ProviderModel {
+        id: "disabled".into(),
+        context_window: Some(1_000_000),
+        reasoning_efforts: vec![],
+        enabled: false,
+    });
+    let result = store
+        .update_provider_models(ModelWriteInput {
+            connection: ConnectionInput {
+                provider_id: Some(p.id.clone()),
+                base_url: p.base_url.clone(),
+                api_key: None,
+                balance_access_token: None,
+            },
+            auth_mode: "bearer".into(),
+            model: p.model.clone(),
+            models,
+            synced_at: 42,
+        })
+        .unwrap();
+    assert!(result.applied);
+    let after = std::fs::read_to_string(&config)
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    assert_eq!(after["model"].as_str(), Some("second"));
+    assert_eq!(after["model_reasoning_effort"].as_str(), Some("max"));
+    assert_eq!(after["service_tier"].as_str(), Some("flex"));
+    assert_eq!(after["model_context_window"].as_integer(), Some(64000));
+    assert_eq!(
+        after["model_auto_compact_token_limit"].as_integer(),
+        Some(50000)
+    );
+    let catalog = read_json(&temp.path().join("codex/uni-switch-models.json"));
+    assert_eq!(catalog["models"].as_array().unwrap().len(), 2);
+    assert_eq!(catalog["models"][0]["context_window"], 128_000);
+    assert_eq!(catalog["models"][0]["auto_compact_token_limit"], 128_000);
+    assert_eq!(catalog["models"][1]["context_window"], 512_000);
+    assert_eq!(catalog["models"][1]["auto_compact_token_limit"], 512_000);
+    assert_eq!(store.status(Target::Codex).unwrap().state, "applied");
+    assert_eq!(
+        store
+            .provider(&p.id)
+            .unwrap()
+            .summary
+            .codex_options
+            .models_synced_at,
+        Some(42)
+    );
+    store.restore(Target::Codex).unwrap();
+    let restored = std::fs::read_to_string(config).unwrap();
+    assert!(restored.contains("model_context_window = 64000"));
+    assert!(restored.contains("model_auto_compact_token_limit = 50000"));
+    assert!(restored.contains("keep = true"));
+}
+
+#[test]
+fn automatic_model_write_rejects_other_connections_invalid_values_and_external_files() {
+    let (temp, mut store) = fixture();
+    let mut value = input(Family::Codex, "保护写入");
+    value.codex_options.models = vec![ProviderModel {
+        id: "test-model".into(),
+        context_window: Some(256_000),
+        reasoning_efforts: vec![],
+        enabled: true,
+    }];
+    let p = store.save(value.clone()).unwrap();
+    store.apply(Target::Codex, &p.id).unwrap();
+    let config = temp.path().join("codex/config.toml");
+    let before = std::fs::read_to_string(&config).unwrap();
+    let request = || ModelWriteInput {
+        connection: ConnectionInput {
+            provider_id: Some(p.id.clone()),
+            base_url: p.base_url.clone(),
+            api_key: None,
+            balance_access_token: None,
+        },
+        auth_mode: "bearer".into(),
+        model: p.model.clone(),
+        models: p.codex_options.models.clone(),
+        synced_at: 42,
+    };
+    let mut changed = request();
+    changed.connection.api_key = Some("another-key".into());
+    assert_eq!(
+        store.update_provider_models(changed).unwrap_err().code,
+        "connection_changed"
+    );
+    let mut invalid = request();
+    invalid.models[0].context_window = Some(0);
+    assert_eq!(
+        store.update_provider_models(invalid).unwrap_err().code,
+        "invalid_models"
+    );
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
+    let catalog = temp.path().join("codex/uni-switch-models.json");
+    let external = std::fs::read_to_string(&catalog)
+        .unwrap()
+        .replace("供应商模型", "外部模型");
+    put(&catalog, &external);
+    assert_eq!(
+        store.update_provider_models(request()).unwrap_err().code,
+        "configuration_changed"
+    );
+    assert_eq!(std::fs::read_to_string(&catalog).unwrap(), external);
+    assert_ne!(
+        store
+            .provider(&p.id)
+            .unwrap()
+            .summary
+            .codex_options
+            .models_synced_at,
+        Some(42)
+    );
+    value.name = "未应用供应商".into();
+    let other = store.save(value).unwrap();
+    let mut inactive = request();
+    inactive.connection.provider_id = Some(other.id);
+    assert!(!store.update_provider_models(inactive).unwrap().applied);
+    assert_eq!(std::fs::read_to_string(config).unwrap(), before);
+}
+
+#[test]
+fn balance_account_credentials_are_private_retained_and_bound_to_site() {
+    let (_temp, mut store) = fixture();
+    let mut value = input(Family::Codex, "账户余额");
+    value.codex_options.balance_query = Some(BalanceQuery {
+        adapter: BalanceAdapter::NewapiAccount,
+        user_id: Some("42".into()),
+        divisor: 500_000.0,
+        ..BalanceQuery::default()
+    });
+    value.balance_access_token = Some("private-console-token".into());
+    let provider = store.save(value.clone()).unwrap();
+    assert!(provider.has_balance_token);
+    assert!(!serde_json::to_string(&store.overview().unwrap())
+        .unwrap()
+        .contains("private-console-token"));
+    value.id = Some(provider.id.clone());
+    value.api_key = None;
+    value.balance_access_token = None;
+    store.save(value.clone()).unwrap();
+    let q = value.codex_options.balance_query.as_ref().unwrap();
+    let connection = ConnectionInput {
+        provider_id: Some(provider.id),
+        base_url: value.base_url.clone(),
+        api_key: None,
+        balance_access_token: None,
+    };
+    assert_eq!(
+        store.balance_connection(connection.clone(), q).unwrap().1,
+        "private-console-token"
+    );
+    assert_eq!(
+        store.connection(connection.clone()).unwrap().1,
+        "test-key-1234"
+    );
+    let auto = store
+        .auto_balance_connection(connection.clone(), None)
+        .unwrap();
+    assert_eq!(auto.1, "test-key-1234");
+    assert_eq!(auto.3.as_deref(), Some("private-console-token"));
+    let auto = store
+        .auto_balance_connection(
+            connection.clone(),
+            Some(BalanceQuery {
+                adapter: BalanceAdapter::Auto,
+                ..BalanceQuery::default()
+            }),
+        )
+        .unwrap();
+    assert!(auto.3.is_none());
+    let mut other = connection;
+    other.base_url = "https://other.example.test/v1".into();
+    assert!(store.balance_connection(other.clone(), q).is_err());
+    assert!(store
+        .auto_balance_connection(other, None)
+        .unwrap()
+        .3
+        .is_none());
+    value.base_url = "https://other.example.test/v1".into();
+    assert!(store.save(value.clone()).is_err());
+    value.balance_access_token = Some("new-console-token".into());
+    assert!(store.save(value.clone()).is_ok());
+    value.codex_options.balance_query = None;
+    store.save(value.clone()).unwrap();
+    assert!(store
+        .provider(value.id.as_deref().unwrap())
+        .unwrap()
+        .balance_access_token
+        .is_none());
+}
+
+#[test]
+fn legacy_balance_presets_migrate_without_changing_custom_queries() {
+    let mut value = input(Family::Codex, "旧版 New API");
+    value.codex_options.balance_query = Some(BalanceQuery {
+        path: "/api/usage/token".into(),
+        json_path: "data.total_available".into(),
+        unit: "额度".into(),
+        ..BalanceQuery::default()
+    });
+    let (_temp, mut store) = fixture();
+    let provider = store.save(value).unwrap();
+    let mut stored = serde_json::to_value(store.provider(&provider.id).unwrap()).unwrap();
+    stored
+        .pointer_mut("/summary/codexOptions/balanceQuery")
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .remove("adapter");
+    stored
+        .as_object_mut()
+        .unwrap()
+        .remove("balance_access_token");
+    stored
+        .pointer_mut("/summary")
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .remove("hasBalanceToken");
+    let migrated = decode_provider(&stored.to_string()).unwrap();
+    let q = migrated.summary.codex_options.balance_query.unwrap();
+    assert_eq!(q.adapter, BalanceAdapter::NewapiToken);
+    assert_eq!(q.divisor, 500_000.0);
+    stored
+        .pointer_mut("/summary/codexOptions/balanceQuery/path")
+        .unwrap()
+        .clone_from(&json!("/custom"));
+    assert_eq!(
+        decode_provider(&stored.to_string())
+            .unwrap()
+            .summary
+            .codex_options
+            .balance_query
+            .unwrap()
+            .adapter,
+        BalanceAdapter::Custom
+    );
+}
+
+#[test]
+fn codex_options_catalog_switch_and_restore_are_transactional() {
+    let (temp, mut store) = fixture();
+    let dir = temp.path().join("codex");
+    let config = dir.join("config.toml");
+    put(&config, "# original\nmodel = \"old\"\nservice_tier = \"flex\"\nmodel_context_window = 32000\n[features]\nkeep_feature = true\nfast_mode = false\n");
+    let mut value = input(Family::Codex, "模型供应商");
+    value.reasoning_effort = Some("high".into());
+    value.codex_options = CodexOptions {
+        fast_mode: Some(true),
+        context_window: Some(128000),
+        auto_compact_token_limit: Some(100000),
+        models: vec![
+            ProviderModel {
+                id: "test-model".into(),
+                context_window: Some(128000),
+                reasoning_efforts: vec!["low".into(), "high".into()],
+                enabled: true,
+            },
+            ProviderModel {
+                id: "backup-model".into(),
+                context_window: None,
+                reasoning_efforts: vec![],
+                enabled: true,
+            },
+        ],
+        ..Default::default()
+    };
+    let provider = store.save(value.clone()).unwrap();
+    store.apply(Target::Codex, &provider.id).unwrap();
+    let text = std::fs::read_to_string(&config).unwrap();
+    assert!(text.contains("service_tier = \"priority\""));
+    assert!(text.contains("model_context_window = 128000"));
+    assert!(text.contains("model_auto_compact_token_limit = 100000"));
+    assert!(text.contains("keep_feature = true"));
+    let catalog_path = dir.join("uni-switch-models.json");
+    let catalog = read_json(&catalog_path);
+    assert_eq!(catalog["models"].as_array().unwrap().len(), 2);
+    assert_eq!(catalog["models"][0]["visibility"], "list");
+    assert_eq!(catalog["models"][0]["slug"], "test-model");
+    let preferences = adapters::read_model_preferences(Target::Codex, &dir).unwrap();
+    assert_eq!(preferences.codex_options.fast_mode, Some(true));
+    assert_eq!(preferences.codex_options.models.len(), 2);
+    assert_eq!(store.list().unwrap().len(), 1);
+    value.id = Some(provider.id.clone());
+    value.codex_options.fast_mode = Some(false);
+    value.codex_options.models[1].enabled = false;
+    store.save(value).unwrap();
+    assert_eq!(store.status(Target::Codex).unwrap().state, "saved_changes");
+    store.apply(Target::Codex, &provider.id).unwrap();
+    assert_eq!(
+        read_json(&catalog_path)["models"].as_array().unwrap().len(),
+        1
+    );
+    store.restore(Target::Codex).unwrap();
+    assert!(!catalog_path.exists());
+    let restored = std::fs::read_to_string(config).unwrap();
+    assert!(restored.contains("service_tier = \"flex\""));
+    assert!(restored.contains("model_context_window = 32000"));
+    assert!(restored.contains("fast_mode = false"));
+    assert!(!restored.contains("model_catalog_json"));
+}
+
+#[test]
+fn older_saved_providers_and_baselines_migrate_without_losing_new_user_settings() {
+    let (temp, mut store) = fixture();
+    let dir = temp.path().join("codex");
+    let config = dir.join("config.toml");
+    put(&config, "model_context_window = 32000\n");
+    let provider = store.save(input(Family::Codex, "旧版配置")).unwrap();
+    let mut old = serde_json::to_value(store.provider(&provider.id).unwrap()).unwrap();
+    old["summary"]
+        .as_object_mut()
+        .unwrap()
+        .remove("codexOptions");
+    store
+        .conn
+        .execute(
+            "UPDATE providers SET data=?1 WHERE id=?2",
+            params![old.to_string(), provider.id],
+        )
+        .unwrap();
+    assert!(store.list().unwrap()[0].codex_options.models.is_empty());
+    store.apply(Target::Codex, &provider.id).unwrap();
+    let (_, _, baseline) = store.target_record(Target::Codex).unwrap();
+    let mut legacy = baseline.unwrap();
+    legacy.retain(|f| f.format == "toml");
+    legacy[0].keys.retain(|k| {
+        [
+            "model",
+            "model_provider",
+            "model_reasoning_effort",
+            "model_providers.uni_switch",
+        ]
+        .contains(&k.as_str())
+    });
+    store
+        .conn
+        .execute(
+            "UPDATE targets SET baseline=?1 WHERE id='codex'",
+            [json(&legacy).unwrap()],
+        )
+        .unwrap();
+    let text = std::fs::read_to_string(&config).unwrap();
+    put(
+        &config,
+        &text.replace(
+            "model_context_window = 32000",
+            "model_context_window = 64000",
+        ),
+    );
+    // The old provider never owned this field. Capture the client's current
+    // value only when a later explicit override first takes ownership.
+    let mut value = input(Family::Codex, "旧版配置");
+    value.id = Some(provider.id.clone());
+    value.codex_options.context_window = Some(128000);
+    store.save(value).unwrap();
+    store.apply(Target::Codex, &provider.id).unwrap();
+    store.restore(Target::Codex).unwrap();
+    assert!(std::fs::read_to_string(config)
+        .unwrap()
+        .contains("model_context_window = 64000"));
+}
+
+#[test]
+fn modified_catalog_is_preserved_and_invalid_options_are_rejected() {
+    let (temp, mut store) = fixture();
+    let mut value = input(Family::Codex, "模型供应商");
+    value.codex_options.models = vec![ProviderModel {
+        id: "test-model".into(),
+        context_window: None,
+        reasoning_efforts: vec![],
+        enabled: true,
+    }];
+    let provider = store.save(value.clone()).unwrap();
+    store.apply(Target::Codex, &provider.id).unwrap();
+    let catalog = temp.path().join("codex/uni-switch-models.json");
+    put(&catalog, r#"{"models":[],"external":true}"#);
+    assert_eq!(
+        store.status(Target::Codex).unwrap().state,
+        "external_change"
+    );
+    assert!(store.restore(Target::Codex).is_err());
+    assert!(store.apply(Target::Codex, &provider.id).is_err());
+    assert_eq!(read_json(&catalog)["external"], true);
+    value.codex_options.context_window = Some(0);
+    assert!(store.save(value.clone()).is_err());
+    value.codex_options.context_window = Some(10);
+    value.codex_options.auto_compact_token_limit = Some(20);
+    assert!(store.save(value.clone()).is_err());
+    value.codex_options.auto_compact_token_limit = None;
+    value.model = "unselected-model".into();
+    assert!(store.save(value).is_err());
+}
+
+#[test]
+fn codex_model_menu_choices_do_not_block_switch_or_restore_but_routing_changes_do() {
+    let (temp, mut store) = fixture();
+    let config = temp.path().join("codex/config.toml");
+    put(&config, "model = \"original\"\n");
+    let mut value = input(Family::Codex, "多模型");
+    value.codex_options.models = ["test-model", "other-model"]
+        .into_iter()
+        .map(|id| ProviderModel {
+            id: id.into(),
+            context_window: None,
+            reasoning_efforts: vec![],
+            enabled: true,
+        })
+        .collect();
+    let provider = store.save(value.clone()).unwrap();
+    store.apply(Target::Codex, &provider.id).unwrap();
+    let text = std::fs::read_to_string(&config)
+        .unwrap()
+        .replace("model = \"test-model\"", "model = \"other-model\"");
+    put(
+        &config,
+        &format!("model_reasoning_effort = \"high\"\nservice_tier = \"priority\"\n{text}"),
+    );
+    assert_eq!(store.status(Target::Codex).unwrap().state, "applied");
+    store.restore(Target::Codex).unwrap();
+    assert!(std::fs::read_to_string(&config)
+        .unwrap()
+        .contains("original"));
+    store.apply(Target::Codex, &provider.id).unwrap();
+    let text = std::fs::read_to_string(&config)
+        .unwrap()
+        .replace("model = \"test-model\"", "model = \"other-model\"");
+    put(&config, &text);
+    value.id = Some(provider.id.clone());
+    value.codex_options.fast_mode = Some(true);
+    value.codex_options.models[1].enabled = false;
+    store.save(value).unwrap();
+    assert_eq!(store.status(Target::Codex).unwrap().state, "saved_changes");
+    store.apply(Target::Codex, &provider.id).unwrap();
+    let text = std::fs::read_to_string(&config)
+        .unwrap()
+        .replace("test-key-1234", "externally-edited-key");
+    put(&config, &text);
+    assert_eq!(
+        store.status(Target::Codex).unwrap().state,
+        "external_change"
+    );
+    assert!(store.restore(Target::Codex).is_err());
+}
+
+#[test]
+fn codex_switch_preserves_comments_projects_and_credentials() {
+    let (temp, mut store) = fixture();
+    let dir = temp.path().join("codex");
+    let path = dir.join("config.toml");
+    put(&path, "# 用户原来的注释\nmodel = \"original\"\n[projects.\"D:/中文 项目\"]\ntrust_level = \"trusted\"\n[mcp_servers.example]\ncommand = \"test\"\n");
+    put(
+        &dir.join("auth.json"),
+        r#"{"tokens":{"access_token":"official-test-token"}}"#,
+    );
+    let original_auth = std::fs::read(dir.join("auth.json")).unwrap();
+    let a = store.save(input(Family::Codex, "配置 A")).unwrap();
+    let mut b_input = input(Family::Codex, "配置 B");
+    b_input.api_key = Some("test-key-5678".into());
+    b_input.model = "another-model".into();
+    let b = store.save(b_input).unwrap();
+    store.apply(Target::Codex, &a.id).unwrap();
+    store.apply(Target::Codex, &b.id).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("# 用户原来的注释"));
+    assert!(text.contains("trust_level"));
+    assert!(text.contains("mcp_servers.example"));
+    assert!(text.contains("another-model"));
+    assert!(text.contains("test-key-5678"));
+    assert!(text.contains("requires_openai_auth = true"));
+    assert!(!text.contains("official-test-token"));
+    assert_eq!(std::fs::read(dir.join("auth.json")).unwrap(), original_auth);
+    put(&path, &format!("{text}\n[features]\nexample = true\n"));
+    store.restore(Target::Codex).unwrap();
+    let restored = std::fs::read_to_string(path).unwrap();
+    assert!(restored.contains("original"));
+    assert!(restored.contains("[features]"));
+    assert!(!restored.contains("test-key-5678"));
+}
+
+#[test]
+fn desktop_writes_profile_and_library_preserves_mcp_and_restores_new_settings() {
+    let (temp, mut store) = fixture();
+    let dir = temp.path().join("claude_desktop");
+    let normal = dir.join("Claude/claude_desktop_config.json");
+    let third = dir.join("Claude-3p/claude_desktop_config.json");
+    let meta = dir.join("Claude-3p/configLibrary/_meta.json");
+    put(
+        &normal,
+        r#"{"deploymentMode":"1p","mcpServers":{"keep":{"command":"demo"}}}"#,
+    );
+    put(&third, r#"{"existing":true}"#);
+    put(
+        &meta,
+        r#"{"entries":[{"id":"other-profile","name":"Existing"}],"appliedId":"other-profile","custom":true}"#,
+    );
+    let mut multi = input(Family::Claude, "Claude 桌面");
+    multi.codex_options.models = [
+        "claude-opus-4-6",
+        "claude-sonnet-4-6",
+        "claude-haiku-4-5",
+        "ignored-model",
+    ]
+    .iter()
+    .map(|id| crate::types::ProviderModel {
+        id: (*id).into(),
+        enabled: *id != "ignored-model",
+        context_window: None,
+        reasoning_efforts: Vec::new(),
+    })
+    .collect();
+    let provider = store.save(multi).unwrap();
+    let status = store.apply(Target::ClaudeDesktop, &provider.id).unwrap();
+    assert_eq!(status.state, "applied");
+    assert_eq!(read_json(&normal)["deploymentMode"], "3p");
+    assert!(read_json(&normal)["mcpServers"].is_object());
+    let profile_path = dir.join(format!(
+        "Claude-3p/configLibrary/{}.json",
+        adapters::PROFILE_UUID
+    ));
+    let profile = read_json(&profile_path);
+    assert_eq!(profile["inferenceProvider"], "gateway");
+    assert_eq!(profile["inferenceGatewayAuthScheme"], "bearer");
+    assert_eq!(profile["inferenceModels"][0], "claude-sonnet-4-6");
+    assert_eq!(
+        profile["inferenceModels"],
+        json!(["claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5"])
+    );
+    let preferences = adapters::read_model_preferences(Target::ClaudeDesktop, &dir).unwrap();
+    assert_eq!(preferences.codex_options.models.len(), 3);
+    store.apply(Target::ClaudeCli, &provider.id).unwrap();
+    let cli = read_json(&temp.path().join("claude_cli/settings.json"));
+    assert_eq!(cli["env"]["ANTHROPIC_MODEL"], provider.model);
+    for tier in ["SONNET", "OPUS", "HAIKU"] {
+        assert!(cli["env"]
+            .get(format!("ANTHROPIC_DEFAULT_{tier}_MODEL"))
+            .is_none());
+    }
+    assert_eq!(read_json(&meta)["entries"].as_array().unwrap().len(), 2);
+    let mut normal_doc = read_json(&normal);
+    normal_doc["newUserSetting"] = json!(true);
+    put(&normal, &normal_doc.to_string());
+    let mut profile_doc = read_json(&profile_path);
+    profile_doc["permissionMode"] = json!("default");
+    put(&profile_path, &profile_doc.to_string());
+    store.restore(Target::ClaudeDesktop).unwrap();
+    assert_eq!(read_json(&normal)["deploymentMode"], "1p");
+    assert_eq!(read_json(&normal)["newUserSetting"], true);
+    assert_eq!(read_json(&meta)["appliedId"], "other-profile");
+    assert_eq!(read_json(&meta)["entries"].as_array().unwrap().len(), 1);
+    let restored_profile = read_json(&profile_path);
+    assert_eq!(restored_profile["permissionMode"], "default");
+    assert!(restored_profile.get("inferenceGatewayApiKey").is_none());
+}
+
+#[test]
+fn client_preferences_existing_claude_configuration_keeps_absent_role_aliases() {
+    let (temp, mut store) = fixture();
+    let path = temp.path().join("claude_cli/settings.json");
+    let original =
+        json!({"env":{"KEEP":"yes"}, "permissions":{"allow":["Read"]}, "hooks":{"Stop":[]}});
+    put(&path, &original.to_string());
+    let provider = store
+        .save(input(Family::Claude, "Absent role aliases"))
+        .unwrap();
+    store.apply(Target::ClaudeCli, &provider.id).unwrap();
+    for key in [
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    ] {
+        assert!(read_json(&path)["env"].get(key).is_none());
+    }
+    store.restore(Target::ClaudeCli).unwrap();
+    assert_eq!(read_json(&path), original);
+}
+
+#[test]
+fn client_preferences_claude_role_aliases_survive_switch_and_restore() {
+    let (temp, mut store) = fixture();
+    let path = temp.path().join("claude_cli/settings.json");
+    put(
+        &path,
+        r#"{"env":{"ANTHROPIC_DEFAULT_SONNET_MODEL":"my-sonnet","ANTHROPIC_DEFAULT_OPUS_MODEL":"my-opus","ANTHROPIC_DEFAULT_HAIKU_MODEL":"my-haiku"},"permissions":{"allow":["Read"]},"mcpServers":{"keep":{}},"hooks":{"Stop":[]}}"#,
+    );
+    let provider = store.save(input(Family::Claude, "Role aliases")).unwrap();
+    store.apply(Target::ClaudeCli, &provider.id).unwrap();
+    let (_, _, baseline) = store.target_record(Target::ClaudeCli).unwrap();
+    let mut legacy = baseline.unwrap();
+    legacy[0].keys.extend(
+        adapters::CLI_MODEL_ALIAS_KEYS
+            .iter()
+            .map(|key| key.to_string()),
+    );
+    store
+        .conn
+        .execute(
+            "UPDATE targets SET baseline=?1 WHERE id=?2",
+            params![json(&legacy).unwrap(), Target::ClaudeCli.id()],
+        )
+        .unwrap();
+    let mut current = read_json(&path);
+    assert_eq!(
+        current["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"],
+        "my-sonnet"
+    );
+    assert_eq!(current["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"], "my-opus");
+    assert_eq!(current["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "my-haiku");
+    current["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"] = json!("later-opus");
+    put(&path, &current.to_string());
+    assert_eq!(store.status(Target::ClaudeCli).unwrap().state, "applied");
+    let second = store
+        .save(input(Family::Claude, "Second role endpoint"))
+        .unwrap();
+    store.apply(Target::ClaudeCli, &second.id).unwrap();
+    store.restore(Target::ClaudeCli).unwrap();
+    let restored = read_json(&path);
+    assert_eq!(
+        restored["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"],
+        "my-sonnet"
+    );
+    assert_eq!(
+        restored["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"],
+        "later-opus"
+    );
+    assert_eq!(restored["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "my-haiku");
+    assert_eq!(restored["permissions"], current["permissions"]);
+    assert_eq!(restored["mcpServers"], current["mcpServers"]);
+    assert_eq!(restored["hooks"], current["hooks"]);
+}
+
+#[test]
+fn client_preferences_claude_default_aliases_release_legacy_ownership() {
+    let (temp, mut store) = fixture();
+    let path = temp.path().join("claude_cli/settings.json");
+    store.set_bridge_route(crate::bridge::Route {
+        port: 19876,
+        token: "c".repeat(64),
+    });
+    let provider = store
+        .save(input(Family::Codex, "Missing bridge role aliases"))
+        .unwrap();
+    store.apply(Target::ClaudeCli, &provider.id).unwrap();
+    let (_, _, baseline) = store.target_record(Target::ClaudeCli).unwrap();
+    let mut legacy = baseline.unwrap();
+    let file = legacy.iter_mut().find(|file| file.path == path).unwrap();
+    for tier in ["SONNET", "OPUS", "HAIKU"] {
+        let key = format!("env.ANTHROPIC_DEFAULT_{tier}_MODEL");
+        if !file.keys.contains(&key) {
+            file.keys.push(key);
+        }
+    }
+    store
+        .conn
+        .execute(
+            "UPDATE targets SET baseline=?1 WHERE id=?2",
+            params![json(&legacy).unwrap(), Target::ClaudeCli.id()],
+        )
+        .unwrap();
+    let mut current = read_json(&path);
+    for tier in ["SONNET", "OPUS", "HAIKU"] {
+        assert_eq!(
+            current["env"][format!("ANTHROPIC_DEFAULT_{tier}_MODEL")],
+            provider.model
+        );
+    }
+    current["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = json!("later-haiku");
+    put(&path, &current.to_string());
+    assert_eq!(store.status(Target::ClaudeCli).unwrap().state, "applied");
+    let data = store.data_directory.clone();
+    drop(store);
+    let mut reopened = Store::open(data).unwrap();
+    reopened.restore(Target::ClaudeCli).unwrap();
+    let restored = read_json(&path);
+    assert_eq!(
+        restored["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"],
+        "later-haiku"
+    );
+    assert!(restored["env"]
+        .get("ANTHROPIC_DEFAULT_OPUS_MODEL")
+        .is_none());
+    assert!(restored["env"]
+        .get("ANTHROPIC_DEFAULT_SONNET_MODEL")
+        .is_none());
+}
+
+#[test]
+fn client_preferences_bridge_initialized_aliases_are_stable_and_restore_exact_baseline() {
+    for original in [None, Some("{\"env\":{\"KEEP\":\"yes\"},\"hooks\":{}}")] {
+        let (temp, mut store) = fixture();
+        let path = temp.path().join("claude_cli/settings.json");
+        if let Some(original) = original {
+            put(&path, original);
+        }
+        store.set_bridge_route(crate::bridge::Route {
+            port: 19876,
+            token: "c".repeat(64),
+        });
+        let provider = store
+            .save(input(Family::Codex, "Bridge initialized aliases"))
+            .unwrap();
+        store.apply(Target::ClaudeCli, &provider.id).unwrap();
+        let revision = store
+            .status(Target::ClaudeCli)
+            .unwrap()
+            .configuration_revision;
+        let applied = std::fs::read_to_string(&path).unwrap();
+        for tier in ["SONNET", "OPUS", "HAIKU"] {
+            assert_eq!(
+                read_json(&path)["env"][format!("ANTHROPIC_DEFAULT_{tier}_MODEL")],
+                provider.model
+            );
+        }
+        store.apply(Target::ClaudeCli, &provider.id).unwrap();
+        let status = store.status(Target::ClaudeCli).unwrap();
+        assert_eq!(status.state, "applied");
+        assert_eq!(status.configuration_revision, revision);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), applied);
+        store.restore(Target::ClaudeCli).unwrap();
+        assert_eq!(adapters::read(&path).unwrap(), original.map(str::to_string));
+    }
+}
+
+#[test]
+fn cli_switch_clears_old_auth_preserves_hooks_and_does_not_apply_desktop() {
+    let (temp, mut store) = fixture();
+    let path = temp.path().join("claude_cli/settings.json");
+    put(
+        &path,
+        r#"{"env":{"ANTHROPIC_API_KEY":"old-key","KEEP":"yes"},"hooks":{"Stop":[]},"permissions":{"allow":["Read"]}}"#,
+    );
+    let provider = store.save(input(Family::Claude, "Claude CLI")).unwrap();
+    store.apply(Target::ClaudeCli, &provider.id).unwrap();
+    let doc = read_json(&path);
+    assert!(doc["env"].get("ANTHROPIC_API_KEY").is_none());
+    assert_eq!(doc["env"]["ANTHROPIC_AUTH_TOKEN"], "test-key-1234");
+    assert_eq!(doc["env"]["KEEP"], "yes");
+    assert!(doc["hooks"].is_object());
+    assert_eq!(
+        store.status(Target::ClaudeDesktop).unwrap().state,
+        "unmanaged"
+    );
+    store.restore(Target::ClaudeCli).unwrap();
+    assert_eq!(read_json(&path)["env"]["ANTHROPIC_API_KEY"], "old-key");
+}
+
+#[test]
+fn damaged_desktop_file_prevents_all_four_writes() {
+    let (temp, mut store) = fixture();
+    let dir = temp.path().join("claude_desktop");
+    let normal = dir.join("Claude/claude_desktop_config.json");
+    let third = dir.join("Claude-3p/claude_desktop_config.json");
+    put(&normal, r#"{"deploymentMode":"1p"}"#);
+    put(&third, "{ broken json");
+    let provider = store.save(input(Family::Claude, "Claude")).unwrap();
+    assert_eq!(
+        store
+            .apply(Target::ClaudeDesktop, &provider.id)
+            .unwrap_err()
+            .code,
+        "invalid_json"
+    );
+    assert_eq!(read_json(&normal)["deploymentMode"], "1p");
+    assert!(!dir.join("Claude-3p/configLibrary").exists());
+}
+
+#[test]
+fn external_changes_remain_protected_until_external_edit_is_reverted() {
+    let (temp, mut store) = fixture();
+    let p = store.save(input(Family::Claude, "A")).unwrap();
+    store.apply(Target::ClaudeCli, &p.id).unwrap();
+    let path = temp.path().join("claude_cli/settings.json");
+    let before = std::fs::read_to_string(&path).unwrap();
+    let mut doc = read_json(&path);
+    doc["env"]["ANTHROPIC_BASE_URL"] = json!("https://changed.example.test");
+    put(&path, &doc.to_string());
+    assert_eq!(
+        store.status(Target::ClaudeCli).unwrap().state,
+        "external_change"
+    );
+    assert_eq!(
+        store.apply(Target::ClaudeCli, &p.id).unwrap_err().code,
+        "external_change"
+    );
+    assert_eq!(
+        store.restore(Target::ClaudeCli).unwrap_err().code,
+        "external_change"
+    );
+    assert_eq!(read_json(&path), doc, "conflicting file is untouched");
+    assert_eq!(store.list().unwrap().len(), 1, "no provider is adopted");
+    assert_eq!(
+        store.provider(&p.id).unwrap().summary.base_url,
+        "https://gateway.example.test/v1"
+    );
+    put(&path, &before);
+    store.apply(Target::ClaudeCli, &p.id).unwrap();
+    assert_eq!(store.status(Target::ClaudeCli).unwrap().state, "applied");
+    store.restore(Target::ClaudeCli).unwrap();
+}
+
+#[test]
+fn edited_key_is_preserved_when_blank_and_pending_changes_are_visible() {
+    let (_temp, mut store) = fixture();
+    let p = store.save(input(Family::Codex, "A")).unwrap();
+    store.apply(Target::Codex, &p.id).unwrap();
+    let mut update = input(Family::Codex, "Renamed");
+    update.id = Some(p.id.clone());
+    update.api_key = None;
+    update.model = "new-model".into();
+    store.save(update).unwrap();
+    assert_eq!(store.provider(&p.id).unwrap().api_key, "test-key-1234");
+    assert_eq!(store.status(Target::Codex).unwrap().state, "saved_changes");
+    assert_eq!(store.delete(&p.id).unwrap_err().code, "in_use");
+    assert!(!json(&store.overview().unwrap())
+        .unwrap()
+        .contains("test-key-1234"));
+}
+
+#[test]
+fn partial_crash_rolls_back_and_completed_files_finish_database_commit() {
+    let (temp, mut store) = fixture();
+    let dir = temp.path().join("claude_desktop");
+    let p = store.save(input(Family::Claude, "Claude")).unwrap();
+    let files =
+        adapters::plan(Target::ClaudeDesktop, &dir, &store.provider(&p.id).unwrap()).unwrap();
+    let changes: Vec<_> = files
+        .iter()
+        .map(|f| Change {
+            path: f.path.clone(),
+            before: f.original.clone(),
+            after: f.expected.clone(),
+        })
+        .collect();
+    let pending = Pending {
+        target: Target::ClaudeDesktop,
+        changes,
+        baseline: Some(files),
+        active: Some(p.id.clone()),
+        provider_update: None,
+        applied_summary: None,
+        accepted_source: None,
+    };
+    store
+        .conn
+        .execute(
+            "INSERT INTO operations VALUES('crash','pending',?1,0)",
+            [json(&pending).unwrap()],
+        )
+        .unwrap();
+    writer::write(
+        &pending.changes[0].path,
+        pending.changes[0].after.as_deref(),
+    )
+    .unwrap();
+    store.recover().unwrap();
+    assert!(!pending.changes[0].path.exists());
+    assert_eq!(
+        store.status(Target::ClaudeDesktop).unwrap().state,
+        "unmanaged"
+    );
+    store
+        .conn
+        .execute(
+            "INSERT INTO operations VALUES('complete','pending',?1,1)",
+            [json(&pending).unwrap()],
+        )
+        .unwrap();
+    for change in &pending.changes {
+        writer::write(&change.path, change.after.as_deref()).unwrap();
+    }
+    store.recover().unwrap();
+    assert_eq!(
+        store
+            .status(Target::ClaudeDesktop)
+            .unwrap()
+            .active_provider_id,
+        Some(p.id)
+    );
+}
+
+#[test]
+fn invalid_urls_models_and_changed_directory_are_rejected() {
+    let (_temp, mut store) = fixture();
+    let mut bad = input(Family::Codex, "A");
+    bad.base_url = "file:///tmp/secret".into();
+    assert_eq!(store.save(bad).unwrap_err().code, "invalid_url");
+    let p = store.save(input(Family::Codex, "A")).unwrap();
+    store.apply(Target::Codex, &p.id).unwrap();
+    assert_eq!(
+        store
+            .set_directory(Target::Codex, std::env::temp_dir().to_string_lossy().into())
+            .unwrap_err()
+            .code,
+        "managed_directory"
+    );
+    let mut other = input(Family::Claude, "Other");
+    other.model = "non-claude-model".into();
+    let c = store.save(other).unwrap();
+    assert_eq!(
+        store.apply(Target::ClaudeDesktop, &c.id).unwrap_err().code,
+        "desktop_model"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_locked_file_keeps_original_contents() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("locked.json");
+    put(&path, "original");
+    let _held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(&path)
+        .unwrap();
+    assert!(writer::write(&path, Some("replacement")).is_err());
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "original");
+}

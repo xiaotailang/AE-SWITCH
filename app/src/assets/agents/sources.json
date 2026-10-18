@@ -1,0 +1,60 @@
+{
+  "description": "Original official Agent Hub assets; licenses of client code do not automatically grant trademark rights. Original seven-tool hashes were retained from the workspace asset inventory.",
+  "assets": [
+    {
+      "file": "claude-code.png",
+      "url": "https://anthropic.gallerycdn.vsassets.io/extensions/anthropic/claude-code/2.1.293/1791396798180/Microsoft.VisualStudio.Services.Icons.Default",
+      "sha256": "7241633e5a39b44a947c7b9a821637f30d6e86716e7a8c847136d91f9c3f6ba1"
+    },
+    {
+      "file": "codex.png",
+      "url": "https://openai.gallerycdn.vsassets.io/extensions/openai/chatgpt/26.51002.51308/1791325973000/Microsoft.VisualStudio.Services.Icons.Default",
+      "sha256": "2ce1c57dd3b312417106a487815ab1235bddce17e1fa9b32a2f048bd71ee25d3"
+    },
+    {
+      "file": "../brands/codex.png",
+      "source": "Official Windows package OpenAI.Codex_26.930.3930.0_x64__2p2nqsd0c76g0 / assets/Square44x44Logo.targetsize-256_altform-lightunplated.png",
+      "sha256": "b45359d98553406d60c45e699cbe80de6fe733d51661a317ca37b41632b58823"
+    },
+    {
+      "file": "hermes.svg",
+      "url": "https://github.com/NousResearch/hermes-agent/blob/cc75e8f4021f7efab99158f57601be4d691a6da9/assets/icon-master.svg",
+      "sha256": "6c4968c1a46f104559684826ed8061fad6052711ff0af9c6b36a6ce674536684"
+    },
+    {
+      "file": "oh-my-pi.svg",
+      "url": "https://github.com/can1357/oh-my-pi/blob/2e5311bb6eb824fedca5e84f49c292ca6957acc3/assets/icon.svg",
+      "sha256": "727019727006f26fe3d1f187d3fe9830f26213733a51721096a2044ab059cf61"
+    },
+    {
+      "file": "opencode-dark.svg",
+      "url": "https://github.com/anomalyco/opencode/blob/a697115b203395c54a7496dc3d1863fe7b319c0c/packages/console/app/src/asset/brand/opencode-logo-dark-square.svg",
+      "sha256": "d6a0e3b8a295f413543f41cb73957e670351b5cb088c8d9dbd186b9e9d633cca"
+    },
+    {
+      "file": "opencode-light.svg",
+      "url": "https://github.com/anomalyco/opencode/blob/a697115b203395c54a7496dc3d1863fe7b319c0c/packages/console/app/src/asset/brand/opencode-logo-light-square.svg",
+      "sha256": "b1c48d82ebd304eab820658387642bcf4c9b8350d6860894d0fe21ddca25ef3f"
+    },
+    {
+      "file": "zcode.png",
+      "url": "https://github.com/zai-org/ZCode/blob/29628c9acdb81b703bbd4080c207a0e7ce5e276e/public/logo/icons/256x256.png",
+      "sha256": "ad0e1d32febb23d42942ab6faa32254d5647ddce38b18c276523bc7baab0e7aa"
+    },
+    {
+      "file": "workbuddy.svg",
+      "url": "https://download.codebuddy.cn/web/workbuddy/788eb1c5ba3681efa98cf7b58ae688e293c1bb34/assets/logo.svg",
+      "sha256": "10ccbc099e7bc3d5ff12c315c4edd7b21386aa7166c1ec19997b3d55010d5c7d"
+    },
+    {
+      "file": "deepseek-harness.svg",
+      "url": "https://www.deepseek.com/harness/favicon.svg",
+      "bytes": 3864,
+      "sha256": "d19b62d73c8db53d5a241dfb4adbc7cad259557e5da8da6587a86d7dd4b06382",
+      "verifiedAt": "2026-10-10",
+      "httpStatus": 200,
+      "byteExact": true,
+      "rights": "Official website mark; no separate icon license established. Harness code MIT is not a trademark grant."
+    }
+  ]
+}
