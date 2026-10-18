@@ -255,6 +255,285 @@ async function specifyInstallation(directory: string) {
   });
 }
 describe("Agent Hub 真实状态与配置流程", () => {
+  it("保存新连接及延迟同步模型后保留选定等级和验证结果", async () => {
+    const models = [
+      {
+        ...provider.codexOptions!.models[0],
+        reasoningEfforts: ["low", "high"],
+      },
+    ];
+    let savedProvider = {
+      ...provider,
+      codexOptions: { ...provider.codexOptions!, models },
+    };
+    vi.mocked(api.overview).mockImplementation(async () => ({
+      providers: [savedProvider],
+      targets: [],
+      dataDirectory: "./data",
+    }));
+    vi.mocked(api.save).mockImplementation(async (input) => {
+      savedProvider = {
+        ...savedProvider,
+        reasoningEffort: input.reasoningEffort,
+      };
+      return savedProvider;
+    });
+    vi.mocked(api.discoverConnection).mockResolvedValue({
+      models,
+      protocol: "openai",
+      authMode: "bearer",
+      syncedAt: 2,
+      baseUrl: provider.baseUrl,
+    });
+    await mount();
+    await enterConnection();
+    await userEvent.click(screen.getByRole("radio", { name: "高（high）" }));
+    await userEvent.click(screen.getByRole("button", { name: "确认连接" }));
+    await screen.findByText("工具写读验证通过");
+    await waitFor(
+      () => expect(api.discoverConnection).toHaveBeenCalledTimes(2),
+      { timeout: 3000 },
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("radio", { name: "高（high）" })).toBeChecked(),
+    );
+    expect(screen.getByText("工具写读验证通过")).toBeVisible();
+    expect(api.save).toHaveBeenCalledWith(
+      expect.objectContaining({ reasoningEffort: "high" }),
+    );
+  });
+
+  it("ZCode内置命令行验证失败与桌面接入状态明确区分", async () => {
+    vi.mocked(agentApi.probe).mockResolvedValue({
+      ok: false,
+      model: "gpt-test",
+      latencyMs: 3,
+      message: "ZCode 自动验证进程退出，尚未完成文件写读。",
+      validationScope: "tool",
+      toolVerified: false,
+      stage: "process",
+      clientSurface: "desktop-bundled-cli",
+      diagnostic: "provider_rejected\n命令行进程退出码：1",
+      desktopGuiVerified: false,
+      cleanup: { succeeded: true },
+    });
+    await mount();
+    await enterConnection();
+    await userEvent.click(
+      screen.getByRole("button", { name: /Z Code 官方图标/ }),
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "确认连接" })).toBeEnabled(),
+    );
+    await userEvent.click(screen.getByRole("button", { name: "确认连接" }));
+    await screen.findByText("自动文件验证未通过");
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "配置已写入，自动文件验证未通过",
+    );
+    expect(
+      screen.getByText(
+        /此结果仅表示自动文件验证未通过，不代表桌面客户端不可用/,
+      ),
+    ).toBeVisible();
+    expect(screen.getByText("验证阶段：运行自动验证命令")).toBeVisible();
+    expect(screen.queryByText("工具写读验证通过")).toBeNull();
+    await userEvent.click(
+      screen.getByText("查看验证原因", { selector: "summary" }),
+    );
+    expect(screen.getByText(/provider_rejected/)).toBeVisible();
+  });
+
+  it("根据真实模型能力显示思考选项并将选择保存到连接", async () => {
+    vi.mocked(api.discoverConnection).mockResolvedValue({
+      models: [
+        {
+          ...provider.codexOptions!.models[0],
+          reasoningEfforts: ["low", "high", "xhigh", "unsupported"],
+        },
+      ],
+      protocol: "openai",
+      authMode: "bearer",
+      syncedAt: 2,
+      baseUrl: provider.baseUrl,
+    });
+    await mount();
+    await enterConnection();
+    const options = screen.getByRole("group", { name: "思考程度" });
+    expect(within(options).getAllByRole("radio")).toHaveLength(4);
+    expect(within(options).getByRole("radio", { name: "默认" })).toBeChecked();
+    await userEvent.click(
+      within(options).getByRole("radio", { name: "更高（xhigh）" }),
+    );
+    await userEvent.click(screen.getByRole("button", { name: "确认连接" }));
+    await waitFor(() =>
+      expect(api.save).toHaveBeenCalledWith(
+        expect.objectContaining({ reasoningEffort: "xhigh" }),
+      ),
+    );
+    expect(agentApi.configure).toHaveBeenCalledOnce();
+  });
+
+  it("思考等级未知或Anthropic连接不会提供猜测档位", async () => {
+    await mount();
+    await enterConnection();
+    expect(screen.getAllByRole("radio")).toHaveLength(1);
+    expect(
+      screen.getByText(
+        "供应商未返回此模型的可选思考等级，使用客户端或供应商的默认设置。",
+      ),
+    ).toBeVisible();
+    vi.mocked(api.discoverConnection).mockResolvedValue({
+      models: [
+        {
+          ...provider.codexOptions!.models[0],
+          reasoningEfforts: ["low", "high"],
+        },
+      ],
+      protocol: "anthropic",
+      authMode: "x-api-key",
+      syncedAt: 3,
+      baseUrl: provider.baseUrl,
+    });
+    await userEvent.click(screen.getByRole("button", { name: "同步模型" }));
+    await screen.findByText(
+      "此连接暂不支持在 AE Switch 中设置思考等级，使用客户端或供应商的默认设置。",
+    );
+    expect(screen.getAllByRole("radio")).toHaveLength(1);
+  });
+
+  it("切换模型后清除思考档位和上一次验证结果", async () => {
+    const models = [
+      {
+        ...provider.codexOptions!.models[0],
+        reasoningEfforts: ["low", "high"],
+      },
+      {
+        id: "other-model",
+        enabled: true,
+        contextWindow: null,
+        reasoningEfforts: ["medium"],
+      },
+    ];
+    const savedProvider = {
+      ...provider,
+      codexOptions: { ...provider.codexOptions!, models },
+    };
+    vi.mocked(api.overview).mockResolvedValue({
+      providers: [savedProvider],
+      targets: [],
+      dataDirectory: "./data",
+    });
+    vi.mocked(api.save).mockResolvedValue(savedProvider);
+    vi.mocked(api.discoverConnection).mockResolvedValue({
+      models,
+      protocol: "openai",
+      authMode: "bearer",
+      syncedAt: 2,
+      baseUrl: provider.baseUrl,
+    });
+    await mount();
+    await enterConnection();
+    await userEvent.click(screen.getByRole("button", { name: "确认连接" }));
+    await screen.findByText("工具写读验证通过");
+    await userEvent.click(
+      await screen.findByRole("radio", { name: "高（high）" }),
+    );
+    expect(screen.queryByText("工具写读验证通过")).toBeNull();
+    await userEvent.selectOptions(
+      screen.getByRole("combobox", { name: "默认模型" }),
+      "other-model",
+    );
+    expect(screen.getByRole("radio", { name: "默认" })).toBeChecked();
+    expect(screen.queryByRole("radio", { name: "高（high）" })).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "确认连接" }));
+    await waitFor(() =>
+      expect(api.save).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          model: "other-model",
+          reasoningEffort: null,
+        }),
+      ),
+    );
+  });
+
+  it("已保存档位可恢复，选择默认会明确移除AE覆盖", async () => {
+    const savedProvider: Provider = {
+      ...provider,
+      reasoningEffort: "high",
+      codexOptions: {
+        ...provider.codexOptions!,
+        models: [
+          {
+            ...provider.codexOptions!.models[0],
+            reasoningEfforts: ["low", "high"],
+          },
+        ],
+      },
+    };
+    vi.mocked(api.overview).mockResolvedValue({
+      providers: [savedProvider],
+      targets: [],
+      dataDirectory: "./data",
+    });
+    vi.mocked(api.discoverConnection).mockResolvedValue({
+      models: savedProvider.codexOptions!.models,
+      protocol: "openai",
+      authMode: "bearer",
+      syncedAt: 2,
+      baseUrl: provider.baseUrl,
+    });
+    await mount();
+    await userEvent.selectOptions(
+      screen.getByRole("combobox", { name: "供应商配置" }),
+      savedProvider.id,
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("radio", { name: "高（high）" })).toBeChecked(),
+    );
+    await userEvent.click(screen.getByRole("radio", { name: "默认" }));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "确认连接" })).toBeEnabled(),
+    );
+    await userEvent.click(screen.getByRole("button", { name: "确认连接" }));
+    await waitFor(() =>
+      expect(api.save).toHaveBeenCalledWith(
+        expect.objectContaining({ reasoningEffort: null }),
+      ),
+    );
+  });
+
+  it("同步后模型移除等级时清除旧选择", async () => {
+    vi.mocked(api.discoverConnection).mockResolvedValue({
+      models: [
+        {
+          ...provider.codexOptions!.models[0],
+          reasoningEfforts: ["low", "high"],
+        },
+      ],
+      protocol: "openai",
+      authMode: "bearer",
+      syncedAt: 2,
+      baseUrl: provider.baseUrl,
+    });
+    await mount();
+    await enterConnection();
+    await userEvent.click(screen.getByRole("radio", { name: "高（high）" }));
+    vi.mocked(api.discoverConnection).mockResolvedValue({
+      models: [
+        { ...provider.codexOptions!.models[0], reasoningEfforts: ["low"] },
+      ],
+      protocol: "openai",
+      authMode: "bearer",
+      syncedAt: 3,
+      baseUrl: provider.baseUrl,
+    });
+    await userEvent.click(screen.getByRole("button", { name: "同步模型" }));
+    await waitFor(() =>
+      expect(screen.queryByRole("radio", { name: "高（high）" })).toBeNull(),
+    );
+    expect(screen.getByRole("radio", { name: "默认" })).toBeChecked();
+  });
+
   function workBuddyFixture(defaultSelection?: WorkBuddyDefaultSelection) {
     configuredAgent = "workbuddy";
     const profile = {
@@ -1213,9 +1492,7 @@ describe("Agent Hub 真实状态与配置流程", () => {
     );
     expect(screen.queryByLabelText("原配置目录", { exact: true })).toBeNull();
     expect(screen.getByRole("button", { name: "确认连接" })).toBeDisabled();
-    await userEvent.click(
-      screen.getByRole("button", { name: /^识别$/ }),
-    );
+    await userEvent.click(screen.getByRole("button", { name: /^识别$/ }));
     await waitFor(() =>
       expect(screen.getByRole("button", { name: "确认连接" })).toBeEnabled(),
     );
@@ -1297,9 +1574,7 @@ describe("Agent Hub 真实状态与配置流程", () => {
     await mount();
     await enterConnection();
     await specifyInstallation("G:/valid/install");
-    await userEvent.click(
-      screen.getByRole("button", { name: /^识别$/ }),
-    );
+    await userEvent.click(screen.getByRole("button", { name: /^识别$/ }));
     await waitFor(() =>
       expect(screen.getByRole("button", { name: "确认连接" })).toBeEnabled(),
     );
@@ -1310,16 +1585,12 @@ describe("Agent Hub 真实状态与配置流程", () => {
     });
     expect(screen.queryByText("工具写读验证通过")).toBeNull();
     expect(screen.getByRole("button", { name: "确认连接" })).toBeDisabled();
-    await userEvent.click(
-      screen.getByRole("button", { name: /^识别$/ }),
-    );
+    await userEvent.click(screen.getByRole("button", { name: /^识别$/ }));
     expect(
       await screen.findByText(/安装目录识别失败：目录不可访问/),
     ).toBeVisible();
     expect(screen.getByRole("button", { name: "确认连接" })).toBeDisabled();
-    await userEvent.click(
-      screen.getByRole("button", { name: /^识别$/ }),
-    );
+    await userEvent.click(screen.getByRole("button", { name: /^识别$/ }));
     expect(
       await screen.findByText(/所选安装目录中未识别到 Claude Code/),
     ).toBeVisible();
@@ -1349,9 +1620,7 @@ describe("Agent Hub 真实状态与配置流程", () => {
     await mount();
     await enterConnection();
     await specifyInstallation("G:/many/install");
-    await userEvent.click(
-      screen.getByRole("button", { name: /^识别$/ }),
-    );
+    await userEvent.click(screen.getByRole("button", { name: /^识别$/ }));
     const select = screen.getByRole("combobox", { name: "已安装客户端与配置" });
     await within(select).findByRole("option", {
       name: `${second.directory} · ${second.executablePath}`,
@@ -1381,16 +1650,12 @@ describe("Agent Hub 真实状态与配置流程", () => {
     await mount();
     await enterConnection();
     await specifyInstallation("G:/old/install");
-    await userEvent.click(
-      screen.getByRole("button", { name: /^识别$/ }),
-    );
+    await userEvent.click(screen.getByRole("button", { name: /^识别$/ }));
     expect(screen.getByRole("button", { name: "确认连接" })).toBeDisabled();
     fireEvent.change(screen.getByLabelText("安装目录", { exact: true }), {
       target: { value: "G:/new/install" },
     });
-    await userEvent.click(
-      screen.getByRole("button", { name: /^识别$/ }),
-    );
+    await userEvent.click(screen.getByRole("button", { name: /^识别$/ }));
     await waitFor(() =>
       expect(screen.getByRole("button", { name: "确认连接" })).toBeEnabled(),
     );
@@ -1415,9 +1680,7 @@ describe("Agent Hub 真实状态与配置流程", () => {
     await mount();
     await enterConnection();
     await specifyInstallation("G:/pending/install");
-    await userEvent.click(
-      screen.getByRole("button", { name: /^识别$/ }),
-    );
+    await userEvent.click(screen.getByRole("button", { name: /^识别$/ }));
     const nav = within(screen.getByRole("navigation", { name: "选择 Agent" }));
     await userEvent.click(nav.getByRole("button", { name: /Codex 官方图标/ }));
     await act(async () =>
@@ -1445,9 +1708,7 @@ describe("Agent Hub 真实状态与配置流程", () => {
     await mount();
     await enterConnection();
     await specifyInstallation("G:/pending/install");
-    await userEvent.click(
-      screen.getByRole("button", { name: /^识别$/ }),
-    );
+    await userEvent.click(screen.getByRole("button", { name: /^识别$/ }));
     await enterAdvancedPaths();
     await act(async () =>
       resolveOld(

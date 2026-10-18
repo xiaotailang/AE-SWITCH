@@ -158,15 +158,17 @@ pub fn parse_models(value: &Value) -> Result<Vec<ProviderModel>> {
             .filter(|v| (1..=100_000_000).contains(v));
         let reasoning_efforts = item
             .get("supported_reasoning_levels")
+            .or_else(|| item.get("supported_reasoning_efforts"))
             .or_else(|| item.get("reasoning_efforts"))
             .and_then(Value::as_array)
             .map(|a| {
+                let mut seen_efforts = HashSet::new();
                 a.iter()
                     .filter_map(|e| {
                         e.as_str()
                             .or_else(|| e.get("effort").and_then(Value::as_str))
                     })
-                    .filter(|e| valid_effort(e))
+                    .filter(|e| valid_effort(e) && seen_efforts.insert(*e))
                     .map(str::to_owned)
                     .collect()
             })
@@ -631,6 +633,17 @@ mod tests {
         assert!(models[1].reasoning_efforts.is_empty());
         assert!(parse_models(&json!({"data":[]})).is_err());
         assert!(parse_models(&json!({"data":[{"id":"bad\nmodel"}]})).is_err());
+    }
+    #[test]
+    fn discovery_accepts_explicit_reasoning_capability_formats_without_guessing() {
+        let models = parse_models(&json!({"data":[
+            {"id":"a","supported_reasoning_levels":[{"effort":"high"},{"effort":"high"},{"effort":"ultra"},{"effort":"invalid"}]},
+            {"id":"b","supported_reasoning_efforts":["none","low","xhigh"]},
+            {"id":"gpt-6.1-sol"}
+        ]})).unwrap();
+        assert_eq!(models[0].reasoning_efforts, ["high", "ultra"]);
+        assert_eq!(models[1].reasoning_efforts, ["none", "low", "xhigh"]);
+        assert!(models[2].reasoning_efforts.is_empty());
     }
     #[test]
     fn balance_supports_numeric_strings_zero_and_explicit_conversion() {

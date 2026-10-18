@@ -365,6 +365,162 @@ async fn selected_post(
         .unwrap()
 }
 
+fn set_provider_effort(fixture: &Fixture, model: &str, effort: Option<&str>, known: bool) {
+    let mut store = fixture.store.lock().unwrap();
+    let summary = store.agent_provider(&fixture.id).unwrap().summary;
+    let mut input: ProviderInput =
+        serde_json::from_value(serde_json::to_value(summary).unwrap()).unwrap();
+    input.model = model.into();
+    input.reasoning_effort = effort.map(str::to_owned);
+    input.codex_options.models = [MODEL, "selected-b"]
+        .into_iter()
+        .map(|id| ProviderModel {
+            id: id.into(),
+            context_window: None,
+            reasoning_efforts: if known {
+                ["none", "low", "high", "ultra"].map(str::to_owned).into()
+            } else {
+                vec![]
+            },
+            enabled: true,
+        })
+        .collect();
+    store.save(input).unwrap();
+}
+
+#[tokio::test]
+async fn selected_reasoning_is_snapshotted_and_reaches_all_openai_request_paths() {
+    use crate::agent_configs::AgentId;
+    for kind in [UpstreamKind::Openai, UpstreamKind::ChatOnly] {
+        let fixture = Fixture::new(kind, CodexProtocol::Openai, "bearer", "/v1").await;
+        set_provider_effort(&fixture, MODEL, Some("ultra"), true);
+        for agent in [AgentId::Codex, AgentId::Zcode, AgentId::ClaudeCode] {
+            configure_selected_agent(&fixture, agent, MODEL);
+        }
+        // Saving a different preference on the shared endpoint must not alter
+        // already configured clients, even when they use the same model.
+        set_provider_effort(&fixture, MODEL, Some("low"), true);
+        configure_selected_agent(&fixture, AgentId::WorkBuddy, MODEL);
+        for (agent, resource, effort) in [
+            ("codex", "responses", "ultra"),
+            ("zcode", "chat/completions", "ultra"),
+            ("claude_code", "messages", "ultra"),
+            ("workbuddy", "chat/completions", "low"),
+        ] {
+            let mut body = request_body(resource, false);
+            if resource == "responses" {
+                body["reasoning"] = json!({"effort":"low", "summary":"auto"});
+            } else if resource == "chat/completions" {
+                body["reasoning_effort"] = "high".into();
+            }
+            let response = selected_post(&fixture, agent, resource, body).await;
+            assert!(response.status().is_success(), "{agent}");
+            let recorded = fixture.recorded().pop().unwrap();
+            if recorded.path == "/v1/responses" {
+                assert_eq!(recorded.body["reasoning"]["effort"], effort, "{agent}");
+                if agent == "codex" {
+                    assert_eq!(recorded.body["reasoning"]["summary"], "auto");
+                }
+            } else {
+                assert_eq!(recorded.body["reasoning_effort"], effort, "{agent}");
+            }
+        }
+        fixture.assert_unactivated();
+        fixture.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn selected_reasoning_defaults_preserve_clients_and_do_not_apply_to_other_models() {
+    use crate::agent_configs::AgentId;
+    let fixture = Fixture::new(UpstreamKind::Openai, CodexProtocol::Openai, "bearer", "/v1").await;
+    set_provider_effort(&fixture, MODEL, Some("high"), true);
+    configure_selected_agent(&fixture, AgentId::Zcode, MODEL);
+    configure_selected_agent(&fixture, AgentId::Codex, "selected-b");
+    set_provider_effort(&fixture, MODEL, None, true);
+    configure_selected_agent(&fixture, AgentId::WorkBuddy, MODEL);
+    for (agent, model) in [
+        ("zcode", "selected-b"),
+        ("codex", "selected-b"),
+        ("workbuddy", MODEL),
+    ] {
+        let mut body = request_body("chat/completions", false);
+        body["model"] = model.into();
+        body["reasoning_effort"] = "low".into();
+        assert!(selected_post(&fixture, agent, "chat/completions", body)
+            .await
+            .status()
+            .is_success());
+        assert_eq!(
+            fixture.recorded().pop().unwrap().body["reasoning_effort"],
+            "low"
+        );
+    }
+    // Legacy provider routes continue following the request even if the provider
+    // has an explicit preference for the new single-page agent workflow.
+    set_provider_effort(&fixture, MODEL, Some("high"), true);
+    let mut body = request_body("chat/completions", false);
+    body["reasoning_effort"] = "low".into();
+    assert!(fixture
+        .post("chat/completions", body)
+        .await
+        .status()
+        .is_success());
+    assert_eq!(
+        fixture.recorded().pop().unwrap().body["reasoning_effort"],
+        "low"
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn selected_reasoning_rejects_unconfirmed_or_changed_capabilities_before_forwarding() {
+    use crate::agent_configs::AgentId;
+    for (protocol, known) in [
+        (CodexProtocol::Openai, false),
+        (CodexProtocol::Anthropic, true),
+    ] {
+        let fixture = Fixture::new(UpstreamKind::Openai, protocol, "bearer", "/v1").await;
+        set_provider_effort(&fixture, MODEL, Some("high"), known);
+        let error = crate::agent_hub::configure(
+            &fixture.store.lock().unwrap(),
+            crate::agent_hub::AgentInput {
+                agent_id: AgentId::Zcode,
+                provider_id: fixture.id.clone(),
+                model: None,
+                profile: None,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "unsupported_reasoning_effort");
+        assert!(!fixture
+            .temporary
+            .path()
+            .join("data/agent-selection.json")
+            .exists());
+        assert!(!fixture.temporary.path().join("data/agents/zcode").exists());
+        assert!(fixture.recorded().is_empty());
+        fixture.shutdown().await;
+    }
+    let fixture = Fixture::new(UpstreamKind::Openai, CodexProtocol::Openai, "bearer", "/v1").await;
+    set_provider_effort(&fixture, MODEL, Some("high"), true);
+    configure_selected_agent(&fixture, AgentId::Zcode, MODEL);
+    set_provider_effort(&fixture, MODEL, None, false);
+    assert_eq!(
+        selected_post(
+            &fixture,
+            "zcode",
+            "chat/completions",
+            request_body("chat/completions", false)
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert!(fixture.recorded().is_empty());
+    fixture.shutdown().await;
+}
+
 #[tokio::test]
 async fn release_routing_selected_agent_models_are_isolated_from_shared_provider_default() {
     use crate::agent_configs::AgentId;

@@ -159,7 +159,7 @@ pub(super) async fn messages(
     // Responses does not support stop sequences. Select Chat explicitly when
     // the client requires them; never silently discard the stopping contract.
     let mut chat = stops.is_some();
-    let initial = if chat {
+    let mut initial = if chat {
         let mut value = reverse::chat_request(&converted)
             .map_err(|e| claude_error(StatusCode::BAD_REQUEST, e))?;
         value["stop"] = stops.unwrap().clone();
@@ -167,11 +167,18 @@ pub(super) async fn messages(
     } else {
         converted.clone()
     };
+    let selected_agent = target == "agent" && id.starts_with("selected:");
+    if selected_agent {
+        agent_http::apply_selected_reasoning_effort(&provider, &mut initial, chat);
+    }
     let mut response = send(&runtime, &provider, &initial, chat).await?;
     if !chat && matches!(response.status().as_u16(), 404 | 405) {
         drop(response);
-        let fallback = reverse::chat_request(&converted)
+        let mut fallback = reverse::chat_request(&converted)
             .map_err(|e| claude_error(StatusCode::BAD_REQUEST, e))?;
+        if selected_agent {
+            agent_http::apply_selected_reasoning_effort(&provider, &mut fallback, true);
+        }
         response = send(&runtime, &provider, &fallback, true).await?;
         chat = true;
     }

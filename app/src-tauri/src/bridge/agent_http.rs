@@ -115,14 +115,41 @@ fn resource_url(base: &str, resource: &str) -> String {
     }
 }
 
+pub(super) fn apply_selected_reasoning_effort(
+    provider: &StoredProvider,
+    body: &mut Value,
+    chat: bool,
+) {
+    if body["model"].as_str() != Some(provider.summary.model.as_str()) {
+        return;
+    }
+    let Some(effort) = provider.summary.reasoning_effort.as_deref() else {
+        // Default means following the client/upstream. Do not erase a client's
+        // own reasoning settings or invent a default on its behalf.
+        return;
+    };
+    if chat {
+        body["reasoning_effort"] = effort.into();
+    } else {
+        if !body["reasoning"].is_object() {
+            body["reasoning"] = json!({});
+        }
+        body["reasoning"]["effort"] = effort.into();
+    }
+}
+
 async fn forward(
     runtime: Runtime,
     provider: StoredProvider,
     headers: HeaderMap,
     resource: &str,
-    body: Value,
+    mut body: Value,
+    selected: bool,
 ) -> std::result::Result<Response, HttpError> {
     validate_model(&provider, &body)?;
+    if selected && matches!(resource, "responses" | "chat/completions") {
+        apply_selected_reasoning_effort(&provider, &mut body, resource == "chat/completions");
+    }
     let mut request = runtime
         .client
         .post(resource_url(&provider.summary.base_url, resource))
@@ -223,7 +250,15 @@ pub(super) async fn responses(
         )
         .await
     } else {
-        forward(runtime, provider, headers, "responses", body).await
+        forward(
+            runtime,
+            provider,
+            headers,
+            "responses",
+            body,
+            id.starts_with("selected:"),
+        )
+        .await
     }
 }
 
@@ -244,7 +279,15 @@ pub(super) async fn compact(
         .await
         .map(IntoResponse::into_response)
     } else {
-        forward(runtime, provider, headers, "responses/compact", body).await
+        forward(
+            runtime,
+            provider,
+            headers,
+            "responses/compact",
+            body,
+            id.starts_with("selected:"),
+        )
+        .await
     }
 }
 
@@ -265,7 +308,15 @@ pub(super) async fn messages(
         )
         .await
     } else {
-        forward(runtime, provider, headers, "messages", body).await
+        forward(
+            runtime,
+            provider,
+            headers,
+            "messages",
+            body,
+            id.starts_with("selected:"),
+        )
+        .await
     }
 }
 
@@ -286,7 +337,15 @@ pub(super) async fn count_tokens(
         )
         .await
     } else {
-        forward(runtime, provider, headers, "messages/count_tokens", body).await
+        forward(
+            runtime,
+            provider,
+            headers,
+            "messages/count_tokens",
+            body,
+            id.starts_with("selected:"),
+        )
+        .await
     }
 }
 
@@ -407,7 +466,15 @@ pub(super) async fn chat(
 ) -> std::result::Result<Response, HttpError> {
     let provider = provider(&runtime, &headers, &id)?;
     if provider.summary.upstream_protocol() == CodexProtocol::Openai {
-        return forward(runtime, provider, headers, "chat/completions", body).await;
+        return forward(
+            runtime,
+            provider,
+            headers,
+            "chat/completions",
+            body,
+            id.starts_with("selected:"),
+        )
+        .await;
     }
     validate_model(&provider, &body)?;
     let responses = chat_to_responses(&body).map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
@@ -541,7 +608,13 @@ async fn responses_via_chat(
         convert::request(&body, streaming).map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
     let responses = reverse::request(&converted.body, &model, streaming)
         .map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
-    let chat = reverse::chat_request(&responses).map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
+    let mut chat =
+        reverse::chat_request(&responses).map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
+    // The compatibility translators pass through Anthropic's thinking format.
+    // Restore the exact OpenAI effort rather than round-tripping via a budget.
+    if let Some(effort) = body.pointer("/reasoning/effort") {
+        chat["reasoning_effort"] = effort.clone();
+    }
     let response = reverse_http::send(&runtime, &provider, &chat, true).await?;
     if !response.status().is_success() {
         let status =

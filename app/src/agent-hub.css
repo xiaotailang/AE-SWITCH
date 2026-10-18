@@ -324,6 +324,80 @@
   margin-bottom: 22px;
 }
 
+.hub-reasoning-settings {
+  min-width: 0;
+  margin: 18px 0 22px;
+  padding: 0;
+  border: 0;
+}
+
+.hub-reasoning-settings legend {
+  margin-bottom: 8px;
+  color: var(--hub-text);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.hub-reasoning-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.hub-reasoning-option {
+  position: relative;
+  display: inline-flex;
+  padding: 8px 12px;
+  border: 1px solid var(--hub-line);
+  border-radius: 7px;
+  background: var(--hub-input);
+  color: var(--hub-text);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.hub-reasoning-option.selected {
+  border-color: var(--hub-focus);
+  background: var(--hub-accent-soft);
+}
+
+.hub-reasoning-option:focus-within {
+  outline: 2px solid var(--hub-focus);
+  outline-offset: 2px;
+}
+
+.hub-reasoning-option:has(input:disabled) {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.hub-reasoning-option input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+}
+
+.hub-verification-diagnostic {
+  margin: 8px 0;
+  font-size: 12px;
+}
+
+.hub-verification-diagnostic summary {
+  cursor: pointer;
+}
+
+.hub-verification-diagnostic pre {
+  max-height: 180px;
+  overflow: auto;
+  padding: 10px;
+  border: 1px solid var(--hub-line);
+  border-radius: 7px;
+  background: var(--hub-input);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .hub-field label,
 .hub-manual-profile label,
 .hub-client-runtime label,

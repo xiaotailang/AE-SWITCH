@@ -25,6 +25,8 @@ struct Selection {
     provider_id: String,
     model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     profile: Option<ExistingProfile>,
     #[serde(default)]
     configuration_revision: u64,
@@ -266,7 +268,7 @@ pub fn overview(store: &Store) -> Result<Value> {
         let (warnings,variables)=profile_warnings(definition.id,profile);
         let directory = profile.map(|profile| PathBuf::from(&profile.directory)).unwrap_or(private_directory.clone());
         let launcher = if configured { Some(profile.map(|profile| PathBuf::from(&profile.executable_path)).unwrap_or_else(|| private_directory.join(agent_configs::launcher_file_name()))) } else { None };
-        json!({"id":definition.id,"name":definition.name,"description":definition.description,"protocol":definition.protocol,"configured":configured,"directory":directory,"launcher":launcher,"model":selection.map(|s| &s.model),"providerId":selection.map(|s| &s.provider_id),"profile":profile,"mode":if profile.is_some(){"existing"}else{"private"},"needsRestart":configured,"configurationRevision":selection.map_or(0,|selection|selection.configuration_revision),"appliedAtMs":selection.map_or(0,|selection|selection.applied_at_ms),"canLaunch":configured&&launch_reason.is_none(),"reason":validation.err().map(|error|error.message),"launchReason":launch_reason,"warnings":warnings,"overrideEnvironmentVariables":variables})
+        json!({"id":definition.id,"name":definition.name,"description":definition.description,"protocol":definition.protocol,"configured":configured,"directory":directory,"launcher":launcher,"model":selection.map(|s| &s.model),"reasoningEffort":selection.and_then(|s| s.reasoning_effort.as_ref()),"providerId":selection.map(|s| &s.provider_id),"profile":profile,"mode":if profile.is_some(){"existing"}else{"private"},"needsRestart":configured,"configurationRevision":selection.map_or(0,|selection|selection.configuration_revision),"appliedAtMs":selection.map_or(0,|selection|selection.applied_at_ms),"canLaunch":configured&&launch_reason.is_none(),"reason":validation.err().map(|error|error.message),"launchReason":launch_reason,"warnings":warnings,"overrideEnvironmentVariables":variables})
     }).collect();
     Ok(json!({"agents":agents,"dataDirectory":store.data_directory,"bridgeHealthy":false}))
 }
@@ -291,6 +293,45 @@ fn selected_model(store: &Store, input: &AgentInput) -> Result<String> {
     Ok(model.to_owned())
 }
 
+fn validate_reasoning_effort(
+    provider: &StoredProvider,
+    model: &str,
+    effort: Option<&str>,
+) -> Result<()> {
+    let Some(effort) = effort else {
+        return Ok(());
+    };
+    if provider.summary.upstream_protocol() != crate::types::CodexProtocol::Openai {
+        return Err(AppError::new(
+            "unsupported_reasoning_effort",
+            "此协议尚未支持指定思考等级，请使用客户端或供应商默认设置",
+        ));
+    }
+    if !crate::types::valid_effort(effort)
+        || !provider.summary.codex_options.models.iter().any(|entry| {
+            entry.enabled
+                && entry.id == model
+                && entry.reasoning_efforts.iter().any(|value| value == effort)
+        })
+    {
+        return Err(AppError::new(
+            "unsupported_reasoning_effort",
+            "所选思考等级未在此模型的供应商能力中确认，请重新查询模型后选择",
+        ));
+    }
+    Ok(())
+}
+
+fn selected_reasoning_effort(provider: &StoredProvider, model: &str) -> Result<Option<String>> {
+    // A provider's preference belongs to its preferred model, not to every
+    // enabled model selected by a different client.
+    let effort = (provider.summary.model == model)
+        .then(|| provider.summary.reasoning_effort.clone())
+        .flatten();
+    validate_reasoning_effort(provider, model, effort.as_deref())?;
+    Ok(effort)
+}
+
 fn gateway_id(agent: AgentId) -> String {
     format!("selected:{}", agent.as_str())
 }
@@ -312,12 +353,16 @@ pub(crate) fn gateway_provider(store: &Store, id: &str) -> Result<StoredProvider
         ));
     }
     // The shared provider's preferred model must not replace another Agent's selection.
+    validate_reasoning_effort(&provider, &saved.model, saved.reasoning_effort.as_deref())?;
     provider.summary.model = saved.model;
+    provider.summary.reasoning_effort = saved.reasoning_effort;
     Ok(provider)
 }
 
 pub fn configure(store: &Store, input: AgentInput) -> Result<Value> {
     let model = selected_model(store, &input)?;
+    let reasoning_effort =
+        selected_reasoning_effort(&store.agent_provider(&input.provider_id)?, &model)?;
     let profile = input
         .profile
         .as_ref()
@@ -352,6 +397,7 @@ pub fn configure(store: &Store, input: AgentInput) -> Result<Value> {
         Selection {
             provider_id: input.provider_id.clone(),
             model: model.clone(),
+            reasoning_effort: reasoning_effort.clone(),
             profile: profile.clone(),
             configuration_revision,
             applied_at_ms,
@@ -383,6 +429,7 @@ pub fn configure(store: &Store, input: AgentInput) -> Result<Value> {
     let mut result = serde_json::to_value(configured)
         .map_err(|_| AppError::new("serialization", "无法读取 Agent 配置"))?;
     result["providerId"] = json!(input.provider_id);
+    result["reasoningEffort"] = json!(reasoning_effort);
     result["profile"] = json!(profile);
     result["mode"] = json!(if result["profile"].is_null() {
         "private"
@@ -415,6 +462,7 @@ pub fn probe_context(store: &Store, input: &AgentInput) -> Result<ProbeContext> 
     let route = store.agent_route()?;
     let provider = store.agent_provider(&input.provider_id)?;
     let model = selected_model(store, input)?;
+    let reasoning_effort = selected_reasoning_effort(&provider, &model)?;
     let profile = input
         .profile
         .as_ref()
@@ -424,6 +472,7 @@ pub fn probe_context(store: &Store, input: &AgentInput) -> Result<ProbeContext> 
     if !saved.get(input.agent_id.as_str()).is_some_and(|selection| {
         selection.provider_id == input.provider_id
             && selection.model == model
+            && selection.reasoning_effort == reasoning_effort
             && selection.profile == profile
     }) {
         return Err(AppError::new(

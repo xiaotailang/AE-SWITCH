@@ -54,6 +54,7 @@ export interface AgentInfo {
   directory: string;
   launcher: string | null;
   model: string | null;
+  reasoningEffort?: string | null;
   providerId: string | null;
   mode?: "existing" | "private";
   profile?: ExistingProfile | null;
@@ -82,12 +83,13 @@ export interface AgentProbe {
   latencyMs: number;
   message: string;
   validationScope: "connection" | "tool";
+  diagnostic?: string;
   toolVerified: boolean;
   stage: string;
   evidence?: Record<string, unknown>;
   cleanup?: Record<string, unknown>;
   profileMode?: "existing" | "private";
-  clientSurface?: "headless-cli" | "desktop-gui";
+  clientSurface?: "headless-cli" | "desktop-gui" | "desktop-bundled-cli";
   verificationScope?: string;
   explicitModelArgument?: boolean;
   nativeDefaultModelVerified?: boolean;

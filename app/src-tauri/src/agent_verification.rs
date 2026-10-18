@@ -275,12 +275,24 @@ pub async fn verify_selected(
     });
     result["desktopGuiVerified"] = json!(false);
     result["desktopDefaultSelectionVerified"] = json!(false);
-    result["clientSurface"] = json!("headless-cli");
+    result["clientSurface"] = json!(verification_client_surface(
+        agent,
+        &launcher,
+        profile.is_some()
+    ));
     result["verificationScope"] = json!("headless_tool_write_read");
     result["explicitModelArgument"] = json!(profile.is_some() && agent == AgentId::WorkBuddy);
     result["nativeDefaultModelVerified"] =
         json!(profile.is_some() && agent != AgentId::WorkBuddy && result["ok"] == true);
     Ok(result)
+}
+
+fn verification_client_surface(agent: AgentId, entry: &Path, existing: bool) -> &'static str {
+    if existing && agent == AgentId::Zcode && crate::zcode_desktop::is_desktop_entry(entry) {
+        "desktop-bundled-cli"
+    } else {
+        "headless-cli"
+    }
 }
 
 fn workbuddy_desktop_entry(entry: &Path) -> bool {
@@ -485,8 +497,26 @@ fn diagnostic(capture: &Capture, secrets: &[String]) -> String {
                 }
             }
         }
+        // ZCode's official event envelope keeps the terminal failure under
+        // payload.error. Do not serialize that object: data/stack/detail can
+        // contain request headers, prompts or unrelated native configuration.
+        if event["type"] == "turn.failed" {
+            let error = &event["payload"]["error"];
+            if let Some(code) = error["code"].as_str() {
+                messages.push(metadata_label(code, secrets));
+            }
+            if let Some(message) = error["message"].as_str() {
+                messages.push(message.to_owned());
+            }
+        }
     }
-    let sanitized = redact(&messages.join("\n"), secrets);
+    if let Some(code) = capture.exit_code.filter(|code| *code != 0) {
+        messages.push(format!("命令行进程退出码：{code}"));
+    }
+    // Even an otherwise useful error message can embed a URL with userinfo,
+    // a query credential or a private endpoint. It is not needed to explain
+    // the failure; known credentials are still redacted before truncation.
+    let sanitized = redact(&omit_diagnostic_urls(&messages.join("\n")), secrets);
     let filtered = sanitized
         .lines()
         .filter(|line| {
@@ -504,6 +534,33 @@ fn diagnostic(capture: &Capture, secrets: &[String]) -> String {
         .into_iter()
         .rev()
         .collect()
+}
+
+fn omit_diagnostic_urls(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut remaining = value;
+    loop {
+        let lowercase = remaining.to_ascii_lowercase();
+        let start = ["http://", "https://"]
+            .iter()
+            .filter_map(|prefix| lowercase.find(prefix))
+            .min();
+        let Some(start) = start else {
+            output.push_str(remaining);
+            break;
+        };
+        output.push_str(&remaining[..start]);
+        output.push_str("<url omitted>");
+        let url = &remaining[start..];
+        let end = url
+            .char_indices()
+            .find(|(_, character)| {
+                character.is_whitespace() || matches!(character, '\'' | '"' | '<' | '>')
+            })
+            .map_or(url.len(), |(index, _)| index);
+        remaining = &url[end..];
+    }
+    output
 }
 
 fn arguments_for(agent: AgentId, prompt: &str, workspace: &Path) -> Vec<String> {
@@ -2887,11 +2944,11 @@ exit 0
             .kill_on_drop(true);
         hidden(&mut command);
         let mut child = command.spawn().unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(child
-            .try_wait()
+        assert!(tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .expect("fixture launcher should exit before delayed output is tested")
             .unwrap()
-            .is_some_and(|status| status.success()));
+            .success());
         let (mut writer, reader) = tokio::io::duplex(128);
         let delayed = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(3)).await;
@@ -3076,6 +3133,100 @@ exit 0
         assert!(!text.contains("private") && !text.contains("PRIVATE_USER_PROMPT"));
         assert!(!text.contains("Only operate") && !text.contains("AE_TOOL_VERIFIED_"));
         assert!(text.contains("401 <redacted>"));
+    }
+
+    #[test]
+    fn zcode_terminal_failure_diagnostics_keep_only_safe_error_fields() {
+        let events = vec![
+            json!({"type":"turn.failed","payload":{"error":{
+                "code":"provider_rejected", "message":"401 credential-secret at HTTPS://private-user:private-password@example.invalid/path?token=url-secret",
+                "stack":"PRIVATE_STACK", "detail":"PRIVATE_DETAIL",
+                "data":{"headers":{"authorization":"PRIVATE_HEADER"}},
+                "underlyingErrorMessage":"PRIVATE_UNDERLYING"
+            }}}),
+            json!({"type":"message.upserted","payload":{"content":"PRIVATE_ASSISTANT","error":{"message":"PRIVATE_ASSISTANT"}}}),
+            json!({"type":"turn.failed","role":"user","payload":{"error":{"message":"PRIVATE_USER"}}}),
+        ];
+        let capture = Capture {
+            stdout: events
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                .into_bytes(),
+            exit_code: Some(1),
+            ..Capture::default()
+        };
+        let text = diagnostic(&capture, &["credential-secret".to_owned()]);
+        assert!(text.contains("provider_rejected"));
+        assert!(text.contains("401 <redacted> at <url omitted>"));
+        assert!(text.contains("命令行进程退出码：1"));
+        for omitted in [
+            "credential-secret",
+            "private-user",
+            "private-password",
+            "example.invalid",
+            "url-secret",
+            "PRIVATE_STACK",
+            "PRIVATE_DETAIL",
+            "PRIVATE_HEADER",
+            "PRIVATE_UNDERLYING",
+            "PRIVATE_ASSISTANT",
+            "PRIVATE_USER",
+        ] {
+            assert!(
+                !text.contains(omitted),
+                "unexpected diagnostic value: {omitted}"
+            );
+        }
+        assert_eq!(outcome(&capture, &Evidence::default(), true).0, "process");
+        assert!(!Evidence::default().verified(capture.process_succeeded));
+    }
+
+    #[test]
+    fn diagnostic_urls_are_omitted_before_known_credential_redaction_and_truncation() {
+        let capture = Capture {
+            stderr: b"Error: https://user:known-secret@private.invalid/?key=unknown-token failed; HTTP://user2:password2@other.invalid/path\n401 known-secret".to_vec(),
+            ..Capture::default()
+        };
+        let text = diagnostic(&capture, &["known-secret".to_owned()]);
+        assert!(text.contains("Error: <url omitted> failed; <url omitted>"));
+        assert!(text.contains("401 <redacted>"));
+        for omitted in [
+            "user",
+            "secret",
+            "private.invalid",
+            "unknown-token",
+            "other.invalid",
+            "password2",
+        ] {
+            assert!(!text.contains(omitted));
+        }
+    }
+
+    #[test]
+    fn zcode_desktop_verification_surface_does_not_claim_gui_acceptance() {
+        let root = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let entry = root.path().join("ZCode.exe");
+        fs::create_dir(root.path().join("resources")).unwrap();
+        fs::write(root.path().join("resources/app.asar"), b"fixture").unwrap();
+        assert_eq!(
+            verification_client_surface(AgentId::Zcode, &entry, true),
+            "desktop-bundled-cli"
+        );
+        assert_eq!(
+            verification_client_surface(AgentId::Zcode, &entry, false),
+            "headless-cli"
+        );
+        assert_eq!(
+            verification_client_surface(AgentId::Codex, &entry, true),
+            "headless-cli"
+        );
+        fs::remove_file(root.path().join("resources/app.asar")).unwrap();
+        assert_eq!(
+            verification_client_surface(AgentId::Zcode, &entry, true),
+            "headless-cli"
+        );
     }
 
     #[test]

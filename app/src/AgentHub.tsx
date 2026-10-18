@@ -53,6 +53,16 @@ import deepSeekHarnessLogo from "./assets/agents/deepseek-harness.svg";
 import "./agent-hub.css";
 
 const DEFAULT_ENDPOINT = "https://aiease-yun.com";
+const reasoningLabels: Record<string, string> = {
+  none: "不思考（none）",
+  minimal: "最低（minimal）",
+  low: "低（low）",
+  medium: "中（medium）",
+  high: "高（high）",
+  xhigh: "更高（xhigh）",
+  max: "最高（max）",
+  ultra: "极高（ultra）",
+};
 
 const agentLogos: Record<AgentId, { dark: string; light: string }> = {
   claude_code: { dark: claudeCodeLogo, light: claudeCodeLogo },
@@ -71,6 +81,8 @@ const verificationStages: Record<string, string> = {
   not_installed: "检查工具安装",
   not_configured: "核对当前工具配置",
   launch: "启动工具",
+  configuration: "核对验证配置",
+  process: "运行自动验证命令",
   timeout: "工具响应超时",
   tool_execution: "执行真实工具",
   write: "工具写入文件",
@@ -101,6 +113,12 @@ function verificationOutcome(result: AgentProbe): {
       status: "当前选择尚未配置",
       failure: "工具配置不匹配",
     };
+  if (result.clientSurface === "desktop-bundled-cli")
+    return {
+      tone: "error",
+      status: "自动文件验证未通过",
+      failure: "自动文件验证未通过",
+    };
   return {
     tone: "error",
     status: "真实工具验证未通过",
@@ -115,6 +133,10 @@ export default function AgentHub() {
   const [baseUrl, setBaseUrl] = useState(DEFAULT_ENDPOINT);
   const [apiKey, setApiKey] = useState("");
   const [name, setName] = useState("");
+  const [reasoningChoice, setReasoningChoice] = useState<{
+    context: string;
+    value: string | null;
+  } | null>(null);
   const [showKey, setShowKey] = useState(false);
   const [busy, setBusy] = useState<
     | "save"
@@ -337,6 +359,36 @@ export default function AgentHub() {
           (model) => model.enabled && discovery.allowed(model.id),
         )
       : [];
+  const reasoningLevels =
+    discovery.protocol === "openai"
+      ? [
+          ...new Set(
+            models.find((model) => model.id === discovery.model)
+              ?.reasoningEfforts ?? [],
+          ),
+        ].filter((effort) => Object.hasOwn(reasoningLabels, effort))
+      : [];
+  const reasoningContext = JSON.stringify([
+    selectedAgent,
+    providerId,
+    baseUrl,
+    apiKey,
+    discovery.model,
+    discovery.protocol,
+    reasoningLevels,
+  ]);
+  const savedReasoning =
+    provider?.model === discovery.model &&
+    provider.baseUrl.replace(/\/+$/, "") === baseUrl.replace(/\/+$/, "") &&
+    !apiKey.trim() &&
+    provider.reasoningEffort &&
+    reasoningLevels.includes(provider.reasoningEffort)
+      ? provider.reasoningEffort
+      : null;
+  const reasoningEffort =
+    reasoningChoice?.context === reasoningContext
+      ? reasoningChoice.value
+      : savedReasoning;
   const enabled =
     desktopRuntime &&
     discovery.ready &&
@@ -529,6 +581,7 @@ export default function AgentHub() {
   }
 
   function chooseProvider(next?: Provider) {
+    setReasoningChoice(null);
     setProviderId(next?.id ?? "");
     setBaseUrl(next?.baseUrl ?? DEFAULT_ENDPOINT);
     setApiKey("");
@@ -551,6 +604,15 @@ export default function AgentHub() {
       )
     )
       throw new Error(discovery.failure || "请先同步并选择一个可用模型。");
+    if (
+      reasoningEffort !== null &&
+      (ready.model !== discovery.model ||
+        ready.protocol !== "openai" ||
+        !ready.models
+          .find((model) => model.id === ready.model)
+          ?.reasoningEfforts.includes(reasoningEffort))
+    )
+      throw new Error("模型的思考等级信息已变化，请重新同步并选择。");
     let host = "API 供应商";
     try {
       host = new URL(baseUrl).hostname;
@@ -565,7 +627,7 @@ export default function AgentHub() {
       apiKey: apiKey.trim() || null,
       model: ready.model,
       authMode: ready.authMode,
-      reasoningEffort: provider?.reasoningEffort ?? null,
+      reasoningEffort,
       codexOptions: {
         fastMode: null,
         contextWindow: null,
@@ -1036,6 +1098,7 @@ export default function AgentHub() {
                       disabled={!!busy}
                       spellCheck={false}
                       onChange={(event) => {
+                        setReasoningChoice(null);
                         setBaseUrl(event.target.value);
                         setNotice(null);
                         setProbe(null);
@@ -1062,6 +1125,7 @@ export default function AgentHub() {
                       disabled={!!busy}
                       spellCheck={false}
                       onChange={(event) => {
+                        setReasoningChoice(null);
                         setApiKey(event.target.value);
                         setNotice(null);
                         setProbe(null);
@@ -1115,6 +1179,7 @@ export default function AgentHub() {
                     value={models.length ? discovery.model : ""}
                     disabled={!models.length || !!busy || discovery.busy}
                     onChange={(event) => {
+                      setReasoningChoice(null);
                       discovery.selectDefault(event.target.value);
                       setNotice(null);
                       setProbe(null);
@@ -1171,6 +1236,44 @@ export default function AgentHub() {
                   )}
                 </div>
               </div>
+
+              <fieldset className="hub-reasoning-settings">
+                <legend>思考程度</legend>
+                <div className="hub-reasoning-options">
+                  {[null, ...reasoningLevels].map((effort) => (
+                    <label
+                      key={effort ?? "default"}
+                      className={`hub-reasoning-option ${reasoningEffort === effort ? "selected" : ""}`}
+                    >
+                      <input
+                        type="radio"
+                        name="hub-reasoning"
+                        value={effort ?? ""}
+                        checked={reasoningEffort === effort}
+                        disabled={!!busy || discovery.busy || !models.length}
+                        onChange={() => {
+                          setReasoningChoice({
+                            context: reasoningContext,
+                            value: effort,
+                          });
+                          setProbe(null);
+                          setNotice(null);
+                        }}
+                      />
+                      <span>
+                        {effort === null ? "默认" : reasoningLabels[effort]}
+                      </span>
+                    </label>
+                  ))}
+                </div>
+                <p className="hub-profile-note">
+                  {reasoningLevels.length
+                    ? "仅显示供应商返回的模型等级。选择默认时保留客户端或供应商的设置；指定等级在确认连接后通过 AE 网关应用。"
+                    : discovery.protocol === "anthropic"
+                      ? "此连接暂不支持在 AE Switch 中设置思考等级，使用客户端或供应商的默认设置。"
+                      : "供应商未返回此模型的可选思考等级，使用客户端或供应商的默认设置。"}
+                </p>
+              </fieldset>
 
               <details className="hub-extra-settings">
                 <summary>已保存连接</summary>
@@ -1489,7 +1592,7 @@ export default function AgentHub() {
                     )}
                   </details>
                   <p className="hub-profile-note">
-                    仅配置端点、认证与模型路由，保留原历史及其他设置。
+                    配置端点、认证、模型路由及明确选择的思考程度，保留原历史及其他设置。
                   </p>
                 </div>
               </details>
@@ -1574,6 +1677,20 @@ export default function AgentHub() {
                     </p>
                   )}
                   <p className="hub-verification-message">{probe.message}</p>
+                  {!probe.toolVerified && probe.diagnostic && (
+                    <details className="hub-verification-diagnostic">
+                      <summary>查看验证原因</summary>
+                      <pre>{probe.diagnostic}</pre>
+                    </details>
+                  )}
+                  {probe.clientSurface === "desktop-bundled-cli" && (
+                    <p className="hub-verification-scope hub-profile-note">
+                      自动验证使用 ZCode 内置命令行，与桌面会话分开运行。
+                      {probe.toolVerified
+                        ? "本次文件写读已通过，桌面会话尚未自动验证。"
+                        : "此结果仅表示自动文件验证未通过，不代表桌面客户端不可用。"}
+                    </p>
+                  )}
                   {probe.toolVerified &&
                     probe.clientSurface === "headless-cli" && (
                       <p className="hub-verification-scope hub-profile-note">
@@ -1645,6 +1762,15 @@ export default function AgentHub() {
                     <dt>当前模型</dt>
                     <dd>{agent.model || "尚未配置"}</dd>
                   </div>
+                  {agent.reasoningEffort && (
+                    <div>
+                      <dt>思考程度</dt>
+                      <dd>
+                        {reasoningLabels[agent.reasoningEffort] ??
+                          agent.reasoningEffort}
+                      </dd>
+                    </div>
+                  )}
                   <div>
                     <dt>配置范围</dt>
                     <dd>
