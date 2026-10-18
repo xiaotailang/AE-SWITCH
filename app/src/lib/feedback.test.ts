@@ -68,7 +68,7 @@ describe("结果与异常提示", () => {
   });
   it("配置路径中的实际 UUID 不会把外部修改误判为 HTTP 403", () => {
     const message =
-      "配置已被外部修改：G:\\开源项目开发\\ae-switch\\ae-switch\\.cache\\native-e2e-sandbox\\77f34630b35e46888c995403814096a4\\config.toml";
+      "配置已被外部修改：D:\\example-project\\.cache\\native-e2e-sandbox\\77f34630b35e46888c995403814096a4\\config.toml";
     expect(explainError({ code: "external_change", message })).toEqual(
       externalChangeFeedback,
     );

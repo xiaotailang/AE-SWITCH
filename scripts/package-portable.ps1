@@ -61,11 +61,45 @@ function Get-PackageSha256([string]$Location) {
     finally { $stream.Dispose(); $hasher.Dispose() }
 }
 
+function Assert-NoBuildWorkspacePath([string]$Location, [string]$Description) {
+    if (-not ('AEReleaseWorkspacePathScan' -as [type])) {
+        Add-Type -TypeDefinition @'
+public static class AEReleaseWorkspacePathScan {
+    public static bool Contains(byte[] data, byte[] needle) {
+        for (int start = 0; start <= data.Length - needle.Length; start++) {
+            if (data[start] != needle[0]) continue;
+            int offset = 1;
+            while (offset < needle.Length && data[start + offset] == needle[offset]) offset++;
+            if (offset == needle.Length) return true;
+        }
+        return false;
+    }
+}
+'@
+    }
+    $workspace = $packageWorkspace
+    if ($workspace.StartsWith('\\?\', [StringComparison]::Ordinal)) { $workspace = $workspace.Substring(4) }
+    $prefixes = @($workspace, $workspace.Replace('\', '/'), $workspace.Replace('\', '\\'))
+    if ($workspace -match '^[A-Za-z]:[\\/]') {
+        $prefixes += @(('\\?\' + $workspace.Replace('/', '\')), ('//?/' + $workspace.Replace('\', '/')))
+    }
+    $bytes = [IO.File]::ReadAllBytes($Location)
+    foreach ($prefix in $prefixes | Select-Object -Unique) {
+        foreach ($encoding in @([Text.Encoding]::UTF8, [Text.Encoding]::Unicode, [Text.Encoding]::BigEndianUnicode)) {
+            if ([AEReleaseWorkspacePathScan]::Contains($bytes, $encoding.GetBytes($prefix))) {
+                throw "$Description contains this machine's build workspace path. Rebuild after loading scripts/release-env.ps1 before packaging."
+            }
+        }
+    }
+}
+
 # Validate the actual inputs before creating a distributable directory. There
 # are no placeholder executables, environment-file copies, or deletion steps.
 $packageDesktop = Require-WindowsExecutable $ExecutablePath 'Rust desktop executable'
 if ($CliExecutablePath) { $packageCli = Require-WindowsExecutable $CliExecutablePath 'Rust CLI executable' }
 else { $packageCli = $null }
+Assert-NoBuildWorkspacePath $packageDesktop 'Rust desktop executable'
+if ($packageCli) { Assert-NoBuildWorkspacePath $packageCli 'Rust CLI executable' }
 $packageUi = Require-Directory (Join-Path $packageWorkspace 'app/dist') 'production React UI'
 $null = Require-File (Join-Path $packageUi 'index.html') 'production React UI entry'
 $packageLicense = Require-File (Join-Path $packageWorkspace 'app/LICENSE') 'AE Switch/upstream license'

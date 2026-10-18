@@ -54,13 +54,15 @@ AE-Switch-portable-win-x64/
 GitHub clone 和源码 ZIP 提供完整源码，不能直接当成已编译程序双击运行。源码构建需要 Node.js、pnpm 10.12.3、Rust 1.89 或更新版本，以及 Windows 对应的链接环境。先在源码根目录安装依赖并构建前端：
 
 ```powershell
+. ./scripts/release-env.ps1
 pnpm -C app install --frozen-lockfile
 pnpm -C app run build
 cargo build --manifest-path app/src-tauri/Cargo.toml --release --no-default-features --features desktop,tauri/custom-protocol --bin ae-switch -j 1
+cargo build --manifest-path app/src-tauri/Cargo.toml --release --no-default-features --bin ae-switch-cli -j 1
 ```
 
-本项目未提供源码一键安装或构建脚本。`scripts/workspace-env.ps1` 用于本工作区隔离构建，会将 Rust 工具链、依赖和缓存重定向到 `.tools/`、`.cache/`；这些本机工具未随源码分发，因此它不是干净 clone 的工具链安装入口。使用自己已安装的开发环境时，无需先加载该脚本。
+本项目未提供源码一键安装或构建脚本。发布构建先加载 `scripts/release-env.ps1`：它复用 `scripts/workspace-env.ps1` 的 `.tools/`、`.cache/` 隔离目录和原有链接参数，并把编译产物中的本机源码路径映射为相对路径。每次重新加载 `workspace-env.ps1` 后，应在发布构建前再次加载 `release-env.ps1`。这些脚本不安装工具链；需先准备相应目录下可用的开发工具和依赖。
 
-便携打包入口为 [package-portable.ps1](scripts/package-portable.ps1)，需先构建 desktop/core，并自行把固定 WebView2 x64 运行时放到 `.tools/webview2/`；`WebView2Loader.dll` 必须位于桌面 EXE 旁。完整步骤见 [app/README](app/README.md)。源码发布只取已审计的源码 ZIP 内容，不上传含本机缓存、安装树或私密输入的整个工作目录。
+便携打包入口为 [package-portable.ps1](scripts/package-portable.ps1)，需先构建 desktop/core，并自行把固定 WebView2 x64 运行时放到 `.tools/webview2/`；`WebView2Loader.dll` 必须位于桌面 EXE 旁。打包会拒绝仍包含当前构建目录路径的 desktop/core 输入。完整步骤见 [app/README](app/README.md)。源码发布只取已审计的源码 ZIP 内容，不上传含本机缓存、安装树或私密输入的整个工作目录。
 
-版本 **0.1.0**，许可 [AGPL-3.0-only](app/LICENSE)。原署名、依赖许可及标识来源保留在 [NOTICE](app/NOTICE) 与[第三方说明](app/THIRD_PARTY_NOTICES.md)。当前候选为 `1d89fd33…`；GitHub 目标按用户安排延期，未执行公开发布。见[发布准备说明](app/docs/github-release.md)和[包内验收导航](app/docs/portable-verification.md)。
+版本 **0.1.0**，许可 [AGPL-3.0-only](app/LICENSE)。原署名、依赖许可及标识来源保留在 [NOTICE](app/NOTICE) 与[第三方说明](app/THIRD_PARTY_NOTICES.md)。本次为移除开发路径的隐私重编，历史构建 `1d89fd33…` 的客户端验收不自动算作新二进制的验收结果；GitHub 继续按预发布提供。见[发布准备说明](app/docs/github-release.md)和[包内验收导航](app/docs/portable-verification.md)。
