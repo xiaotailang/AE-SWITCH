@@ -31,6 +31,7 @@ import {
   type AgentId,
   type AgentProbe,
   type ExistingProfile,
+  type InstalledAgentDiscovery,
   type WorkBuddyDefaultSelection,
 } from "./lib/agentApi";
 import { useConnectionDiscovery } from "./lib/useConnectionDiscovery";
@@ -144,6 +145,27 @@ export default function AgentHub() {
   const [manualModes, setManualModes] = useState<
     Partial<Record<AgentId, boolean>>
   >({});
+  const [directoryModes, setDirectoryModes] = useState<
+    Partial<Record<AgentId, boolean>>
+  >({});
+  const [installationDirectories, setInstallationDirectories] = useState<
+    Partial<Record<AgentId, string>>
+  >({});
+  const [directoryDiscoveries, setDirectoryDiscoveries] = useState<
+    Partial<
+      Record<AgentId, { directory: string; data: InstalledAgentDiscovery }>
+    >
+  >({});
+  const [directoryErrors, setDirectoryErrors] = useState<
+    Partial<Record<AgentId, string>>
+  >({});
+  const [directoryOperation, setDirectoryOperation] = useState<{
+    agent: AgentId;
+    kind: "identify" | "pick";
+    token: number;
+  } | null>(null);
+  const directoryRequest = useRef(0);
+  const directoryContext = useRef("");
   const [processChoices, setProcessChoices] = useState<
     Partial<Record<AgentId, string>>
   >({});
@@ -235,9 +257,31 @@ export default function AgentHub() {
     runtime.data?.platformSupported &&
     !runtime.data?.restartInProgress &&
     selectedProcess?.canRestart;
+  const directoryMode = directoryModes[selectedAgent] === true;
+  const installationDirectory = installationDirectories[selectedAgent] ?? "";
+  directoryContext.current = JSON.stringify([
+    selectedAgent,
+    directoryMode,
+    installationDirectory,
+  ]);
+  const directoryResult = directoryDiscoveries[selectedAgent];
+  const detected = directoryMode
+    ? directoryResult?.directory === installationDirectory.trim()
+      ? directoryResult.data
+      : undefined
+    : installed.data;
+  const directoryBusy = directoryOperation?.agent === selectedAgent;
+  const detectionFetching = directoryMode
+    ? directoryBusy
+    : installed.isFetching;
+  const detectionPending = directoryMode ? !detected : installed.isPending;
+  const detectionError = directoryMode
+    ? directoryErrors[selectedAgent]
+    : installed.isError
+      ? errorMessage(installed.error)
+      : undefined;
   const installedClients =
-    installed.data?.clients.filter((item) => item.agentId === selectedAgent) ??
-    [];
+    detected?.clients.filter((item) => item.agentId === selectedAgent) ?? [];
   const detectedProfiles = [
     ...new Map(
       installedClients
@@ -251,7 +295,7 @@ export default function AgentHub() {
     : (detectedProfiles.find(
         (profile) => JSON.stringify(profile) === profileChoices[selectedAgent],
       ) ??
-      (agent.mode === "existing" && agent.profile
+      (!directoryMode && agent.mode === "existing" && agent.profile
         ? detectedProfiles.find((profile) =>
             Object.keys({ ...profile, ...agent.profile }).every(
               (key) =>
@@ -260,7 +304,7 @@ export default function AgentHub() {
             ),
           )
         : undefined) ??
-      (!installed.data?.limited &&
+      (!detected?.limited &&
       detectedProfiles.length === 1 &&
       !profileChoices[selectedAgent]
         ? detectedProfiles[0]
@@ -308,7 +352,7 @@ export default function AgentHub() {
     canSave &&
     profileReady &&
     (manualMode ||
-      (!installed.isError && !installed.isPending && !installed.isFetching));
+      (!detectionError && !detectionPending && !detectionFetching));
   const selectedProfileKey = JSON.stringify(selectedProfile);
   const workBuddyDesktop =
     selectedAgent === "workbuddy" &&
@@ -349,6 +393,11 @@ export default function AgentHub() {
     [workBuddyContextKey],
   );
   useEffect(() => {
+    directoryRequest.current += 1;
+    setDirectoryOperation(null);
+    setManualModes({});
+  }, [selectedAgent]);
+  useEffect(() => {
     setProbe(null);
     setNotice(null);
     setWorkBuddyDefault(null);
@@ -367,6 +416,117 @@ export default function AgentHub() {
     )
       setWorkBuddyDefault(null);
   }, [discovery.model, workBuddyDefault]);
+
+  function invalidateDirectorySelection() {
+    directoryRequest.current += 1;
+    setDirectoryOperation(null);
+    setDirectoryDiscoveries((current) => ({
+      ...current,
+      [selectedAgent]: undefined,
+    }));
+    setDirectoryErrors((current) => ({
+      ...current,
+      [selectedAgent]: undefined,
+    }));
+    setProfileChoices((current) => ({ ...current, [selectedAgent]: "" }));
+    setManualModes((current) => ({ ...current, [selectedAgent]: false }));
+    setManualProfiles((current) => ({
+      ...current,
+      [selectedAgent]: undefined,
+    }));
+    setProbe(null);
+    setNotice(null);
+    setWorkBuddyDefault(null);
+  }
+
+  function updateInstallationDirectory(value: string) {
+    invalidateDirectorySelection();
+    directoryContext.current = JSON.stringify([
+      selectedAgent,
+      directoryMode,
+      value,
+    ]);
+    setInstallationDirectories((current) => ({
+      ...current,
+      [selectedAgent]: value,
+    }));
+  }
+
+  async function identifyInstallation(directoryOverride?: string) {
+    if (busy || !desktopRuntime) return;
+    invalidateDirectorySelection();
+    const input = directoryOverride ?? installationDirectory;
+    const directory = input.trim();
+    const agentId = selectedAgent;
+    if (!directory) {
+      setDirectoryErrors((current) => ({
+        ...current,
+        [agentId]: "请先输入或选择安装目录。",
+      }));
+      return;
+    }
+    const token = ++directoryRequest.current;
+    const context = JSON.stringify([agentId, directoryMode, input]);
+    directoryContext.current = context;
+    setDirectoryOperation({ agent: agentId, kind: "identify", token });
+    try {
+      const data = await agentApi.discoverDirectory(agentId, directory);
+      if (
+        directoryRequest.current !== token ||
+        directoryContext.current !== context
+      )
+        return;
+      setDirectoryDiscoveries((current) => ({
+        ...current,
+        [agentId]: { directory, data },
+      }));
+    } catch (error) {
+      if (
+        directoryRequest.current !== token ||
+        directoryContext.current !== context
+      )
+        return;
+      setDirectoryErrors((current) => ({
+        ...current,
+        [agentId]: errorMessage(error),
+      }));
+    } finally {
+      if (directoryRequest.current === token) setDirectoryOperation(null);
+    }
+  }
+
+  async function pickInstallationDirectory() {
+    if (busy || !desktopRuntime) return;
+    const agentId = selectedAgent;
+    const token = ++directoryRequest.current;
+    const context = directoryContext.current;
+    setDirectoryOperation({ agent: agentId, kind: "pick", token });
+    try {
+      const directory = await agentApi.pickDirectory();
+      if (
+        directoryRequest.current !== token ||
+        directoryContext.current !== context
+      )
+        return;
+      if (directory !== null) {
+        updateInstallationDirectory(directory);
+        void identifyInstallation(directory);
+      }
+    } catch (error) {
+      if (
+        directoryRequest.current !== token ||
+        directoryContext.current !== context
+      )
+        return;
+      invalidateDirectorySelection();
+      setDirectoryErrors((current) => ({
+        ...current,
+        [agentId]: errorMessage(error),
+      }));
+    } finally {
+      if (directoryRequest.current === token) setDirectoryOperation(null);
+    }
+  }
 
   function chooseProvider(next?: Provider) {
     setProviderId(next?.id ?? "");
@@ -1057,9 +1217,10 @@ export default function AgentHub() {
                   desktopRuntime &&
                   (!profileReady ||
                     manualMode ||
+                    directoryMode ||
                     detectedProfiles.length > 1 ||
-                    installed.data?.limited ||
-                    installed.isError)
+                    detected?.limited ||
+                    !!detectionError)
                 }
               >
                 <summary>
@@ -1074,22 +1235,63 @@ export default function AgentHub() {
                       type="button"
                       className="hub-icon-button"
                       aria-label="重新探测工具"
-                      disabled={
-                        !!busy || installed.isFetching || !desktopRuntime
-                      }
+                      disabled={!!busy || detectionFetching || !desktopRuntime}
                       onClick={() => {
                         setProbe(null);
                         setNotice(null);
-                        void installed.refetch();
+                        if (directoryMode) void identifyInstallation();
+                        else void installed.refetch();
                       }}
                     >
                       <RefreshCw
                         size={15}
-                        className={installed.isFetching ? "hub-spinning" : ""}
+                        className={detectionFetching ? "hub-spinning" : ""}
                         aria-hidden
                       />
                     </button>
                   </div>
+                  {directoryMode && (
+                    <div className="hub-install-directory">
+                      <label htmlFor="hub-installation-directory">
+                        安装目录
+                      </label>
+                      <div className="hub-install-directory-controls">
+                        <input
+                          id="hub-installation-directory"
+                          value={installationDirectory}
+                          placeholder="选择客户端所在的安装文件夹"
+                          disabled={!!busy}
+                          onChange={(event) =>
+                            updateInstallationDirectory(event.target.value)
+                          }
+                        />
+                        <button
+                          type="button"
+                          className="hub-button secondary"
+                          disabled={!!busy || directoryBusy}
+                          onClick={() => void pickInstallationDirectory()}
+                        >
+                          <FolderOpen size={15} aria-hidden />
+                          选择目录
+                        </button>
+                        <button
+                          type="button"
+                          className="hub-button secondary"
+                          disabled={
+                            !!busy ||
+                            directoryBusy ||
+                            !installationDirectory.trim()
+                          }
+                          onClick={() => void identifyInstallation()}
+                        >
+                          {directoryBusy &&
+                          directoryOperation?.kind === "identify"
+                            ? "识别中…"
+                            : "识别"}
+                        </button>
+                      </div>
+                    </div>
+                  )}
                   {!manualMode && (
                     <div className="hub-select-wrap">
                       <select
@@ -1098,7 +1300,7 @@ export default function AgentHub() {
                           selectedProfile ? JSON.stringify(selectedProfile) : ""
                         }
                         disabled={
-                          !!busy || !desktopRuntime || installed.isFetching
+                          !!busy || !desktopRuntime || detectionFetching
                         }
                         onChange={(event) => {
                           setProfileChoices((current) => ({
@@ -1110,11 +1312,13 @@ export default function AgentHub() {
                         }}
                       >
                         <option value="">
-                          {installed.isPending && desktopRuntime
-                            ? "正在探测已安装工具…"
+                          {detectionFetching && desktopRuntime
+                            ? "正在识别客户端…"
                             : detectedProfiles.length
                               ? "请选择要配置的原目录"
-                              : "未发现客户端，可手动指定"}
+                              : directoryMode
+                                ? "请先识别安装目录"
+                                : "未发现客户端，可指定安装目录"}
                         </option>
                         {detectedProfiles.map((profile) => (
                           <option
@@ -1129,89 +1333,92 @@ export default function AgentHub() {
                     </div>
                   )}
                   <p className="hub-profile-note" aria-live="polite">
-                    {installed.isError
-                      ? `工具探测失败：${errorMessage(installed.error)}`
+                    {detectionError
+                      ? `${directoryMode ? "安装目录识别失败" : "工具探测失败"}：${detectionError}`
                       : !desktopRuntime
                         ? "在桌面应用中探测本机工具。"
-                        : installed.isPending
+                        : detectionFetching
                           ? "只读取安装位置与配置线索。"
                           : selectedProfile
                             ? `原配置：${selectedProfile.directory}`
-                            : installed.data?.limited
-                              ? `探测未完成：${installed.data.notes.join("；") || "未能完整扫描安装位置"}。请明确选择已有目录，或手动指定。`
+                            : detected?.limited
+                              ? `探测未完成：${detected.notes.join("；") || "未能完整扫描安装位置"}。请明确选择已有目录，或使用高级路径设置。`
                               : detectedProfiles.length
                                 ? "有多个配置候选，请明确选择要使用的目录。"
-                                : `未探测到已安装的 ${agent.name}。${installedClients.find((item) => item.reason)?.reason || "安装后重新探测，或手动指定已有目录。"}`}
+                                : directoryMode
+                                  ? detected
+                                    ? `所选安装目录中未识别到 ${agent.name}。${installedClients.find((item) => item.reason)?.reason || "请核对目录后重新识别。"}`
+                                    : "输入或选择安装目录后点击识别，原配置目录将自动确定。"
+                                  : `未探测到已安装的 ${agent.name}。${installedClients.find((item) => item.reason)?.reason || "安装后重新探测，或指定安装目录。"}`}
                   </p>
                   <button
                     type="button"
                     className="hub-profile-toggle"
                     disabled={!!busy || !desktopRuntime}
                     onClick={() => {
-                      setManualModes((current) => ({
+                      invalidateDirectorySelection();
+                      setDirectoryModes((current) => ({
                         ...current,
-                        [selectedAgent]: !manualMode,
+                        [selectedAgent]: !directoryMode,
                       }));
-                      if (!manualMode && !manualProfiles[selectedAgent])
-                        setManualProfiles((current) => ({
-                          ...current,
-                          [selectedAgent]: selectedProfile ?? {
-                            directory: "",
-                            homeDirectory: "",
-                            executablePath: "",
-                            workspaceDirectory: "",
-                          },
-                        }));
-                      setProbe(null);
                     }}
                   >
-                    {manualMode ? "使用自动探测结果" : "手动指定已有客户端"}
+                    {directoryMode ? "使用自动探测结果" : "指定安装目录"}
                   </button>
-                  {manualMode && (
-                    <div className="hub-manual-profile">
-                      {(
-                        [
-                          ["directory", "原配置目录"],
-                          ["homeDirectory", "原用户目录"],
-                          ["executablePath", "客户端启动文件"],
-                          ["workspaceDirectory", "工作目录"],
-                        ] as const
-                      ).map(([field, label]) => (
-                        <label key={field}>
-                          {label}
-                          <input
-                            value={manualProfiles[selectedAgent]?.[field] ?? ""}
-                            disabled={!!busy}
-                            onChange={(event) => {
-                              setProbe(null);
-                              setNotice(null);
-                              setManualProfiles((current) => ({
-                                ...current,
-                                [selectedAgent]: {
-                                  ...current[selectedAgent]!,
-                                  [field]: event.target.value,
-                                },
-                              }));
-                            }}
-                          />
-                        </label>
-                      ))}
-                      <details className="hub-extra-settings">
-                        <summary>
-                          其它配置路径 <span>可选</span>
-                        </summary>
+                  <details
+                    key={selectedAgent}
+                    className="hub-advanced-paths"
+                    onToggle={(event) => {
+                      if (!event.currentTarget.open && manualMode) {
+                        setManualModes((current) => ({
+                          ...current,
+                          [selectedAgent]: false,
+                        }));
+                        setProbe(null);
+                        setNotice(null);
+                        setWorkBuddyDefault(null);
+                      }
+                    }}
+                  >
+                    <summary>高级路径设置</summary>
+                    <p className="hub-profile-note">
+                      仅在工具使用特殊原配置或环境时设置完整路径。
+                    </p>
+                    <button
+                      type="button"
+                      className="hub-profile-toggle"
+                      disabled={!!busy || !desktopRuntime}
+                      onClick={() => {
+                        directoryRequest.current += 1;
+                        setDirectoryOperation(null);
+                        setManualModes((current) => ({
+                          ...current,
+                          [selectedAgent]: !manualMode,
+                        }));
+                        if (!manualMode)
+                          setManualProfiles((current) => ({
+                            ...current,
+                            [selectedAgent]: selectedProfile ?? {
+                              directory: "",
+                              homeDirectory: "",
+                              executablePath: "",
+                              workspaceDirectory: "",
+                            },
+                          }));
+                        setProbe(null);
+                        setNotice(null);
+                      }}
+                    >
+                      {manualMode ? "使用识别结果" : "手动设置完整路径"}
+                    </button>
+                    {manualMode && (
+                      <div className="hub-manual-profile">
                         {(
                           [
-                            ["configFile", "主配置文件"],
-                            ["secondaryConfigFile", "附加配置文件"],
-                            ["builtinConfigFile", "内置模型配置文件"],
-                            ["stateFile", "原状态文件"],
-                            ["dataDirectory", "原数据目录"],
-                            ["profileName", "Profile 名称"],
-                            ["xdgConfigDirectory", "XDG 配置目录"],
-                            ["xdgDataDirectory", "XDG 数据目录"],
-                            ["xdgStateDirectory", "XDG 状态目录"],
-                            ["xdgCacheDirectory", "XDG 缓存目录"],
+                            ["directory", "原配置目录"],
+                            ["homeDirectory", "原用户目录"],
+                            ["executablePath", "客户端启动文件"],
+                            ["workspaceDirectory", "工作目录"],
                           ] as const
                         ).map(([field, label]) => (
                           <label key={field}>
@@ -1224,20 +1431,63 @@ export default function AgentHub() {
                               onChange={(event) => {
                                 setProbe(null);
                                 setNotice(null);
-                                setManualProfiles((current) => {
-                                  const next = { ...current[selectedAgent]! };
-                                  if (event.target.value)
-                                    next[field] = event.target.value;
-                                  else delete next[field];
-                                  return { ...current, [selectedAgent]: next };
-                                });
+                                setManualProfiles((current) => ({
+                                  ...current,
+                                  [selectedAgent]: {
+                                    ...current[selectedAgent]!,
+                                    [field]: event.target.value,
+                                  },
+                                }));
                               }}
                             />
                           </label>
                         ))}
-                      </details>
-                    </div>
-                  )}
+                        <details className="hub-extra-settings">
+                          <summary>
+                            其它配置路径 <span>可选</span>
+                          </summary>
+                          {(
+                            [
+                              ["configFile", "主配置文件"],
+                              ["secondaryConfigFile", "附加配置文件"],
+                              ["builtinConfigFile", "内置模型配置文件"],
+                              ["stateFile", "原状态文件"],
+                              ["dataDirectory", "原数据目录"],
+                              ["profileName", "Profile 名称"],
+                              ["xdgConfigDirectory", "XDG 配置目录"],
+                              ["xdgDataDirectory", "XDG 数据目录"],
+                              ["xdgStateDirectory", "XDG 状态目录"],
+                              ["xdgCacheDirectory", "XDG 缓存目录"],
+                            ] as const
+                          ).map(([field, label]) => (
+                            <label key={field}>
+                              {label}
+                              <input
+                                value={
+                                  manualProfiles[selectedAgent]?.[field] ?? ""
+                                }
+                                disabled={!!busy}
+                                onChange={(event) => {
+                                  setProbe(null);
+                                  setNotice(null);
+                                  setManualProfiles((current) => {
+                                    const next = { ...current[selectedAgent]! };
+                                    if (event.target.value)
+                                      next[field] = event.target.value;
+                                    else delete next[field];
+                                    return {
+                                      ...current,
+                                      [selectedAgent]: next,
+                                    };
+                                  });
+                                }}
+                              />
+                            </label>
+                          ))}
+                        </details>
+                      </div>
+                    )}
+                  </details>
                   <p className="hub-profile-note">
                     仅配置端点、认证与模型路由，保留原历史及其他设置。
                   </p>

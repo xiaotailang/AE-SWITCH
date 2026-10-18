@@ -748,7 +748,8 @@ export async function verifyProductionSurface({
           const original = await page
             .locator("#hub-installed-profile")
             .inputValue();
-          await button("手动指定已有客户端").click();
+          await setDetails(".hub-advanced-paths", true);
+          await button("手动设置完整路径").click();
           const directory = page.getByLabel("原配置目录", { exact: true });
           const old = await directory.inputValue();
           manualDraft = {
@@ -769,7 +770,7 @@ export async function verifyProductionSurface({
           manualDraft.optional = originalOptional;
           await optionalPath.fill("Synthetic unsaved optional profile");
           await optionalPath.fill(originalOptional);
-          await button("使用自动探测结果").click();
+          await button("使用识别结果").click();
           assert.equal(
             await page.locator("#hub-installed-profile").inputValue(),
             original,
@@ -963,8 +964,9 @@ export async function verifyProductionSurface({
           await button("关闭快速上手").click();
         if (manualDraft) {
           await selectAgent(manualDraft.agent);
-          if (await button("使用自动探测结果").count()) {
+          if (await button("使用识别结果").count()) {
             await setDetails(".hub-profile-settings", true);
+            await setDetails(".hub-advanced-paths", true);
             await page
               .getByLabel("原配置目录", { exact: true })
               .fill(manualDraft.directory);
@@ -974,7 +976,7 @@ export async function verifyProductionSurface({
                 .getByLabel("Profile 名称", { exact: true })
                 .fill(manualDraft.optional);
             }
-            await button("使用自动探测结果").click();
+            await button("使用识别结果").click();
           }
         }
         if (await page.locator("#hub-api-key").inputValue())

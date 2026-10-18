@@ -19,8 +19,12 @@ pub mod store;
 pub mod supplier;
 pub mod types;
 pub mod updates;
+#[cfg(windows)]
+mod windows_installations;
 pub mod workbuddy_default;
 pub mod writer;
+#[cfg(windows)]
+mod zcode_desktop;
 
 #[cfg(feature = "desktop")]
 mod desktop {
@@ -257,6 +261,44 @@ mod desktop {
     #[tauri::command]
     fn agent_hub_discover() -> crate::agent_discovery::InstalledAgentDiscovery {
         crate::agent_discovery::discover()
+    }
+
+    #[tauri::command]
+    async fn agent_hub_discover_directory(
+        agent_id: crate::agent_configs::AgentId,
+        directory: String,
+    ) -> Result<crate::agent_discovery::InstalledAgentDiscovery> {
+        tauri::async_runtime::spawn_blocking(move || {
+            crate::agent_discovery::discover_in_directory(
+                agent_id,
+                std::path::Path::new(&directory),
+            )
+        })
+        .await
+        .map_err(|_| AppError::new("agent_discovery", "安装目录识别未完成，请重试"))?
+    }
+
+    #[tauri::command]
+    async fn agent_hub_pick_directory(app: tauri::AppHandle) -> Result<Option<String>> {
+        use tauri_plugin_dialog::DialogExt;
+        tauri::async_runtime::spawn_blocking(move || {
+            let Some(selected) = app
+                .dialog()
+                .file()
+                .set_title("选择客户端安装目录")
+                .blocking_pick_folder()
+            else {
+                return Ok(None);
+            };
+            let path = selected
+                .into_path()
+                .map_err(|_| AppError::new("agent_directory", "请选择可访问的本地安装目录"))?;
+            crate::portable::validate_root(&path)?;
+            crate::agent_configs::validate_existing_runtime_directory(&path)?;
+            Ok(Some(path.to_string_lossy().into_owned()))
+        })
+        .await
+        .map_err(|_| AppError::new("agent_directory", "目录选择未完成，请重试"))?
     }
 
     #[tauri::command]
@@ -843,6 +885,8 @@ mod desktop {
             })
             .invoke_handler(tauri::generate_handler![
                 agent_hub_discover,
+                agent_hub_discover_directory,
+                agent_hub_pick_directory,
                 agent_hub_overview,
                 configure_agent,
                 apply_workbuddy_default_model,

@@ -197,6 +197,17 @@ export const agentApi = {
     requireDesktop();
     return invoke("agent_hub_discover");
   },
+  discoverDirectory: async (
+    agentId: AgentId,
+    directory: string,
+  ): Promise<InstalledAgentDiscovery> => {
+    requireDesktop();
+    return invoke("agent_hub_discover_directory", { agentId, directory });
+  },
+  pickDirectory: async (): Promise<string | null> => {
+    requireDesktop();
+    return invoke("agent_hub_pick_directory");
+  },
   overview: async (): Promise<AgentOverview> =>
     desktopRuntime
       ? invoke("agent_hub_overview")

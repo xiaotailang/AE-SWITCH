@@ -47,6 +47,8 @@ AE-Switch-portable-win-x64/
 
 产品不绑定盘符，可放在包括 C 盘在内的任意可写本地目录。既有客户端和 profile 可以位于其他盘；移动 AE 不会迁移客户端安装及历史。分享时使用新打包目录，不要分享已使用的 `data/`。包内不含八客户端及其 Node、Python、PowerShell 或 Git 环境。
 
+Windows 优先自动发现原用户 `PATH`、已知安装位置，以及 ZCode、WorkBuddy 的系统安装记录；找不到时可只选择或输入一个安装目录，再由 AE 识别程序入口和原生配置，无需分别填写用户目录、配置目录和工作目录。指定目录只检查本目录及固定浅层位置，不全盘搜索；它不会被当作用户目录或配置目录。存在多个安装或 profile 时仍需选择目标。ZCode 桌面版的文件工具验证使用它随包提供的官方 CLI，打开客户端仍使用桌面入口。
+
 本工作区的测试写入限定在 G 盘的隔离目录。Windows 同机测试不能证明干净异机或 macOS/Linux 原生运行，详见[平台支持](docs/platform-support.md)。
 
 ## 构建与发布资料
@@ -65,4 +67,4 @@ cargo build --manifest-path app/src-tauri/Cargo.toml --release --no-default-feat
 
 便携打包入口为 [package-portable.ps1](scripts/package-portable.ps1)，需先构建 desktop/core，并自行把固定 WebView2 x64 运行时放到 `.tools/webview2/`；`WebView2Loader.dll` 必须位于桌面 EXE 旁。打包会拒绝仍包含当前构建目录路径的 desktop/core 输入。完整步骤见 [app/README](app/README.md)。源码发布只取已审计的源码 ZIP 内容，不上传含本机缓存、安装树或私密输入的整个工作目录。
 
-版本 **0.1.0**，许可 [AGPL-3.0-only](app/LICENSE)。原署名、依赖许可及标识来源保留在 [NOTICE](app/NOTICE) 与[第三方说明](app/THIRD_PARTY_NOTICES.md)。本次为移除开发路径的隐私重编，历史构建 `1d89fd33…` 的客户端验收不自动算作新二进制的验收结果；GitHub 继续按预发布提供。见[发布准备说明](app/docs/github-release.md)和[包内验收导航](app/docs/portable-verification.md)。
+版本 **0.1.0**，许可 [AGPL-3.0-only](app/LICENSE)。原署名、依赖许可及标识来源保留在 [NOTICE](app/NOTICE) 与[第三方说明](app/THIRD_PARTY_NOTICES.md)。开发路径隐私重编及 Windows 安装自动发现分别按其构建记录核对，历史构建 `1d89fd33…` 的客户端验收不自动算作新二进制的验收结果；GitHub 继续按预发布提供。见[发布准备说明](app/docs/github-release.md)和[包内验收导航](app/docs/portable-verification.md)。

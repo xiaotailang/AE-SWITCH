@@ -378,6 +378,15 @@ fn existing_restart_waits_for_normal_exit_and_reopens_same_owned_profile_without
         .candidates
         .iter()
         .any(|candidate| candidate.can_restart));
+    // Restart completion proves that the new process was spawned. Its fixture
+    // counter is written during PowerShell startup, which may finish later.
+    let ready_deadline = Instant::now() + Duration::from_secs(10);
+    while !fs::read_to_string(fixture._owner.path().join("counter.txt"))
+        .is_ok_and(|count| count == "2")
+        && Instant::now() < ready_deadline
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
     assert_eq!(
         fs::read_to_string(fixture._owner.path().join("counter.txt")).unwrap(),
         "2"

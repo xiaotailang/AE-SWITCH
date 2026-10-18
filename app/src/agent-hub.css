@@ -461,6 +461,7 @@
 }
 
 .hub-select-wrap select,
+.hub-install-directory input,
 .hub-manual-profile input,
 .hub-extra-settings input,
 .hub-client-runtime select {
@@ -531,6 +532,7 @@
 }
 
 .hub-profile-settings,
+.hub-advanced-paths,
 .hub-extra-settings,
 .hub-client-actions {
   margin-top: 16px;
@@ -539,6 +541,7 @@
 }
 
 .hub-profile-settings summary,
+.hub-advanced-paths summary,
 .hub-extra-settings summary,
 .hub-client-actions summary {
   width: fit-content;
@@ -549,6 +552,7 @@
 }
 
 .hub-profile-settings[open] > summary,
+.hub-advanced-paths[open] > summary,
 .hub-extra-settings[open] > summary,
 .hub-client-actions[open] > summary {
   margin-bottom: 16px;
@@ -568,6 +572,29 @@
 
 .hub-manual-profile input {
   margin-bottom: 14px;
+}
+
+.hub-install-directory {
+  margin: 12px 0 16px;
+}
+
+.hub-install-directory-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.hub-install-directory-controls input {
+  flex: 1 1 240px;
+  min-width: 0;
+  width: auto;
+}
+
+.hub-install-directory-controls .hub-button {
+  flex: 0 0 auto;
+  padding: 8px 12px;
 }
 
 .hub-form-actions {

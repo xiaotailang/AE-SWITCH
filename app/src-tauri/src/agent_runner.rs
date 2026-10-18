@@ -28,6 +28,14 @@ pub fn existing_command(
     crate::agent_configs::validate_existing_profile(agent, profile)?;
     let entry = std::path::PathBuf::from(&profile.executable_path);
     #[cfg(windows)]
+    let zcode_desktop = agent == AgentId::Zcode && crate::zcode_desktop::is_desktop_entry(&entry);
+    #[cfg(windows)]
+    let zcode_cli = if zcode_desktop && !arguments.is_empty() {
+        Some(crate::zcode_desktop::bundle(&entry)?)
+    } else {
+        None
+    };
+    #[cfg(windows)]
     let mut command = {
         let extension = entry
             .extension()
@@ -168,6 +176,28 @@ pub fn existing_command(
             );
         }
         AgentId::Zcode => {
+            #[cfg(windows)]
+            if zcode_desktop {
+                // Opening the app keeps its GUI entry. Explicit CLI tasks use
+                // the same Electron/Node bridge used by ZCode's own desktop host.
+                command.env_remove("ELECTRON_RUN_AS_NODE");
+                if let Some((script, builtin)) = &zcode_cli {
+                    command.env("ELECTRON_RUN_AS_NODE", "1").arg(script);
+                    if profile.builtin_config_file.is_none() {
+                        command.env("ZCODE_BUILTIN_PROVIDER_CONFIG_FILE", builtin);
+                        command.env(
+                            "ZCODE_PERSONAL_PROVIDER_CONFIG_FILE",
+                            profile
+                                .config_file
+                                .as_deref()
+                                .map(std::path::PathBuf::from)
+                                .unwrap_or_else(|| {
+                                    Path::new(&profile.directory).join("provider_config.json")
+                                }),
+                        );
+                    }
+                }
+            }
             if let Some(state) = &profile.state_file {
                 let state = Path::new(state);
                 let storage = state.parent().and_then(Path::parent).ok_or_else(|| {
@@ -372,6 +402,97 @@ mod existing_tests {
                     .map(|value| value.to_string_lossy().into_owned())
             );
         }
+    }
+
+    #[cfg(windows)]
+    fn zcode_desktop_fixture() -> (tempfile::TempDir, ExistingProfile) {
+        let (root, mut profile) = fixture();
+        let install = root.path().join("desktop install 中文");
+        let bundle = install.join("resources/glm");
+        let provider = install.join("resources/config/provider");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::create_dir_all(&provider).unwrap();
+        std::fs::write(
+            install.join("resources/app.asar"),
+            b"desktop archive fixture",
+        )
+        .unwrap();
+        std::fs::write(
+            bundle.join(".node-bundle-meta.json"),
+            br#"{"runtime":"electron-node","entry":"zcode.cjs","platform":"win32-x64"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            bundle.join("zcode.cjs"),
+            b"official bundle fixture, never executed",
+        )
+        .unwrap();
+        std::fs::write(provider.join("zcode-builtin.json"), b"{}").unwrap();
+        let entry = install.join("ZCode.exe");
+        let mut image = b"MZdesktop fixture dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX".to_vec();
+        image.extend([1, 9]);
+        image.extend(b"101000011");
+        std::fs::write(&entry, image).unwrap();
+        profile.executable_path = entry.to_string_lossy().into();
+        profile.directory = Path::new(&profile.home_directory)
+            .join(".zcode/v2")
+            .to_string_lossy()
+            .into();
+        (root, profile)
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn zcode_desktop_opens_gui_but_runs_explicit_tasks_with_its_bundled_cli() {
+        let (_root, profile) = zcode_desktop_fixture();
+        let gui = existing_command(AgentId::Zcode, &profile, &[], None).unwrap();
+        assert_eq!(gui.get_program(), Path::new(&profile.executable_path));
+        assert!(gui.get_args().next().is_none());
+        assert_eq!(command_environment(&gui)["ELECTRON_RUN_AS_NODE"], None);
+
+        let args = vec![
+            "--help".into(),
+            "--output-format".into(),
+            "stream-json".into(),
+        ];
+        let cli = existing_command(AgentId::Zcode, &profile, &args, None).unwrap();
+        let install = Path::new(&profile.executable_path).parent().unwrap();
+        let passed: Vec<_> = cli.get_args().collect();
+        assert_eq!(passed[0], install.join("resources/glm/zcode.cjs"));
+        assert_eq!(&passed[1..], ["--help", "--output-format", "stream-json"]);
+        let environment = command_environment(&cli);
+        assert_eq!(environment["ELECTRON_RUN_AS_NODE"].as_deref(), Some("1"));
+        assert_eq!(
+            environment["ZCODE_BUILTIN_PROVIDER_CONFIG_FILE"]
+                .as_deref()
+                .map(Path::new),
+            Some(install.join("resources/config/provider/zcode-builtin.json")).as_deref()
+        );
+        assert_eq!(
+            environment["ZCODE_PERSONAL_PROVIDER_CONFIG_FILE"]
+                .as_deref()
+                .map(Path::new),
+            Some(Path::new(&profile.directory).join("provider_config.json")).as_deref()
+        );
+        assert_eq!(
+            environment["HOME"].as_deref(),
+            Some(profile.home_directory.as_str())
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn zcode_desktop_keeps_an_explicit_builtin_instead_of_replacing_it() {
+        let (root, mut profile) = zcode_desktop_fixture();
+        let custom = root.path().join("selected-builtin.json");
+        std::fs::write(&custom, b"{}").unwrap();
+        profile.builtin_config_file = Some(custom.to_string_lossy().into());
+        let command = existing_command(AgentId::Zcode, &profile, &["--help".into()], None).unwrap();
+        let environment = command_environment(&command);
+        assert_eq!(
+            environment["ZCODE_BUILTIN_PROVIDER_CONFIG_FILE"].as_deref(),
+            custom.to_str()
+        );
     }
 
     #[test]

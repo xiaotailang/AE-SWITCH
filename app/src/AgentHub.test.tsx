@@ -17,6 +17,7 @@ import {
   agentCatalog,
   type AgentId,
   type ExistingProfile,
+  type InstalledAgentDiscovery,
   type ExistingRuntime,
   type WorkBuddyDefaultSelection,
 } from "./lib/agentApi";
@@ -86,6 +87,13 @@ beforeEach(() => {
     limited: false,
     notes: [],
   });
+  vi.spyOn(agentApi, "discoverDirectory").mockResolvedValue({
+    clients: [],
+    scannedAt: "now",
+    limited: false,
+    notes: [],
+  });
+  vi.spyOn(agentApi, "pickDirectory").mockResolvedValue(null);
   vi.spyOn(api, "overview").mockResolvedValue({
     providers: [provider],
     targets: [],
@@ -210,6 +218,41 @@ async function enterConnection() {
       ),
     { timeout: 3000 },
   );
+}
+async function enterAdvancedPaths() {
+  await userEvent.click(
+    screen.getByText("高级路径设置", { selector: "summary" }),
+  );
+  await userEvent.click(
+    screen.getByRole("button", { name: "手动设置完整路径" }),
+  );
+}
+function installationResult(
+  profiles: ExistingProfile[],
+  agentId: AgentId = "claude_code",
+): InstalledAgentDiscovery {
+  return {
+    clients: profiles.length
+      ? [
+          {
+            agentId,
+            executablePath: profiles[0].executablePath,
+            profiles,
+            source: "selected-directory",
+            reason: null,
+          },
+        ]
+      : [],
+    scannedAt: "now",
+    limited: false,
+    notes: [],
+  };
+}
+async function specifyInstallation(directory: string) {
+  await userEvent.click(screen.getByRole("button", { name: "指定安装目录" }));
+  fireEvent.change(screen.getByLabelText("安装目录", { exact: true }), {
+    target: { value: directory },
+  });
 }
 describe("Agent Hub 真实状态与配置流程", () => {
   function workBuddyFixture(defaultSelection?: WorkBuddyDefaultSelection) {
@@ -624,18 +667,14 @@ describe("Agent Hub 真实状态与配置流程", () => {
     expect(status()).toBeNull();
     await userEvent.click(apply);
     await screen.findByRole("status", { name: "WorkBuddy 默认模型状态" });
-    await userEvent.click(
-      screen.getByRole("button", { name: "手动指定已有客户端" }),
-    );
+    await enterAdvancedPaths();
     await userEvent.type(
       screen.getByLabelText("工作目录", { exact: true }),
       "/changed",
     );
     expect(status()).toBeNull();
     expect(apply).toBeDisabled();
-    await userEvent.click(
-      screen.getByRole("button", { name: "使用自动探测结果" }),
-    );
+    await userEvent.click(screen.getByRole("button", { name: "使用识别结果" }));
     await userEvent.click(apply);
     await screen.findByRole("status", { name: "WorkBuddy 默认模型状态" });
     await userEvent.click(
@@ -1160,6 +1199,288 @@ describe("Agent Hub 真实状态与配置流程", () => {
       expect.objectContaining({ profile: second }),
     );
   });
+  it("指定安装目录只输入一个字段，识别后沿用原生配置而不拿安装目录当 HOME", async () => {
+    const profile = installedProfile("claude_code", "-custom");
+    const directory = "G:/custom tools/claude-install";
+    vi.mocked(agentApi.discoverDirectory).mockResolvedValue(
+      installationResult([profile]),
+    );
+    await mount();
+    await enterConnection();
+    await specifyInstallation(directory);
+    expect(document.querySelector(".hub-advanced-paths")).not.toHaveAttribute(
+      "open",
+    );
+    expect(screen.queryByLabelText("原配置目录", { exact: true })).toBeNull();
+    expect(screen.getByRole("button", { name: "确认连接" })).toBeDisabled();
+    await userEvent.click(
+      screen.getByRole("button", { name: /^识别$/ }),
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "确认连接" })).toBeEnabled(),
+    );
+    expect(agentApi.discoverDirectory).toHaveBeenCalledExactlyOnceWith(
+      "claude_code",
+      directory,
+    );
+    await userEvent.click(screen.getByRole("button", { name: "确认连接" }));
+    await waitFor(() =>
+      expect(agentApi.configure).toHaveBeenCalledWith(
+        expect.objectContaining({ profile }),
+      ),
+    );
+    expect(agentApi.probe).toHaveBeenCalledWith(
+      expect.objectContaining({ profile }),
+    );
+    expect(profile.homeDirectory).not.toBe(directory);
+    expect(profile.directory).not.toBe(directory);
+  });
+  it("原生选择目录后自动识别，取消选择保留有效的原配置和验证结果", async () => {
+    const directory = "G:/picked/install";
+    const profile = installedProfile("claude_code", "-picked");
+    vi.mocked(agentApi.pickDirectory)
+      .mockResolvedValueOnce(directory)
+      .mockResolvedValueOnce(null);
+    vi.mocked(agentApi.discoverDirectory).mockResolvedValue(
+      installationResult([profile]),
+    );
+    await mount();
+    await enterConnection();
+    await userEvent.click(screen.getByRole("button", { name: "指定安装目录" }));
+    await userEvent.click(screen.getByRole("button", { name: "选择目录" }));
+    await waitFor(() =>
+      expect(agentApi.discoverDirectory).toHaveBeenCalledExactlyOnceWith(
+        "claude_code",
+        directory,
+      ),
+    );
+    expect(screen.getByLabelText("安装目录", { exact: true })).toHaveValue(
+      directory,
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "确认连接" })).toBeEnabled(),
+    );
+    await userEvent.click(screen.getByRole("button", { name: "确认连接" }));
+    await screen.findByText("工具写读验证通过");
+    await userEvent.click(screen.getByRole("button", { name: "选择目录" }));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "确认连接" })).toBeEnabled(),
+    );
+    expect(screen.getByText("工具写读验证通过")).toBeVisible();
+    expect(screen.getByLabelText("安装目录", { exact: true })).toHaveValue(
+      directory,
+    );
+    expect(agentApi.discoverDirectory).toHaveBeenCalledOnce();
+  });
+  it("改安装目录、识别失败和空结果都使旧通过状态及已保存 profile 失效", async () => {
+    const profile = installedProfile("claude_code");
+    vi.mocked(agentApi.overview).mockResolvedValue({
+      agents: agentCatalog.map((item) =>
+        item.id === "claude_code"
+          ? {
+              ...item,
+              configured: true,
+              mode: "existing" as const,
+              profile,
+              providerId: provider.id,
+              model: provider.model,
+            }
+          : item,
+      ),
+      dataDirectory: "./data",
+      bridgeHealthy: true,
+    });
+    vi.mocked(agentApi.discoverDirectory)
+      .mockResolvedValueOnce(installationResult([profile]))
+      .mockRejectedValueOnce(new Error("目录不可访问"))
+      .mockResolvedValueOnce(installationResult([]));
+    await mount();
+    await enterConnection();
+    await specifyInstallation("G:/valid/install");
+    await userEvent.click(
+      screen.getByRole("button", { name: /^识别$/ }),
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "确认连接" })).toBeEnabled(),
+    );
+    await userEvent.click(screen.getByRole("button", { name: "确认连接" }));
+    await screen.findByText("工具写读验证通过");
+    fireEvent.change(screen.getByLabelText("安装目录", { exact: true }), {
+      target: { value: "G:/other/install" },
+    });
+    expect(screen.queryByText("工具写读验证通过")).toBeNull();
+    expect(screen.getByRole("button", { name: "确认连接" })).toBeDisabled();
+    await userEvent.click(
+      screen.getByRole("button", { name: /^识别$/ }),
+    );
+    expect(
+      await screen.findByText(/安装目录识别失败：目录不可访问/),
+    ).toBeVisible();
+    expect(screen.getByRole("button", { name: "确认连接" })).toBeDisabled();
+    await userEvent.click(
+      screen.getByRole("button", { name: /^识别$/ }),
+    );
+    expect(
+      await screen.findByText(/所选安装目录中未识别到 Claude Code/),
+    ).toBeVisible();
+    expect(screen.getByRole("button", { name: "确认连接" })).toBeDisabled();
+    expect(agentApi.configure).toHaveBeenCalledOnce();
+  });
+  it("安装目录返回多个 profile 时不回落已保存 profile，必须明确选择", async () => {
+    const first = installedProfile("claude_code");
+    const second = installedProfile("claude_code", "-other");
+    vi.mocked(agentApi.overview).mockResolvedValue({
+      agents: agentCatalog.map((item) =>
+        item.id === "claude_code"
+          ? {
+              ...item,
+              configured: true,
+              mode: "existing" as const,
+              profile: first,
+            }
+          : item,
+      ),
+      dataDirectory: "./data",
+      bridgeHealthy: true,
+    });
+    vi.mocked(agentApi.discoverDirectory).mockResolvedValue(
+      installationResult([first, second]),
+    );
+    await mount();
+    await enterConnection();
+    await specifyInstallation("G:/many/install");
+    await userEvent.click(
+      screen.getByRole("button", { name: /^识别$/ }),
+    );
+    const select = screen.getByRole("combobox", { name: "已安装客户端与配置" });
+    await within(select).findByRole("option", {
+      name: `${second.directory} · ${second.executablePath}`,
+    });
+    expect(select).toHaveValue("");
+    expect(screen.getByRole("button", { name: "确认连接" })).toBeDisabled();
+    await userEvent.selectOptions(select, JSON.stringify(second));
+    await userEvent.click(screen.getByRole("button", { name: "确认连接" }));
+    await waitFor(() =>
+      expect(agentApi.configure).toHaveBeenCalledWith(
+        expect.objectContaining({ profile: second }),
+      ),
+    );
+  });
+  it("旧安装目录请求晚于新目录返回时不能替换当前候选", async () => {
+    let resolveOld!: (value: InstalledAgentDiscovery) => void;
+    vi.mocked(agentApi.discoverDirectory)
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveOld = resolve;
+          }),
+      )
+      .mockResolvedValueOnce(
+        installationResult([installedProfile("claude_code", "-new")]),
+      );
+    await mount();
+    await enterConnection();
+    await specifyInstallation("G:/old/install");
+    await userEvent.click(
+      screen.getByRole("button", { name: /^识别$/ }),
+    );
+    expect(screen.getByRole("button", { name: "确认连接" })).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("安装目录", { exact: true }), {
+      target: { value: "G:/new/install" },
+    });
+    await userEvent.click(
+      screen.getByRole("button", { name: /^识别$/ }),
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "确认连接" })).toBeEnabled(),
+    );
+    await act(async () =>
+      resolveOld(
+        installationResult([installedProfile("claude_code", "-stale")]),
+      ),
+    );
+    expect(
+      screen.getByRole("combobox", { name: "已安装客户端与配置" }),
+    ).toHaveValue(JSON.stringify(installedProfile("claude_code", "-new")));
+    expect(screen.queryByRole("option", { name: /-stale/ })).toBeNull();
+  });
+  it("切换工具后丢弃旧识别请求，返回原工具仍需重新识别", async () => {
+    let resolveOld!: (value: InstalledAgentDiscovery) => void;
+    vi.mocked(agentApi.discoverDirectory).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveOld = resolve;
+        }),
+    );
+    await mount();
+    await enterConnection();
+    await specifyInstallation("G:/pending/install");
+    await userEvent.click(
+      screen.getByRole("button", { name: /^识别$/ }),
+    );
+    const nav = within(screen.getByRole("navigation", { name: "选择 Agent" }));
+    await userEvent.click(nav.getByRole("button", { name: /Codex 官方图标/ }));
+    await act(async () =>
+      resolveOld(
+        installationResult([installedProfile("claude_code", "-stale")]),
+      ),
+    );
+    await userEvent.click(
+      nav.getByRole("button", { name: /Claude Code 官方图标/ }),
+    );
+    expect(screen.getByLabelText("安装目录", { exact: true })).toHaveValue(
+      "G:/pending/install",
+    );
+    expect(screen.getByRole("button", { name: "确认连接" })).toBeDisabled();
+    expect(screen.queryByRole("option", { name: /-stale/ })).toBeNull();
+  });
+  it("高级路径显式启用才生效，关闭高级面板后清除验证并恢复识别选择", async () => {
+    let resolveOld!: (value: InstalledAgentDiscovery) => void;
+    vi.mocked(agentApi.discoverDirectory).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveOld = resolve;
+        }),
+    );
+    await mount();
+    await enterConnection();
+    await specifyInstallation("G:/pending/install");
+    await userEvent.click(
+      screen.getByRole("button", { name: /^识别$/ }),
+    );
+    await enterAdvancedPaths();
+    await act(async () =>
+      resolveOld(
+        installationResult([installedProfile("claude_code", "-stale")]),
+      ),
+    );
+    expect(screen.getByLabelText("原配置目录", { exact: true })).toHaveValue(
+      "",
+    );
+    expect(screen.getByRole("button", { name: "确认连接" })).toBeDisabled();
+    const manual = installedProfile("claude_code", "-advanced");
+    for (const [field, label] of [
+      ["directory", "原配置目录"],
+      ["homeDirectory", "原用户目录"],
+      ["executablePath", "客户端启动文件"],
+      ["workspaceDirectory", "工作目录"],
+    ] as const) {
+      fireEvent.change(screen.getByLabelText(label, { exact: true }), {
+        target: { value: manual[field] },
+      });
+    }
+    expect(screen.getByRole("button", { name: "确认连接" })).toBeEnabled();
+    await userEvent.click(screen.getByRole("button", { name: "确认连接" }));
+    await screen.findByText("工具写读验证通过");
+    await userEvent.click(
+      screen.getByText("高级路径设置", { selector: "summary" }),
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "确认连接" })).toBeDisabled(),
+    );
+    expect(screen.queryByText("工具写读验证通过")).toBeNull();
+    expect(screen.queryByLabelText("原配置目录", { exact: true })).toBeNull();
+  });
   it("探测达到上限显示真实原因，即使只有一个候选也需要明确选择", async () => {
     const profile = installedProfile("claude_code");
     vi.mocked(agentApi.discover).mockResolvedValue({
@@ -1210,9 +1531,7 @@ describe("Agent Hub 真实状态与配置流程", () => {
     });
     await mount();
     await enterConnection();
-    await userEvent.click(
-      screen.getByRole("button", { name: "手动指定已有客户端" }),
-    );
+    await enterAdvancedPaths();
     const chosen = installedProfile("claude_code", "-manual");
     for (const [field, label] of [
       ["directory", "原配置目录"],

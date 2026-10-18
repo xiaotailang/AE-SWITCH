@@ -121,13 +121,24 @@ async fn run(directory: std::path::PathBuf) -> Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     let command = arguments.first().map(String::as_str).unwrap_or("help");
     if command == "help" || command == "--help" {
-        println!("AE Switch Rust kernel\nserve\noverview\ndetect-agents\ndiscover <credentials-file>\nsave-provider (ProviderInput JSON on stdin)\nconfigure <agent-id> <provider-id> [model] (one detected existing profile required)\nconfigure-all <provider-id> [model] (detected clients only)\nconfigure-profile (AgentInput JSON with profile on stdin)\nprobe <agent-id> <provider-id> [model] (one detected existing profile required)\nprobe-profile (AgentInput JSON with profile on stdin)\nAE data remains in the portable directory. Client configuration is written only to the selected existing profile. Client programs are not bundled.");
+        println!("AE Switch Rust kernel\nserve\noverview\ndetect-agents\ndetect-agent-directory <agent-id> <installation-directory>\ndiscover <credentials-file>\nsave-provider (ProviderInput JSON on stdin)\nconfigure <agent-id> <provider-id> [model] (one detected existing profile required)\nconfigure-all <provider-id> [model] (detected clients only)\nconfigure-profile (AgentInput JSON with profile on stdin)\nprobe <agent-id> <provider-id> [model] (one detected existing profile required)\nprobe-profile (AgentInput JSON with profile on stdin)\nAE data remains in the portable directory. Client configuration is written only to the selected existing profile. Client programs are not bundled.");
         return Ok(());
     }
     if command == "detect-agents" {
         return print(
             serde_json::to_value(agent_discovery::discover())
                 .map_err(|_| AppError::new("serialization", "无法读取客户端探测结果"))?,
+        );
+    }
+    if command == "detect-agent-directory" {
+        let id = agent(&argument(&arguments, 1, "agent-id")?)?;
+        let installation = argument(&arguments, 2, "installation-directory")?;
+        return print(
+            serde_json::to_value(agent_discovery::discover_in_directory(
+                id,
+                Path::new(&installation),
+            )?)
+            .map_err(|_| AppError::new("serialization", "无法读取安装目录识别结果"))?,
         );
     }
     let mut store = Store::open(directory.clone())?;

@@ -40,6 +40,8 @@ describe("浏览器预览边界", () => {
       () => agentApi.applyWorkBuddyDefault(),
       () => agentApi.openDirectory(),
       () => agentApi.discover(),
+      () => agentApi.discoverDirectory("zcode", "G:/tools/ZCode"),
+      () => agentApi.pickDirectory(),
       () => agentApi.runtime("codex"),
       () =>
         agentApi.restart({
@@ -51,6 +53,29 @@ describe("浏览器预览边界", () => {
     ]) {
       await expect(action()).rejects.toThrow("浏览器仅用于界面预览");
     }
+  });
+});
+describe("安装目录识别", () => {
+  it("只传工具和安装目录，不把安装目录当成用户配置", async () => {
+    runtime.desktop = true;
+    const result = { clients: [], scannedAt: "now", limited: false, notes: [] };
+    vi.mocked(invoke).mockResolvedValue(result);
+    await expect(
+      agentApi.discoverDirectory("zcode", "G:/tools/ZCode"),
+    ).resolves.toEqual(result);
+    expect(invoke).toHaveBeenCalledExactlyOnceWith(
+      "agent_hub_discover_directory",
+      {
+        agentId: "zcode",
+        directory: "G:/tools/ZCode",
+      },
+    );
+  });
+  it("原生选择目录取消时保留 null", async () => {
+    runtime.desktop = true;
+    vi.mocked(invoke).mockResolvedValue(null);
+    await expect(agentApi.pickDirectory()).resolves.toBeNull();
+    expect(invoke).toHaveBeenCalledExactlyOnceWith("agent_hub_pick_directory");
   });
 });
 describe("WorkBuddy 默认模型原生操作", () => {
