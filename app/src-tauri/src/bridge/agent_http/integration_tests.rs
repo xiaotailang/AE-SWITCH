@@ -474,14 +474,109 @@ async fn selected_reasoning_defaults_preserve_clients_and_do_not_apply_to_other_
 }
 
 #[tokio::test]
-async fn selected_reasoning_rejects_unconfirmed_or_changed_capabilities_before_forwarding() {
+async fn selected_reasoning_unknown_metadata_forwards_explicit_values_without_inventing_capabilities(
+) {
     use crate::agent_configs::AgentId;
-    for (protocol, known) in [
-        (CodexProtocol::Openai, false),
-        (CodexProtocol::Anthropic, true),
+    for kind in [UpstreamKind::Openai, UpstreamKind::ChatOnly] {
+        let fixture = Fixture::new(kind, CodexProtocol::Openai, "bearer", "/v1").await;
+        set_provider_effort(&fixture, MODEL, Some("high"), false);
+        let models_before = fixture
+            .store
+            .lock()
+            .unwrap()
+            .agent_provider(&fixture.id)
+            .unwrap()
+            .summary
+            .codex_options
+            .models;
+        for (agent, resource) in [
+            (AgentId::Codex, "responses"),
+            (AgentId::Zcode, "chat/completions"),
+            (AgentId::ClaudeCode, "messages"),
+        ] {
+            configure_selected_agent(&fixture, agent, MODEL);
+            let response = selected_post(
+                &fixture,
+                agent.as_str(),
+                resource,
+                request_body(resource, false),
+            )
+            .await;
+            assert!(response.status().is_success(), "{}", agent.as_str());
+            let recorded = fixture.recorded().pop().unwrap();
+            let effort = if recorded.path == "/v1/responses" {
+                &recorded.body["reasoning"]["effort"]
+            } else {
+                &recorded.body["reasoning_effort"]
+            };
+            assert_eq!(effort, "high", "{}", agent.as_str());
+        }
+        let models_after = fixture
+            .store
+            .lock()
+            .unwrap()
+            .agent_provider(&fixture.id)
+            .unwrap()
+            .summary
+            .codex_options
+            .models;
+        assert_eq!(
+            serde_json::to_value(models_after).unwrap(),
+            serde_json::to_value(models_before).unwrap()
+        );
+        // Unknown capability metadata does not turn the default into an
+        // override: omitted fields remain omitted and client values survive.
+        set_provider_effort(&fixture, MODEL, None, false);
+        configure_selected_agent(&fixture, AgentId::WorkBuddy, MODEL);
+        for requested_effort in [None, Some("low")] {
+            let mut body = request_body("chat/completions", false);
+            if let Some(effort) = requested_effort {
+                body["reasoning_effort"] = effort.into();
+            }
+            assert!(
+                selected_post(&fixture, "workbuddy", "chat/completions", body)
+                    .await
+                    .status()
+                    .is_success()
+            );
+            let recorded = fixture.recorded().pop().unwrap();
+            assert_eq!(
+                recorded
+                    .body
+                    .get("reasoning_effort")
+                    .and_then(Value::as_str),
+                requested_effort
+            );
+        }
+        // The shared default edit cannot erase already configured selections.
+        assert!(selected_post(
+            &fixture,
+            "zcode",
+            "chat/completions",
+            request_body("chat/completions", false)
+        )
+        .await
+        .status()
+        .is_success());
+        assert_eq!(
+            fixture.recorded().pop().unwrap().body["reasoning_effort"],
+            "high"
+        );
+        fixture.assert_unactivated();
+        fixture.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn selected_reasoning_rejects_unsupported_protocol_or_declared_capabilities_before_forwarding(
+) {
+    use crate::agent_configs::AgentId;
+    for (protocol, effort) in [
+        (CodexProtocol::Openai, "medium"),
+        (CodexProtocol::Anthropic, "high"),
     ] {
         let fixture = Fixture::new(UpstreamKind::Openai, protocol, "bearer", "/v1").await;
-        set_provider_effort(&fixture, MODEL, Some("high"), known);
+        set_provider_effort(&fixture, MODEL, Some(effort), true);
         let error = crate::agent_hub::configure(
             &fixture.store.lock().unwrap(),
             crate::agent_hub::AgentInput {
@@ -505,7 +600,17 @@ async fn selected_reasoning_rejects_unconfirmed_or_changed_capabilities_before_f
     let fixture = Fixture::new(UpstreamKind::Openai, CodexProtocol::Openai, "bearer", "/v1").await;
     set_provider_effort(&fixture, MODEL, Some("high"), true);
     configure_selected_agent(&fixture, AgentId::Zcode, MODEL);
-    set_provider_effort(&fixture, MODEL, None, false);
+    set_provider_effort(&fixture, MODEL, None, true);
+    {
+        let mut store = fixture.store.lock().unwrap();
+        let summary = store.agent_provider(&fixture.id).unwrap().summary;
+        let mut input: ProviderInput =
+            serde_json::from_value(serde_json::to_value(summary).unwrap()).unwrap();
+        for model in &mut input.codex_options.models {
+            model.reasoning_efforts = vec!["low".into()];
+        }
+        store.save(input).unwrap();
+    }
     assert_eq!(
         selected_post(
             &fixture,

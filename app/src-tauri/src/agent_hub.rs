@@ -311,12 +311,16 @@ fn validate_reasoning_effort(
         || !provider.summary.codex_options.models.iter().any(|entry| {
             entry.enabled
                 && entry.id == model
-                && entry.reasoning_efforts.iter().any(|value| value == effort)
+                // Many OpenAI-compatible model lists omit capability metadata.
+                // An empty list is unknown, so allow an explicit protocol value
+                // without claiming or persisting inferred model capabilities.
+                && (entry.reasoning_efforts.is_empty()
+                    || entry.reasoning_efforts.iter().any(|value| value == effort))
         })
     {
         return Err(AppError::new(
             "unsupported_reasoning_effort",
-            "所选思考等级未在此模型的供应商能力中确认，请重新查询模型后选择",
+            "所选思考等级无效、超出模型已声明的支持范围，或模型未启用，请重新选择",
         ));
     }
     Ok(())
@@ -948,6 +952,67 @@ mod tests {
                 || name == "ZCODE_API_KEY")
             .is_empty()
         );
+    }
+
+    #[test]
+    fn explicit_reasoning_with_unknown_metadata_requires_an_enabled_model_and_protocol_value() {
+        let mut provider = StoredProvider {
+            summary: crate::types::Provider {
+                id: "reasoning-fixture".into(),
+                family: Family::Codex,
+                name: "Unknown model capabilities".into(),
+                base_url: "https://invalid.example/v1".into(),
+                model: "selected-model".into(),
+                auth_mode: "bearer".into(),
+                reasoning_effort: None,
+                codex_options: CodexOptions {
+                    upstream_protocol: Some(crate::types::CodexProtocol::Openai),
+                    models: vec![crate::types::ProviderModel {
+                        id: "selected-model".into(),
+                        context_window: None,
+                        reasoning_efforts: vec![],
+                        enabled: true,
+                    }],
+                    ..Default::default()
+                },
+                has_key: false,
+                has_balance_token: false,
+                key_suffix: String::new(),
+                updated_at: 0,
+            },
+            api_key: String::new(),
+            balance_access_token: None,
+        };
+        let before = serde_json::to_value(&provider).unwrap();
+        for effort in [
+            "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+        ] {
+            validate_reasoning_effort(&provider, "selected-model", Some(effort)).unwrap();
+        }
+        assert_eq!(serde_json::to_value(&provider).unwrap(), before);
+        for (model, effort) in [
+            ("missing-model", "high"),
+            ("selected-model", "unsupported"),
+            ("selected-model", ""),
+            ("selected-model", "High"),
+        ] {
+            assert_eq!(
+                validate_reasoning_effort(&provider, model, Some(effort))
+                    .unwrap_err()
+                    .code,
+                "unsupported_reasoning_effort"
+            );
+        }
+        provider.summary.codex_options.models[0].enabled = false;
+        assert!(validate_reasoning_effort(&provider, "selected-model", Some("high")).is_err());
+        provider.summary.codex_options.models[0].enabled = true;
+        provider.summary.codex_options.models[0].reasoning_efforts = vec!["low".into()];
+        assert!(validate_reasoning_effort(&provider, "selected-model", Some("high")).is_err());
+        validate_reasoning_effort(&provider, "selected-model", Some("low")).unwrap();
+        provider.summary.codex_options.upstream_protocol =
+            Some(crate::types::CodexProtocol::Anthropic);
+        assert!(validate_reasoning_effort(&provider, "selected-model", Some("low")).is_err());
+        validate_reasoning_effort(&provider, "selected-model", None).unwrap();
     }
 
     #[test]

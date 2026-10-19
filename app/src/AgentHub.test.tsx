@@ -373,15 +373,34 @@ describe("Agent Hub 真实状态与配置流程", () => {
     expect(agentApi.configure).toHaveBeenCalledOnce();
   });
 
-  it("思考等级未知或Anthropic连接不会提供猜测档位", async () => {
+  it("未返回思考等级清单时允许兼容选项且不伪造模型能力", async () => {
     await mount();
     await enterConnection();
-    expect(screen.getAllByRole("radio")).toHaveLength(1);
+    expect(screen.getAllByRole("radio")).toHaveLength(9);
     expect(
       screen.getByText(
-        "供应商未返回此模型的可选思考等级，使用客户端或供应商的默认设置。",
+        /端点未提供等级清单，以下为兼容选项，不代表已确认全部支持/,
       ),
     ).toBeVisible();
+    await userEvent.click(screen.getByRole("radio", { name: "高（high）" }));
+    await userEvent.click(screen.getByRole("button", { name: "确认连接" }));
+    await waitFor(() =>
+      expect(api.save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          reasoningEffort: "high",
+          codexOptions: expect.objectContaining({
+            models: [expect.objectContaining({ reasoningEfforts: [] })],
+          }),
+        }),
+      ),
+    );
+    expect(agentApi.configure).toHaveBeenCalledOnce();
+    expect(agentApi.probe).toHaveBeenCalledOnce();
+  });
+
+  it("原生Anthropic连接保持默认且不提供OpenAI兼容档位", async () => {
+    await mount();
+    await enterConnection();
     vi.mocked(api.discoverConnection).mockResolvedValue({
       models: [
         {
@@ -399,6 +418,36 @@ describe("Agent Hub 真实状态与配置流程", () => {
       "此连接暂不支持在 AE Switch 中设置思考等级，使用客户端或供应商的默认设置。",
     );
     expect(screen.getAllByRole("radio")).toHaveLength(1);
+  });
+
+  it("未知能力后收到明确等级清单时移除未声明的兼容选项", async () => {
+    await mount();
+    await enterConnection();
+    await userEvent.click(screen.getByRole("radio", { name: "更高（xhigh）" }));
+    vi.mocked(api.discoverConnection).mockResolvedValue({
+      models: [
+        {
+          ...provider.codexOptions!.models[0],
+          reasoningEfforts: ["low", "high"],
+        },
+      ],
+      protocol: "openai",
+      authMode: "bearer",
+      syncedAt: 3,
+      baseUrl: provider.baseUrl,
+    });
+    await userEvent.click(screen.getByRole("button", { name: "同步模型" }));
+    await waitFor(() =>
+      expect(screen.queryByRole("radio", { name: "更高（xhigh）" })).toBeNull(),
+    );
+    expect(screen.getByRole("radio", { name: "默认" })).toBeChecked();
+    expect(screen.getAllByRole("radio")).toHaveLength(3);
+    await userEvent.click(screen.getByRole("button", { name: "确认连接" }));
+    await waitFor(() =>
+      expect(api.save).toHaveBeenCalledWith(
+        expect.objectContaining({ reasoningEffort: null }),
+      ),
+    );
   });
 
   it("切换模型后清除思考档位和上一次验证结果", async () => {

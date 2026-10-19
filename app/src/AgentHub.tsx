@@ -359,14 +359,15 @@ export default function AgentHub() {
           (model) => model.enabled && discovery.allowed(model.id),
         )
       : [];
+  const selectedModel = models.find((model) => model.id === discovery.model);
+  const declaredReasoningLevels = [
+    ...new Set(selectedModel?.reasoningEfforts ?? []),
+  ].filter((effort) => Object.hasOwn(reasoningLabels, effort));
   const reasoningLevels =
-    discovery.protocol === "openai"
-      ? [
-          ...new Set(
-            models.find((model) => model.id === discovery.model)
-              ?.reasoningEfforts ?? [],
-          ),
-        ].filter((effort) => Object.hasOwn(reasoningLabels, effort))
+    discovery.protocol === "openai" && selectedModel
+      ? declaredReasoningLevels.length
+        ? declaredReasoningLevels
+        : Object.keys(reasoningLabels)
       : [];
   const reasoningContext = JSON.stringify([
     selectedAgent,
@@ -375,6 +376,7 @@ export default function AgentHub() {
     apiKey,
     discovery.model,
     discovery.protocol,
+    declaredReasoningLevels.length > 0,
     reasoningLevels,
   ]);
   const savedReasoning =
@@ -604,13 +606,17 @@ export default function AgentHub() {
       )
     )
       throw new Error(discovery.failure || "请先同步并选择一个可用模型。");
+    const readyReasoningLevels = (
+      ready.models.find((model) => model.id === ready.model)
+        ?.reasoningEfforts ?? []
+    ).filter((effort) => Object.hasOwn(reasoningLabels, effort));
     if (
       reasoningEffort !== null &&
       (ready.model !== discovery.model ||
         ready.protocol !== "openai" ||
-        !ready.models
-          .find((model) => model.id === ready.model)
-          ?.reasoningEfforts.includes(reasoningEffort))
+        !Object.hasOwn(reasoningLabels, reasoningEffort) ||
+        (readyReasoningLevels.length > 0 &&
+          !readyReasoningLevels.includes(reasoningEffort)))
     )
       throw new Error("模型的思考等级信息已变化，请重新同步并选择。");
     let host = "API 供应商";
@@ -1267,11 +1273,13 @@ export default function AgentHub() {
                   ))}
                 </div>
                 <p className="hub-profile-note">
-                  {reasoningLevels.length
+                  {declaredReasoningLevels.length && reasoningLevels.length
                     ? "仅显示供应商返回的模型等级。选择默认时保留客户端或供应商的设置；指定等级在确认连接后通过 AE 网关应用。"
                     : discovery.protocol === "anthropic"
                       ? "此连接暂不支持在 AE Switch 中设置思考等级，使用客户端或供应商的默认设置。"
-                      : "供应商未返回此模型的可选思考等级，使用客户端或供应商的默认设置。"}
+                      : selectedModel
+                        ? "端点未提供等级清单，以下为兼容选项，不代表已确认全部支持。可选择你已验证的等级，确认后通过 AE 网关传递，以端点响应为准；默认保留客户端设置。"
+                        : "选择模型后可设置思考程度。"}
                 </p>
               </fieldset>
 
