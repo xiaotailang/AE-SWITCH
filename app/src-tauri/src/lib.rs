@@ -8,9 +8,11 @@ pub mod agent_verification;
 #[cfg(feature = "desktop")]
 pub mod background;
 pub mod bridge;
+pub mod config_profiles;
 pub mod desktop_platform;
 pub mod discovery;
 pub mod error;
+pub(crate) mod local_integrity;
 pub mod portable;
 pub mod project_links;
 pub mod restart;
@@ -309,6 +311,134 @@ mod desktop {
         };
         overview["bridgeHealthy"] = serde_json::json!(crate::bridge::healthy(&route).await);
         Ok(overview)
+    }
+
+    #[tauri::command]
+    async fn agent_hub_activity(
+        state: State<'_, AppState>,
+        agent_id: crate::agent_configs::AgentId,
+    ) -> Result<crate::bridge::activity::ActivitySnapshot> {
+        let route = locked(&state)?.agent_route()?;
+        crate::bridge::activity::read_activity(&route, agent_id, false).await
+    }
+
+    #[tauri::command]
+    async fn clear_agent_hub_activity(
+        state: State<'_, AppState>,
+        agent_id: crate::agent_configs::AgentId,
+    ) -> Result<crate::bridge::activity::ActivitySnapshot> {
+        let route = locked(&state)?.agent_route()?;
+        crate::bridge::activity::read_activity(&route, agent_id, true).await
+    }
+
+    #[tauri::command]
+    async fn agent_configuration_safety(
+        state: State<'_, AppState>,
+        agent_id: crate::agent_configs::AgentId,
+    ) -> Result<crate::agent_configs::ConfigurationSafety> {
+        let shared = state.inner().clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let store = shared
+                .lock()
+                .map_err(|_| AppError::new("busy", "配置服务繁忙，请重试"))?;
+            crate::agent_hub::configuration_safety(&store, agent_id)
+        })
+        .await
+        .map_err(|_| AppError::new("configuration_safety", "配置状态检查未完成，请重试"))?
+    }
+
+    #[tauri::command]
+    async fn disconnect_agent(
+        state: State<'_, AppState>,
+        agent_id: crate::agent_configs::AgentId,
+        preview_token: String,
+    ) -> Result<serde_json::Value> {
+        let shared = state.inner().clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let store = shared
+                .lock()
+                .map_err(|_| AppError::new("busy", "配置服务繁忙，请重试"))?;
+            crate::agent_hub::disconnect(&store, agent_id, &preview_token)
+        })
+        .await
+        .map_err(|_| {
+            AppError::new(
+                "configuration_disconnect",
+                "断开操作未完成，请重新检查配置状态",
+            )
+        })?
+    }
+
+    #[tauri::command]
+    fn list_config_profiles(
+        state: State<AppState>,
+    ) -> Result<Vec<crate::config_profiles::ConfigProfile>> {
+        crate::config_profiles::list(&locked(&state)?.data_directory)
+    }
+
+    #[tauri::command]
+    async fn save_config_profile(
+        state: State<'_, AppState>,
+        input: crate::config_profiles::SaveProfileInput,
+    ) -> Result<crate::config_profiles::ConfigProfile> {
+        let shared = state.inner().clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let store = shared
+                .lock()
+                .map_err(|_| AppError::new("busy", "配置服务繁忙，请重试"))?;
+            crate::config_profiles::save(&store, input)
+        })
+        .await
+        .map_err(|_| AppError::new("configuration_profile", "保存方案未完成，请重试"))?
+    }
+
+    #[tauri::command]
+    async fn preview_config_profile(
+        state: State<'_, AppState>,
+        id: String,
+    ) -> Result<crate::config_profiles::ProfilePreview> {
+        let shared = state.inner().clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let store = shared
+                .lock()
+                .map_err(|_| AppError::new("busy", "配置服务繁忙，请重试"))?;
+            crate::config_profiles::preview(&store, &id)
+        })
+        .await
+        .map_err(|_| AppError::new("configuration_profile", "预览方案未完成，请重试"))?
+    }
+
+    #[tauri::command]
+    async fn apply_config_profile(
+        state: State<'_, AppState>,
+        input: crate::config_profiles::ApplyProfileInput,
+    ) -> Result<crate::config_profiles::ApplyProfileResult> {
+        let route = locked(&state)?.agent_route()?;
+        if !crate::bridge::healthy(&route).await {
+            return Err(AppError::new(
+                "bridge_unavailable",
+                "Rust 接入服务正在恢复，请稍后重试",
+            ));
+        }
+        let shared = state.inner().clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let store = shared
+                .lock()
+                .map_err(|_| AppError::new("busy", "配置服务繁忙，请重试"))?;
+            crate::config_profiles::apply(&store, input)
+        })
+        .await
+        .map_err(|_| {
+            AppError::new(
+                "configuration_profile",
+                "应用方案未完成，请重新检查配置状态",
+            )
+        })?
+    }
+
+    #[tauri::command]
+    fn delete_config_profile(state: State<AppState>, id: String, revision: u64) -> Result<()> {
+        crate::config_profiles::delete(&locked(&state)?.data_directory, &id, revision)
     }
 
     #[tauri::command]
@@ -888,6 +1018,15 @@ mod desktop {
                 agent_hub_discover_directory,
                 agent_hub_pick_directory,
                 agent_hub_overview,
+                agent_hub_activity,
+                clear_agent_hub_activity,
+                agent_configuration_safety,
+                disconnect_agent,
+                list_config_profiles,
+                save_config_profile,
+                preview_config_profile,
+                apply_config_profile,
+                delete_config_profile,
                 configure_agent,
                 apply_workbuddy_default_model,
                 probe_agent,

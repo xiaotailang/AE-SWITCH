@@ -75,6 +75,7 @@ impl Store {
     pub fn open(directory: PathBuf) -> Result<Self> {
         crate::portable::validate_owned_path(&directory)?;
         writer::private_directory(&directory)?;
+        writer::protect_existing_private_state(&directory)?;
         let lock_path = directory.join("app.lock");
         crate::portable::validate_owned_path(&lock_path)?;
         let lock = std::fs::OpenOptions::new()
@@ -169,6 +170,7 @@ impl Store {
             }
         }
         store.recover()?;
+        crate::config_profiles::recover(&store.data_directory)?;
         crate::agent_configs::recover_configuration(&store.data_directory)?;
         Ok(store)
     }
@@ -819,7 +821,10 @@ impl Store {
             [id],
             |row| row.get(0),
         )?;
-        if in_use || crate::agent_hub::provider_in_use(&self.data_directory, id)? {
+        if in_use
+            || crate::agent_hub::provider_in_use(&self.data_directory, id)?
+            || crate::config_profiles::provider_in_use(&self.data_directory, id)?
+        {
             return Err(AppError::new(
                 "in_use",
                 "此配置仍在客户端中使用，请先应用其他配置或恢复原配置",

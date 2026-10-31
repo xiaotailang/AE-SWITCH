@@ -22,12 +22,22 @@ const supervisorSha256 = "d".repeat(64);
 const sandbox = "G:\\owned\\.cache\\native-e2e-sandbox\\" + ownerId;
 const options = { sandboxAbsent: true, supervisorSha256 };
 
-test("ordinary-discovered native Codex profile uses the actual manifest executable while its writable paths remain owned", () => {
-  const workspace = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
-  const installations = JSON.parse(fs.readFileSync(path.join(workspace, ".cache/tmp/official-installations-20261017.json"), "utf8"));
-  const entry = installations.runtimes.codex;
+test("native Codex profile path contract accepts only its prepared hash-bound executable while writable paths remain owned", () => {
+  const workspace = path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "../..",
+  );
+  const temporary = path.join(workspace, ".cache/tmp");
+  fs.mkdirSync(temporary, { recursive: true });
+  const fixture = fs.mkdtempSync(path.join(temporary, "native-profile-"));
+  assert.ok(fixture.startsWith(temporary + path.sep));
+  const root = path.join(fixture, "owned-profile");
+  fs.mkdirSync(root);
+  // This file stands in for an already hash-bound read-only runtime. It stays
+  // outside the writable owner root, and is never executed or called official.
+  const entry = path.join(fixture, "synthetic-runtime.exe");
+  fs.writeFileSync(entry, "synthetic contract bytes; never execute", { flag: "wx" });
   const hash = createHash("sha256").update(fs.readFileSync(entry)).digest("hex");
-  const root = fs.mkdtempSync(path.join(workspace, ".cache/tmp/native-profile-"));
   const guard = (file) => {
     assert.ok(path.resolve(file).startsWith(root + path.sep));
     return file;
@@ -41,7 +51,14 @@ test("ordinary-discovered native Codex profile uses the actual manifest executab
       assert.throws(() => assertPreparedProfilePaths({workspace,setup,id:"codex",profile:{...profile,[key]:path.join(workspace,"foreign")},guard}));
     const bad = structuredClone(setup); bad.fixtures.sharedRuntimeFiles[entry]="0".repeat(64);
     assert.throws(() => assertPreparedProfilePaths({workspace,setup:bad,id:"codex",profile,guard}));
-  } finally { fs.rmdirSync(root); assert.equal(fs.existsSync(root),false); }
+    fs.writeFileSync(entry, "changed synthetic runtime bytes");
+    assert.throws(() => assertPreparedProfilePaths({workspace,setup,id:"codex",profile,guard}));
+  } finally {
+    fs.unlinkSync(entry);
+    fs.rmdirSync(root);
+    fs.rmdirSync(fixture);
+    assert.equal(fs.existsSync(fixture),false);
+  }
 });
 
 test("native Codex observations require exact official bytes and a retained owner parent", () => {

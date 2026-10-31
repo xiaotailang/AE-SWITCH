@@ -19,19 +19,19 @@ use std::{
 // Leave room for reasoning models to emit the marker in their visible answer.
 const CONNECTION_PROBE_MAX_OUTPUT_TOKENS: u32 = 512;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Selection {
-    provider_id: String,
-    model: String,
+pub(crate) struct Selection {
+    pub(crate) provider_id: String,
+    pub(crate) model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    reasoning_effort: Option<String>,
+    pub(crate) reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    profile: Option<ExistingProfile>,
+    pub(crate) profile: Option<ExistingProfile>,
     #[serde(default)]
-    configuration_revision: u64,
+    pub(crate) configuration_revision: u64,
     #[serde(default)]
-    applied_at_ms: u64,
+    pub(crate) applied_at_ms: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -126,7 +126,9 @@ fn selections(root: &Path) -> Result<BTreeMap<String, Selection>> {
     Ok(read_selections(root)?.0)
 }
 
-fn read_selections(root: &Path) -> Result<(BTreeMap<String, Selection>, Option<String>)> {
+pub(crate) fn read_selections(
+    root: &Path,
+) -> Result<(BTreeMap<String, Selection>, Option<String>)> {
     let path = root.join("agent-selection.json");
     crate::portable::validate_owned_path(&path)?;
     match std::fs::read(&path) {
@@ -141,6 +143,56 @@ fn read_selections(root: &Path) -> Result<(BTreeMap<String, Selection>, Option<S
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok((BTreeMap::new(), None)),
         Err(error) => Err(AppError::io(&path, error)),
     }
+}
+
+pub fn configuration_safety(
+    store: &Store,
+    agent: AgentId,
+) -> Result<agent_configs::ConfigurationSafety> {
+    crate::config_profiles::recover(&store.data_directory)?;
+    agent_configs::recover_configuration(&store.data_directory)?;
+    let saved = selections(&store.data_directory)?;
+    let selection = saved
+        .get(agent.as_str())
+        .ok_or_else(|| AppError::new("not_configured", "请先配置此客户端"))?;
+    agent_configs::configuration_safety(&store.data_directory, agent, selection.profile.as_ref())
+}
+
+pub fn disconnect(store: &Store, agent: AgentId, preview_token: &str) -> Result<Value> {
+    crate::config_profiles::recover(&store.data_directory)?;
+    agent_configs::recover_configuration(&store.data_directory)?;
+    let (mut saved, before) = read_selections(&store.data_directory)?;
+    let selection = saved
+        .remove(agent.as_str())
+        .ok_or_else(|| AppError::new("not_configured", "此客户端尚未配置"))?;
+    let before = before.ok_or_else(|| AppError::new("not_configured", "此客户端尚未配置"))?;
+    let after = serde_json::to_string_pretty(&saved)
+        .map_err(|_| AppError::new("serialization", "无法保存客户端选择"))?;
+    agent_configs::disconnect_configuration(
+        &store.data_directory,
+        agent,
+        selection.profile.as_ref(),
+        preview_token,
+        &before,
+        &after,
+    )?;
+    Ok(json!({"agentId": agent, "disconnected": true, "needsRestart": true}))
+}
+
+pub(crate) fn validate_profile_choice(
+    store: &Store,
+    provider_id: &str,
+    model: &str,
+    effort: Option<&str>,
+) -> Result<()> {
+    let provider = store.agent_provider(provider_id)?;
+    if !model_is_available(&provider, model) {
+        return Err(AppError::new(
+            "invalid_model",
+            "方案引用的模型已停用或不在已保存的模型列表中",
+        ));
+    }
+    validate_reasoning_effort(&provider, model, effort)
 }
 
 pub(crate) fn provider_in_use(root: &Path, provider_id: &str) -> Result<bool> {
@@ -364,6 +416,7 @@ pub(crate) fn gateway_provider(store: &Store, id: &str) -> Result<StoredProvider
 }
 
 pub fn configure(store: &Store, input: AgentInput) -> Result<Value> {
+    crate::config_profiles::recover(&store.data_directory)?;
     let model = selected_model(store, &input)?;
     let reasoning_effort =
         selected_reasoning_effort(&store.agent_provider(&input.provider_id)?, &model)?;

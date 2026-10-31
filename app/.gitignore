@@ -7,6 +7,17 @@
 /rtk/
 /.rtk/
 /output/
+/data/
+runtime-integrity.key
+agent-ownership-*.json
+agent-ownership-*.json.pending
+agent-disconnect.pending.json
+agent-configuration.pending.json
+agent-native-configuration.pending.json
+agent-selection.json
+protocol-bridge.json
+config-profiles.json
+config-profiles.pending.json
 /release/
 /.codex/
 /.claude/

@@ -26,6 +26,8 @@ enum UpstreamKind {
     ChatOnly,
     Anthropic,
     AuthenticationFailure,
+    InBandError,
+    Interrupted,
 }
 
 #[derive(Clone)]
@@ -58,6 +60,16 @@ async fn upstream(
             Json(json!({"error":{"message":format!("Invalid API key: {UPSTREAM_KEY}")}})),
         )
             .into_response();
+    }
+    if matches!(state.kind, UpstreamKind::InBandError) {
+        return fragmented_sse(vec![
+            json!({"type":"error","error":{"message":UPSTREAM_KEY}}),
+        ]);
+    }
+    if matches!(state.kind, UpstreamKind::Interrupted) {
+        return fragmented_sse(vec![
+            json!({"type":"response.output_text.delta","delta":"partial"}),
+        ]);
     }
     if uri.path() == "/v1/messages/count_tokens" {
         return Json(json!({"input_tokens":42})).into_response();
@@ -139,6 +151,168 @@ fn fragmented_sse(events: Vec<Value>) -> Response {
         Body::from_stream(futures_util::stream::iter(chunks)),
     )
         .into_response()
+}
+
+#[tokio::test]
+async fn activity_http_auth_filters_and_clear_do_not_expose_content_or_change_routes() {
+    use crate::agent_configs::AgentId;
+    let fixture = Fixture::new(UpstreamKind::Openai, CodexProtocol::Openai, "bearer", "").await;
+    configure_selected_agent(&fixture, AgentId::Codex, MODEL);
+    let body = json!({"model":MODEL,"input":"diagnostic-private-prompt","stream":false});
+    let response = selected_post(&fixture, "codex", "responses", body.clone()).await;
+    let data: Value = response.json().await.unwrap();
+    assert_eq!(data["output"][0]["content"][0]["text"], "NATIVE_OK");
+    let snapshot = bridge::activity::read_activity(&fixture.route, AgentId::Codex, false)
+        .await
+        .unwrap();
+    assert_eq!(snapshot.records.len(), 1);
+    assert_eq!(snapshot.records[0].state, "completed");
+    assert_eq!(snapshot.records[0].model.as_deref(), Some(MODEL));
+    assert_eq!(snapshot.records[0].usage.input_tokens, Some(7));
+    assert_eq!(snapshot.records[0].usage.output_tokens, Some(3));
+    let directory = fixture.store.lock().unwrap().data_directory.clone();
+    let route_before = std::fs::read(directory.join("protocol-bridge.json")).unwrap();
+    let from_saved = bridge::activity::read_saved_activity(&directory, AgentId::Codex)
+        .await
+        .unwrap();
+    assert_eq!(from_saved.records[0].id, snapshot.records[0].id);
+    assert_eq!(
+        std::fs::read(directory.join("protocol-bridge.json")).unwrap(),
+        route_before
+    );
+    assert_eq!(fixture.recorded()[0].body, body);
+    let serialized = serde_json::to_string(&snapshot).unwrap();
+    for forbidden in [
+        UPSTREAM_KEY,
+        &fixture.route.token,
+        "diagnostic-private-prompt",
+        "NATIVE_OK",
+        TOOL_ARGUMENTS,
+        "127.0.0.1",
+        "api_key",
+    ] {
+        assert!(!serialized.contains(forbidden));
+    }
+    let url = format!("http://127.0.0.1:{}/activity/codex", fixture.route.port);
+    assert_eq!(
+        fixture.client.get(&url).send().await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        fixture
+            .client
+            .delete(&url)
+            .bearer_auth(&fixture.route.token)
+            .header("Origin", "http://browser.invalid")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        bridge::activity::read_activity(&fixture.route, AgentId::Hermes, false)
+            .await
+            .unwrap()
+            .records
+            .len(),
+        0
+    );
+    assert!(
+        bridge::activity::read_activity(&fixture.route, AgentId::Codex, true)
+            .await
+            .unwrap()
+            .records
+            .is_empty()
+    );
+    assert!(
+        bridge::activity::read_activity(&fixture.route, AgentId::Codex, false)
+            .await
+            .unwrap()
+            .records
+            .is_empty()
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn activity_counts_stream_usage_across_native_and_converted_protocols() {
+    use crate::agent_configs::AgentId;
+    for (kind, protocol, resource, agent) in [
+        (
+            UpstreamKind::ChatOnly,
+            CodexProtocol::Openai,
+            "responses",
+            AgentId::Codex,
+        ),
+        (
+            UpstreamKind::Anthropic,
+            CodexProtocol::Anthropic,
+            "chat/completions",
+            AgentId::Hermes,
+        ),
+        (
+            UpstreamKind::Anthropic,
+            CodexProtocol::Anthropic,
+            "messages",
+            AgentId::ClaudeCode,
+        ),
+    ] {
+        let fixture = Fixture::new(kind, protocol, "bearer", "").await;
+        configure_selected_agent(&fixture, agent, MODEL);
+        let response = selected_post(
+            &fixture,
+            agent.as_str(),
+            resource,
+            request_body(resource, true),
+        )
+        .await;
+        assert!(response.status().is_success());
+        let wire = response.text().await.unwrap();
+        assert!(wire.contains("data:"));
+        let snapshot = bridge::activity::read_activity(&fixture.route, agent, false)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.records.len(), 1);
+        let record = &snapshot.records[0];
+        assert_eq!(record.state, "completed", "{resource}: {wire}");
+        assert_eq!(record.endpoint, resource);
+        assert_eq!(record.usage.input_tokens, Some(7));
+        assert_eq!(record.usage.output_tokens, Some(3));
+        assert_eq!(record.response_bytes as usize, wire.len());
+        fixture.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn activity_retains_failed_and_interrupted_http_results_without_error_text() {
+    use crate::agent_configs::AgentId;
+    for (kind, expected_status, expected_state) in [
+        (UpstreamKind::AuthenticationFailure, 401, "failed"),
+        (UpstreamKind::InBandError, 200, "failed"),
+        (UpstreamKind::Interrupted, 200, "interrupted"),
+    ] {
+        let fixture = Fixture::new(kind, CodexProtocol::Openai, "bearer", "").await;
+        configure_selected_agent(&fixture, AgentId::Codex, MODEL);
+        let response = selected_post(
+            &fixture,
+            "codex",
+            "responses",
+            request_body("responses", true),
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), expected_status);
+        response.bytes().await.unwrap();
+        let snapshot = bridge::activity::read_activity(&fixture.route, AgentId::Codex, false)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.records[0].status, Some(expected_status));
+        assert_eq!(snapshot.records[0].state, expected_state);
+        assert!(!serde_json::to_string(&snapshot)
+            .unwrap()
+            .contains(UPSTREAM_KEY));
+        fixture.shutdown().await;
+    }
 }
 
 struct Fixture {

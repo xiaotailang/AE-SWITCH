@@ -37,6 +37,11 @@ import {
 import { useConnectionDiscovery } from "./lib/useConnectionDiscovery";
 import { WindowChrome } from "./components/WindowChrome";
 import { TutorialDialog } from "./components/TutorialDialog";
+import { RequestActivityPanel } from "./components/RequestActivityPanel";
+import { AgentModelPicker } from "./components/AgentModelPicker";
+import { ConfigurationSafetyPanel } from "./components/ConfigurationSafetyPanel";
+import { ConfigProfilesPanel } from "./components/ConfigProfilesPanel";
+import { rememberModelUse } from "./lib/modelPreferences";
 import { APP_VERSION } from "./lib/appVersion";
 import { projectUrl } from "./lib/projectLinks";
 import type { Provider, ProviderInput } from "./types";
@@ -51,6 +56,7 @@ import zcodeLogo from "./assets/agents/zcode.png";
 import workBuddyLogo from "./assets/agents/workbuddy.svg";
 import deepSeekHarnessLogo from "./assets/agents/deepseek-harness.svg";
 import "./agent-hub.css";
+import "./model-profiles.css";
 
 const DEFAULT_ENDPOINT = "https://aiease-yun.com";
 const reasoningLabels: Record<string, string> = {
@@ -147,6 +153,8 @@ export default function AgentHub() {
     | "restart"
     | "directory"
     | "background"
+    | "configuration"
+    | "profiles"
     | null
   >(null);
   const [connectionStage, setConnectionStage] =
@@ -157,6 +165,8 @@ export default function AgentHub() {
     useState<WorkBuddyDefaultSelection | null>(null);
   const [help, setHelp] = useState(false);
   const [tutorialOpen, setTutorialOpen] = useState(false);
+  const [profilesOpen, setProfilesOpen] = useState(false);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   const [helpError, setHelpError] = useState("");
   const [profileChoices, setProfileChoices] = useState<
     Partial<Record<AgentId, string>>
@@ -675,6 +685,7 @@ export default function AgentHub() {
         stage = "configure";
         setConnectionStage(stage);
         const configured = await agentApi.configure(input);
+        rememberModelUse(selectedAgent, saved.id, saved.model);
         setWorkBuddyDefault(configured.workBuddyDefaultSelection ?? null);
         await client.invalidateQueries({ queryKey: ["agent-hub"] });
         await client.invalidateQueries({ queryKey: ["agent-runtime"] });
@@ -1178,37 +1189,27 @@ export default function AgentHub() {
                     {discovery.busy ? "同步中" : "同步模型"}
                   </button>
                 </div>
-                <div className="hub-select-wrap hub-model-select">
-                  <Cpu size={17} aria-hidden />
-                  <select
-                    id="hub-model"
-                    value={models.length ? discovery.model : ""}
-                    disabled={!models.length || !!busy || discovery.busy}
-                    onChange={(event) => {
-                      setReasoningChoice(null);
-                      discovery.selectDefault(event.target.value);
-                      setNotice(null);
-                      setProbe(null);
-                      setWorkBuddyDefault(null);
-                    }}
-                  >
-                    {!models.length && (
-                      <option value="">
-                        {discovery.busy
-                          ? "正在从供应商获取模型…"
-                          : discovery.failure
-                            ? "未能获取可用模型，请重新同步"
-                            : "填写端点与密钥后自动获取"}
-                      </option>
-                    )}
-                    {models.map((model) => (
-                      <option value={model.id} key={model.id}>
-                        {model.id}
-                      </option>
-                    ))}
-                  </select>
-                  <ChevronDown size={15} aria-hidden />
-                </div>
+                <AgentModelPicker
+                  agentId={selectedAgent}
+                  providerId={provider?.id ?? ""}
+                  models={models}
+                  model={models.length ? discovery.model : ""}
+                  disabled={!models.length || !!busy || discovery.busy}
+                  emptyLabel={
+                    discovery.busy
+                      ? "正在从供应商获取模型…"
+                      : discovery.failure
+                        ? "未能获取可用模型，请重新同步"
+                        : "填写端点与密钥后自动获取"
+                  }
+                  onChange={(model) => {
+                    setReasoningChoice(null);
+                    discovery.selectDefault(model);
+                    setNotice(null);
+                    setProbe(null);
+                    setWorkBuddyDefault(null);
+                  }}
+                />
                 <div
                   className={`hub-model-status ${discovery.failure ? "failure" : ""}`}
                   aria-live="polite"
@@ -1921,6 +1922,80 @@ export default function AgentHub() {
                 {warning}
               </p>
             ))}
+            <ConfigurationSafetyPanel
+              key={`safety:${selectedAgent}`}
+              agentId={selectedAgent}
+              configured={agent.configured}
+              disabled={!!busy}
+              onBusyChange={(active) =>
+                setBusy(active ? "configuration" : null)
+              }
+              onChanged={async () => {
+                setProbe(null);
+                setWorkBuddyDefault(null);
+                setNotice({
+                  tone: "info",
+                  message:
+                    "已断开 AE 连接并恢复受管字段，请让客户端重新加载配置。",
+                });
+                await client.invalidateQueries({ queryKey: ["agent-hub"] });
+                await client.invalidateQueries({ queryKey: ["agent-runtime"] });
+              }}
+            />
+            <RequestActivityPanel
+              key={selectedAgent}
+              agentId={selectedAgent}
+              agentName={agent.name}
+            />
+            <details
+              className="hub-advanced-features"
+              onToggle={(event) => {
+                setAdvancedOpen(event.currentTarget.open);
+                if (!event.currentTarget.open) setProfilesOpen(false);
+              }}
+            >
+              <summary>高级功能</summary>
+              <details
+                className="hub-config-profiles-disclosure"
+                open={profilesOpen}
+                onToggle={(event) => setProfilesOpen(event.currentTarget.open)}
+              >
+                <summary>配置方案</summary>
+                {advancedOpen && profilesOpen && (
+                  <ConfigProfilesPanel
+                    agents={agents}
+                    disabled={!!busy}
+                    onBusyChange={(active) =>
+                      setBusy(active ? "profiles" : null)
+                    }
+                    onApplied={async (_result, preview) => {
+                      for (const entry of preview.entries)
+                        rememberModelUse(
+                          entry.agentId,
+                          entry.providerId,
+                          entry.model,
+                        );
+                      setProbe(null);
+                      setWorkBuddyDefault(null);
+                      setNotice({
+                        tone: "info",
+                        message:
+                          "配置方案已应用，请让相关客户端重新加载配置并重新验证。",
+                      });
+                      await client.invalidateQueries({
+                        queryKey: ["agent-hub"],
+                      });
+                      await client.invalidateQueries({
+                        queryKey: ["agent-runtime"],
+                      });
+                      await client.invalidateQueries({
+                        queryKey: ["agent-configuration-safety"],
+                      });
+                    }}
+                  />
+                )}
+              </details>
+            </details>
           </section>
           <footer className="hub-footer">
             <span>AE Switch v{APP_VERSION}</span>

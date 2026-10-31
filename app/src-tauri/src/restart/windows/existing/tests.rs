@@ -374,17 +374,25 @@ fn existing_restart_waits_for_normal_exit_and_reopens_same_owned_profile_without
     fs::write(fixture._owner.path().join("exit-old"), "normal exit").unwrap();
     let completed = fixture.wait_completed();
     assert!(completed.pending_message.unwrap().contains("新进程"));
-    assert!(completed
-        .candidates
-        .iter()
-        .any(|candidate| candidate.can_restart));
-    // Restart completion proves that the new process was spawned. Its fixture
-    // counter is written during PowerShell startup, which may finish later.
+    // runtime() scans processes before reading the pending state. The reopen
+    // thread can finish between those operations, so the completion flag and
+    // its candidate snapshot need not describe the same instant. Wait for a
+    // fresh eligible replacement PID and the fixture's own startup signal.
     let ready_deadline = Instant::now() + Duration::from_secs(10);
-    while !fs::read_to_string(fixture._owner.path().join("counter.txt"))
-        .is_ok_and(|count| count == "2")
-        && Instant::now() < ready_deadline
-    {
+    loop {
+        let current = runtime(&fixture.context);
+        let replacement_ready = current.candidates.iter().any(|candidate| {
+            candidate.process_id != fixture.child.as_ref().unwrap().id() && candidate.can_restart
+        });
+        let startup_ready = fs::read_to_string(fixture._owner.path().join("counter.txt"))
+            .is_ok_and(|count| count == "2");
+        if replacement_ready && startup_ready {
+            break;
+        }
+        assert!(
+            Instant::now() < ready_deadline,
+            "the reopened owned profile did not become eligible and finish startup"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
     assert_eq!(

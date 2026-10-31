@@ -43,6 +43,8 @@ describe("浏览器预览边界", () => {
       () => agentApi.discoverDirectory("zcode", "G:/tools/ZCode"),
       () => agentApi.pickDirectory(),
       () => agentApi.runtime("codex"),
+      () => agentApi.activity("codex"),
+      () => agentApi.clearActivity("codex"),
       () =>
         agentApi.restart({
           agentId: "codex",

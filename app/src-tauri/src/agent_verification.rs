@@ -330,6 +330,20 @@ fn verification_prompt(agent: AgentId, relative_artifact: &str, marker: &str) ->
     let mut prompt = format!(
         "Only operate on the verification file {relative_artifact} inside the already-created owned verification directory. Do not read or change any other files. {creation} Then use your file read tool to read that same file back. Your final answer must be exactly the content returned by the read tool. Do not use network tools or delegate work."
     );
+    if cfg!(windows) && agent == AgentId::Codex {
+        // Keep the Windows CLI read in an independently observable text-read
+        // operation. Byte arrays, aliases and a remembered marker are not proof
+        // of a successful read of the requested file.
+        prompt.push_str(
+            " For Windows Codex, after the creation tool finishes, perform a separate shell tool call that reads only the exact same verification file. Use Get-Content -LiteralPath with that exact path and -Raw, or [System.IO.File]::ReadAllText with that exact path. Spell the read operation out; do not use gc, byte-array reads, encoded commands, or an echo/Write-Output of the expected marker. Do not combine the write and read in one tool call. The successful separate read result must itself contain the file contents; use that returned content for your final answer.",
+        );
+    }
+    if agent == AgentId::Hermes {
+        prompt.push_str(&format!(
+            " For Hermes, call write_file on that exact path with content equal to only the {length} ASCII characters {marker}. The content argument must contain no leading or trailing whitespace, no LF or CR, no UTF-8 BOM and no literal quote characters. Do not use a patch or shell echo that adds a final newline. After write_file succeeds, make a separate read_file call for that same path and use its returned file content for your answer, without the read tool's line-number prefix. The verifier compares the file bytes exactly and does not trim or normalize them.",
+            length = marker.len(),
+        ));
+    }
     if agent == AgentId::OhMyPi {
         prompt.push_str(
             " For oh-my-pi, the path above is the exact absolute target path. Use that path unchanged as the path argument for both write and read. Do not abbreviate it, guess an 8.3 short name, change any directory component, or change directories. Its parent directory already exists. Create only that exact file, then read the same exact absolute path.",
@@ -1223,18 +1237,72 @@ fn operations(value: &Value) -> (bool, bool) {
         .iter()
         .any(|operation| text.contains(operation))
         || ((text.contains("cat ") || text.contains("printf ")) && text.contains('>'));
-    let read = matches!(name.as_str(), "read" | "read_file")
-        || [
-            "get-content",
-            "readalltext",
-            "read_text",
-            "readfile",
-            "cat ",
-            "type ",
-        ]
-        .iter()
-        .any(|operation| text.contains(operation));
+    let read = matches!(name.as_str(), "read" | "read_file") || shell_read_target(&text).is_some();
     (write, read)
+}
+
+#[path = "agent_verification/shell_read.rs"]
+mod shell_read;
+use shell_read::target as shell_read_target;
+
+fn read_targets(value: &Value, filename: &str) -> bool {
+    let name = tool_name(value).to_ascii_lowercase();
+    if matches!(name.as_str(), "read" | "read_file") {
+        return ["input", "arguments", "args", "state"]
+            .into_iter()
+            .flat_map(|key| {
+                let args = if key == "state" {
+                    &value[key]["input"]
+                } else {
+                    &value[key]
+                };
+                ["path", "filePath", "file_path"]
+                    .into_iter()
+                    .filter_map(move |field| args[field].as_str())
+            })
+            .any(|path| same_verification_path(path, filename));
+    }
+    ["command", "cmd"]
+        .into_iter()
+        .find_map(|key| {
+            value[key]
+                .as_str()
+                .or_else(|| value["input"][key].as_str())
+                .or_else(|| value["arguments"][key].as_str())
+                .or_else(|| value["args"][key].as_str())
+        })
+        .and_then(shell_read_target)
+        .is_some_and(|path| same_verification_path(&path, filename))
+}
+
+fn same_verification_path(path: &str, filename: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    let expected = filename.replace('\\', "/");
+    let actual = std::path::Path::new(&normalized);
+    if actual
+        .components()
+        .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    if expected.contains('/') {
+        if cfg!(windows) {
+            normalized.eq_ignore_ascii_case(&expected)
+        } else {
+            normalized == expected
+        }
+    } else {
+        actual
+            .file_name()
+            .and_then(|part| part.to_str())
+            .is_some_and(|name| {
+                if cfg!(windows) {
+                    name.eq_ignore_ascii_case(&expected)
+                } else {
+                    name == expected
+                }
+            })
+    }
 }
 
 fn returned_marker(value: &Value, marker: &str) -> bool {
@@ -1244,6 +1312,13 @@ fn returned_marker(value: &Value, marker: &str) -> bool {
         || value["result"]["success"] == false
         || !value["error"].is_null()
         || !value["state"]["error"].is_null()
+        // A completed shell item can still report a nonzero exit code while
+        // stdout contains the expected marker. Such output is not a successful
+        // readback, even when the outer CLI exits successfully afterwards.
+        || [value, &value["state"], &value["result"]]
+            .into_iter()
+            .flat_map(|scope| [&scope["exit_code"], &scope["exitCode"]])
+            .any(|code| !code.is_null() && code.as_i64() != Some(0))
         || [
             &value["status"],
             &value["state"]["status"],
@@ -1262,6 +1337,11 @@ fn returned_marker(value: &Value, marker: &str) -> bool {
                     | "incomplete"
                     | "aborted"
                     | "denied"
+                    | "in_progress"
+                    | "running"
+                    | "pending"
+                    | "scheduled"
+                    | "started"
             )
         })
     {
@@ -1306,9 +1386,7 @@ fn hermes_named_readback(observed: &[&Value], filename: &str, marker: &str) -> b
         if value["type"] == "tool_use" {
             pending.entry(name).or_default().push((
                 tool_id(value),
-                value["input"].is_object()
-                    && value["input"].to_string().contains(filename)
-                    && operations(value).1,
+                value["input"].is_object() && read_targets(value, filename) && operations(value).1,
             ));
         } else if value["type"] == "tool_result" {
             let Some(calls) = pending.get_mut(name) else {
@@ -1497,7 +1575,7 @@ fn tool_evidence(agent: AgentId, events: &[Value], filename: &str, marker: &str)
         .collect();
     let read_ids: Vec<_> = related
         .iter()
-        .filter(|item| operations(item).1)
+        .filter(|item| read_targets(item, filename))
         .filter_map(|item| tool_id(item))
         .collect();
     Evidence {
@@ -1535,7 +1613,7 @@ fn tool_evidence(agent: AgentId, events: &[Value], filename: &str, marker: &str)
             })
             .collect(),
         write_observed: related.iter().any(|item| operations(item).0),
-        read_observed: related.iter().any(|item| operations(item).1),
+        read_observed: observed.iter().any(|item| read_targets(item, filename)),
         readback_marker_observed: observed.iter().any(|item| {
             if agent == AgentId::Hermes && item["type"] == "tool_result" && tool_id(item).is_none()
             {
@@ -1543,7 +1621,7 @@ fn tool_evidence(agent: AgentId, events: &[Value], filename: &str, marker: &str)
                 // check even when output happens to repeat the filename.
                 return false;
             }
-            let related_read = (item.to_string().contains(filename) && operations(item).1)
+            let related_read = read_targets(item, filename)
                 || tool_id(item).is_some_and(|id| read_ids.contains(&id));
             related_read && returned_marker(item, marker)
         }) || (agent == AgentId::Hermes
@@ -2300,6 +2378,176 @@ exit 0
     }
 
     #[test]
+    fn codex_explicit_windows_text_reads_retain_all_independent_gates() {
+        let prompt = verification_prompt(AgentId::Codex, "owned.txt", "MARKER");
+        assert_eq!(prompt.contains("For Windows Codex"), cfg!(windows));
+        if cfg!(windows) {
+            assert!(prompt.contains("Get-Content -LiteralPath"));
+            assert!(prompt.contains("-Raw"));
+            assert!(prompt.contains("[System.IO.File]::ReadAllText"));
+            assert!(prompt.contains("Do not combine the write and read in one tool call"));
+        }
+        for read in [
+            "Get-Content -LiteralPath 'owned.txt' -Raw",
+            "[System.IO.File]::ReadAllText('owned.txt')",
+        ] {
+            let mut events = codex_readalltext_fixture();
+            for index in [2, 3] {
+                events[index]["item"]["command"] = json!(read);
+            }
+            let mut evidence = tool_evidence(AgentId::Codex, &events, "owned.txt", "MARKER");
+            assert!(evidence.write_observed && evidence.read_observed);
+            assert!(evidence.readback_marker_observed);
+            evidence.file_matches_marker = true;
+            assert!(
+                !evidence.verified(true),
+                "a read cannot replace the assistant reply"
+            );
+            evidence.assistant_marker_observed =
+                assistant_marker(AgentId::Codex, &events, "MARKER");
+            assert!(evidence.verified(true));
+            assert!(!evidence.verified(false));
+            evidence.file_matches_marker = false;
+            assert!(!evidence.verified(true));
+
+            // A started read can identify its ID; a commandless completion
+            // still has to return the marker on that same successful item.
+            events[3]["item"]["command"] = Value::Null;
+            assert!(
+                tool_evidence(AgentId::Codex, &events, "owned.txt", "MARKER")
+                    .readback_marker_observed
+            );
+            events[3]["item"]["id"] = json!("unrelated-read");
+            assert!(
+                !tool_evidence(AgentId::Codex, &events, "owned.txt", "MARKER")
+                    .readback_marker_observed
+            );
+        }
+    }
+
+    #[test]
+    fn completed_codex_read_with_failure_exit_code_cannot_pass_even_with_exact_file_and_reply() {
+        for code in [json!(1), json!(-1), json!(127), json!("0"), json!(false)] {
+            let mut events = codex_readalltext_fixture();
+            events[3]["item"]["exit_code"] = code;
+            let mut evidence = tool_evidence(AgentId::Codex, &events, "owned.txt", "MARKER");
+            evidence.assistant_marker_observed =
+                assistant_marker(AgentId::Codex, &events, "MARKER");
+            evidence.file_matches_marker = true;
+            assert!(evidence.write_observed && evidence.read_observed);
+            assert!(!evidence.readback_marker_observed);
+            assert!(
+                !evidence.verified(true),
+                "outer process success cannot repair a failed read"
+            );
+        }
+    }
+
+    #[test]
+    fn started_codex_read_cannot_establish_readback_even_when_output_contains_the_marker() {
+        let mut events = codex_readalltext_fixture();
+        events[2]["item"]["aggregated_output"] = json!("MARKER\n");
+        let started_only = tool_evidence(AgentId::Codex, &events[..3], "owned.txt", "MARKER");
+        assert!(started_only.write_observed && started_only.read_observed);
+        assert!(!started_only.readback_marker_observed);
+        // A null exit code from item.started is not a failure once a later,
+        // correlated item.completed reports exit 0 and actual read output.
+        assert!(
+            tool_evidence(AgentId::Codex, &events, "owned.txt", "MARKER").readback_marker_observed
+        );
+        events[3]["item"]["status"] = json!("in_progress");
+        assert!(
+            !tool_evidence(AgentId::Codex, &events, "owned.txt", "MARKER").readback_marker_observed
+        );
+    }
+
+    #[test]
+    fn tool_result_exit_failures_and_nonterminal_statuses_never_establish_readback() {
+        for scope in ["top", "state", "result"] {
+            for key in ["exit_code", "exitCode"] {
+                let mut result = json!({"type":"tool_result","tool_use_id":"read-1","output":"MARKER","status":"completed"});
+                if scope == "top" {
+                    result[key] = json!(3);
+                } else {
+                    result[scope] = json!({key: 3});
+                }
+                let events = vec![fixture()[1].clone(), result];
+                assert!(
+                    !tool_evidence(AgentId::ClaudeCode, &events, "owned.txt", "MARKER")
+                        .readback_marker_observed
+                );
+            }
+        }
+        for status in ["in_progress", "running", "pending", "scheduled", "started"] {
+            let events = vec![
+                fixture()[1].clone(),
+                json!({"type":"tool_result","tool_use_id":"read-1","output":"MARKER","status":status}),
+            ];
+            assert!(
+                !tool_evidence(AgentId::ClaudeCode, &events, "owned.txt", "MARKER")
+                    .readback_marker_observed
+            );
+        }
+        // Preserve the existing status-less native Read result contract.
+        assert!(
+            tool_evidence(AgentId::ClaudeCode, &fixture(), "owned.txt", "MARKER")
+                .readback_marker_observed
+        );
+    }
+
+    #[test]
+    fn unqualified_read_alias_and_byte_output_do_not_become_supported_text_readback() {
+        for command in [
+            "gc 'owned.txt' -Raw",
+            "[System.IO.File]::ReadAllBytes('owned.txt')",
+            "Write-Output 'owned.txt MARKER'",
+        ] {
+            let events = vec![json!({"type":"item.completed","item":{
+                "id":"unqualified","type":"command_execution","status":"completed","exit_code":0,
+                "command":command,"aggregated_output":"MARKER\n"
+            }})];
+            let evidence = tool_evidence(AgentId::Codex, &events, "owned.txt", "MARKER");
+            assert!(!evidence.read_observed && !evidence.readback_marker_observed);
+        }
+    }
+
+    #[test]
+    fn quoted_read_tokens_echo_comments_and_wrong_read_operands_never_verify() {
+        for command in [
+            "powershell.exe -Command \"Write-Output 'Get-Content owned.txt MARKER'\"",
+            "Write-Output '[IO.File]::ReadAllText(owned.txt) MARKER'",
+            "echo 'cat owned.txt MARKER'",
+            "# Get-Content owned.txt",
+            "Get-Content other.txt # owned.txt MARKER",
+            "Get-Content -LiteralPath 'other.txt' -Raw; Write-Output 'owned.txt MARKER'",
+            "[IO.File]::ReadAllText('other.txt'); Write-Output 'owned.txt MARKER'",
+        ] {
+            let mut events = codex_readalltext_fixture();
+            for index in [2, 3] {
+                events[index]["item"]["command"] = json!(command);
+            }
+            events[3]["item"]["aggregated_output"] = json!("owned.txt Get-Content MARKER");
+            let mut evidence = tool_evidence(AgentId::Codex, &events, "owned.txt", "MARKER");
+            evidence.assistant_marker_observed = true;
+            evidence.file_matches_marker = true;
+            assert!(
+                !evidence.read_observed
+                    && !evidence.readback_marker_observed
+                    && !evidence.verified(true),
+                "{command}"
+            );
+        }
+        // Structured tools must identify their operand, not merely echo the
+        // expected filename somewhere in an unrelated result or argument.
+        let events = vec![
+            json!({"type":"tool_use","id":"r","name":"read","input":{"path":"other.txt","note":"owned.txt"}}),
+            json!({"type":"tool_result","tool_use_id":"r","content":"owned.txt MARKER"}),
+        ];
+        let evidence = tool_evidence(AgentId::ClaudeCode, &events, "owned.txt", "MARKER");
+        assert!(!evidence.read_observed && !evidence.readback_marker_observed);
+    }
+
+    #[test]
     fn official_user_wrapped_tool_results_are_correlated_without_accepting_user_text() {
         // Official WorkBuddy/Claude stream JSON wraps a function result as a
         // user message containing a tool_result block, not a top-level event.
@@ -2365,6 +2613,50 @@ exit 0
             !tool_evidence(AgentId::Hermes, &unrelated, "owned.txt", "MARKER")
                 .readback_marker_observed
         );
+    }
+
+    #[test]
+    fn hermes_exact_write_guidance_keeps_bom_and_newline_rejection_with_successful_tool_events() {
+        let marker = "MARKER";
+        let prompt = verification_prompt(AgentId::Hermes, "owned.txt", marker);
+        assert!(prompt.contains("write_file"));
+        assert!(prompt.contains("only the 6 ASCII characters MARKER"));
+        assert!(prompt.contains("no LF or CR, no UTF-8 BOM"));
+        assert!(prompt.contains("separate read_file call"));
+        assert!(prompt.contains("does not trim or normalize"));
+        let events = vec![
+            json!({"type":"tool_use","name":"write_file","input":{"path":"owned.txt","content":marker}}),
+            json!({"type":"tool_result","name":"write_file","output":"{\"success\":true}","is_error":false}),
+            json!({"type":"tool_use","name":"read_file","input":{"path":"owned.txt"}}),
+            json!({"type":"tool_result","name":"read_file","output":"{\"content\":\"1: MARKER\",\"total_lines\":1}","is_error":false}),
+            json!({"type":"result","error":null,"exit_code":0,"text":marker}),
+        ];
+        let mut evidence = tool_evidence(AgentId::Hermes, &events, "owned.txt", marker);
+        evidence.assistant_marker_observed = assistant_marker(AgentId::Hermes, &events, marker);
+        assert!(
+            evidence.write_observed
+                && evidence.read_observed
+                && evidence.readback_marker_observed
+                && evidence.assistant_marker_observed
+        );
+        let directory = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+        let file = directory.path().join("owned.txt");
+        for bytes in [
+            b"MARKER".as_slice(),
+            b"MARKER\n",
+            b"MARKER\r\n",
+            b"\xef\xbb\xbfMARKER",
+            b"MARKER ",
+            b" MARKER",
+        ] {
+            fs::write(&file, bytes).unwrap();
+            evidence.file_matches_marker = exact_owned_contents(
+                directory.path(),
+                &file,
+                &verification_contents(AgentId::Hermes, marker),
+            );
+            assert_eq!(evidence.verified(true), bytes == b"MARKER", "{bytes:?}");
+        }
     }
 
     #[test]
@@ -3137,7 +3429,7 @@ exit 0
 
     #[test]
     fn zcode_terminal_failure_diagnostics_keep_only_safe_error_fields() {
-        let events = vec![
+        let events = [
             json!({"type":"turn.failed","payload":{"error":{
                 "code":"provider_rejected", "message":"401 credential-secret at HTTPS://private-user:private-password@example.invalid/path?token=url-secret",
                 "stack":"PRIVATE_STACK", "detail":"PRIVATE_DETAIL",

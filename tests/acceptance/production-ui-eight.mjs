@@ -35,6 +35,56 @@ const secrets = new Set();
 const sha = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const same = (a, b) =>
   path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
+
+async function explicitlySelectOwnedProfile(field, expectedProfile) {
+  const values = await field
+    .locator("option")
+    .evaluateAll((options) => options.map((option) => option.value));
+  const candidates = values.flatMap((value) => {
+    if (!value) return [];
+    try {
+      const profile = JSON.parse(value);
+      return profile && typeof profile === "object" && !Array.isArray(profile)
+        ? [{ value, profile }]
+        : [];
+    } catch {
+      return [];
+    }
+  });
+  const matches = candidates.filter(({ profile }) => {
+    try {
+      assert.deepEqual(profile, expectedProfile);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+  assert.equal(
+    matches.length,
+    1,
+    "The exact prepared owned profile must appear once among discovered options",
+  );
+  const before = await field.inputValue();
+  let previousSelection = "empty";
+  if (before) {
+    const previous = candidates.find((candidate) => candidate.value === before);
+    assert(
+      previous,
+      "A retained profile selection must still be one of the current discovered options",
+    );
+    previousSelection =
+      before === matches[0].value ? "owned" : "another-discovered-profile";
+  }
+  // Surface verification may already have selected this profile. This workflow
+  // still makes an explicit real UI selection of its exact owned target.
+  await field.selectOption(matches[0].value);
+  assert.deepEqual(JSON.parse(await field.inputValue()), expectedProfile);
+  return {
+    explicitOwnedProfileSelected: true,
+    previousSelection,
+    candidateCount: candidates.length,
+  };
+}
 function safe(value) {
   if (typeof value === "string") {
     for (const key of secrets)
@@ -138,7 +188,7 @@ const key = credentialLines
   .filter((value) => value !== undefined)
   .at(-1);
 const endpoint = credentialLines
-  .map((line) => line.match(/^端点[:：](.*)$/u)?.[1]?.trim())
+  .map((line) => line.match(/^(?:端点|endpoint)[:：](.*)$/u)?.[1]?.trim())
   .filter((value) => value !== undefined)
   .at(-1);
 assert.ok(key && endpoint);
@@ -452,28 +502,37 @@ try {
   );
   report.discovery = discovered;
   const profiles = {};
+  const requiresExplicitProfile = {};
   for (const id of AGENTS) {
     const clients = discovered.clients.filter(
       (client) => client.agentId === id,
     );
+    const expected = setup.fixtures.payload.discoveredProfiles[id];
+    const matches = clients
+      .flatMap((client) =>
+        client.profiles.map((profile) => ({ client, profile })),
+      )
+      .filter(({ profile }) =>
+        Object.keys({ ...expected, ...profile }).every(
+          (key) => profile[key] === expected[key],
+        ),
+      );
     assert.equal(
-      clients.length,
+      matches.length,
       1,
-      id + ": exact ordinary-discovered official installation required",
+      id +
+        ": exactly one ordinary-discovered owned profile must match the prepared fixture",
     );
-    assert.equal(
-      clients[0].profiles.length,
-      1,
-      id + ": unique ordinary-discovered existing profile required",
-    );
-    const profile = clients[0].profiles[0];
+    const { client, profile } = matches[0];
+    requiresExplicitProfile[id] =
+      clients.flatMap((item) => item.profiles).length > 1;
     assertPreparedProfilePaths({ workspace, setup, id, profile, guard });
     assert.deepEqual(
       profile,
       setup.fixtures.payload.discoveredProfiles[id],
       id + ": ordinary discovery must match actual installed profile",
     );
-    assert.ok(same(clients[0].executablePath, profile.executablePath));
+    assert.ok(same(client.executablePath, profile.executablePath));
     profiles[id] = profile;
   }
   const hub = await readonlyNative("agent_hub_overview");
@@ -568,20 +627,31 @@ try {
       await page.waitForFunction(
         () => {
           const field = document.getElementById("hub-installed-profile");
-          return field && !field.disabled && !!field.value;
+          return field && !field.disabled;
         },
         null,
         { timeout: 30000 },
       );
+      if (requiresExplicitProfile[id]) {
+        const selected = await explicitlySelectOwnedProfile(
+          page.locator("#hub-installed-profile"),
+          profiles[id],
+        );
+        outcome.explicitOwnedProfileSelected =
+          selected.explicitOwnedProfileSelected;
+        outcome.explicitProfilePreviousSelection = selected.previousSelection;
+        outcome.explicitProfileCandidateCount = selected.candidateCount;
+      }
       assert.deepEqual(
         JSON.parse(await page.locator("#hub-installed-profile").inputValue()),
         profiles[id],
       );
-      assert.equal(
-        await page.locator(".hub-profile-settings").getAttribute("open"),
-        null,
-        "A unique ready profile must remain collapsed and auto-selected",
-      );
+      if (!requiresExplicitProfile[id])
+        assert.equal(
+          await page.locator(".hub-profile-settings").getAttribute("open"),
+          null,
+          "A unique ready profile must remain collapsed and auto-selected",
+        );
       assert.equal(
         await page.getByRole("button", { name: "仅保存", exact: true }).count(),
         0,
@@ -592,16 +662,25 @@ try {
         await page.locator("#hub-api-key").fill(key);
       }
       outcome.discovery = await freshUiDiscovery();
-      model ??=
-        process.env.AE_PRODUCTION_UI_MODEL ??
-        (outcome.discovery.models.includes("claude-opus-4-6")
-          ? "claude-opus-4-6"
-          : outcome.discovery.models[0]);
+      model ??= process.env.AE_PRODUCTION_UI_MODEL;
+      assert.ok(
+        model,
+        "The current-session model must be explicitly supplied; no automatic model fallback is allowed",
+      );
       assert.ok(
         outcome.discovery.models.includes(model),
         "Selected model must appear in the real supplier UI response",
       );
       await page.locator("#hub-model").selectOption(model);
+      assert.ok(
+        process.env.AE_PRODUCTION_UI_EFFORT,
+        "The current-session reasoning effort must be explicitly supplied",
+      );
+      await page
+        .locator(
+          `input[name="hub-reasoning"][value="${process.env.AE_PRODUCTION_UI_EFFORT}"]`,
+        )
+        .check();
       assert.equal(
         await page.locator(".hub-probe-status.passed").count(),
         0,
@@ -755,6 +834,11 @@ try {
       try {
         retest.receipt = await independentNativeProbe(expected);
         retest.probe = retest.receipt.result;
+        // A rejected upstream connection never starts the official CLI or its
+        // verification directory. Preserve that primary failure instead of
+        // replacing it with the directory observer's secondary assertion.
+        if (retest.probe.stage === "connection")
+          assertProbe(retest.probe, id, model);
         retest.toolWorkspaceObservation = retestWorkspace.finish();
       } finally {
         retestWorkspace.close();

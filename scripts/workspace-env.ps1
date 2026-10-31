@@ -12,6 +12,7 @@ $env:LOCALAPPDATA = Join-Path $taskCache 'localappdata'
 $env:PSModuleAnalysisCachePath = Join-Path $env:LOCALAPPDATA ('PowerShell/ModuleAnalysisCache-' + $PSVersionTable.PSVersion.Major)
 $env:TEMP = Join-Path $taskCache 'tmp'
 $env:TMP = $env:TEMP
+$env:TMPDIR = $env:TEMP
 $env:XDG_CONFIG_HOME = Join-Path $taskCache 'config'
 $env:XDG_DATA_HOME = Join-Path $taskCache 'data'
 $env:XDG_CACHE_HOME = $taskCache
@@ -44,3 +45,6 @@ if (Test-Path -LiteralPath (Join-Path $taskLlvm 'clang.exe')) {
     $env:CARGO_ENCODED_RUSTFLAGS = '-L' + [char]31 + ('native=' + $taskRustNative)
 }
 $env:RTK_TEE_DIR = Join-Path $taskCache 'rtk\tee'
+$env:RTK_DB_PATH = Join-Path $taskCache 'rtk\history.db'
+$env:RTK_AUDIT_DIR = Join-Path $taskCache 'rtk\audit'
+$env:NODE_COMPILE_CACHE = Join-Path $taskCache 'node-compile-cache'

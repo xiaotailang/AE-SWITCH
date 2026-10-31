@@ -11,6 +11,7 @@ pub(super) struct Document {
 
 struct Node {
     start: usize,
+    key_start: usize,
     end: usize,
     value: Value,
     children: Vec<(String, Node)>,
@@ -133,16 +134,39 @@ impl Document {
             return Ok(());
         }
         if let (Some(old), Some(new)) = (node.value.as_object(), next.as_object()) {
-            if old.keys().any(|key| !new.contains_key(key)) {
-                return Err(native_merge::invalid(path));
-            }
-            for (key, child) in &node.children {
-                self.changes(child, &new[key], newline, edits, path)?;
-            }
             let added: Vec<_> = new
                 .iter()
                 .filter(|(key, _)| !old.contains_key(*key))
                 .collect();
+            for (key, child) in &node.children {
+                if let Some(value) = new.get(key) {
+                    self.changes(child, value, newline, edits, path)?;
+                } else {
+                    let mut end = child.end;
+                    whitespace(&self.comments_removed, &mut end);
+                    if self.comments_removed.get(end) == Some(&b',') {
+                        end += 1;
+                    }
+                    edits.push((child.key_start, end, String::new()));
+                }
+            }
+            // A strict JSON client must not acquire a trailing comma when its
+            // final property is removed. Keep all untouched comments in place.
+            if let Some((last_key, last_child)) = node
+                .children
+                .iter()
+                .rev()
+                .find(|(key, _)| new.contains_key(key))
+            {
+                if added.is_empty() && node.children.last().is_some_and(|(key, _)| key != last_key)
+                {
+                    let mut comma = last_child.end;
+                    whitespace(&self.comments_removed, &mut comma);
+                    if self.comments_removed.get(comma) == Some(&b',') {
+                        edits.push((comma, comma + 1, String::new()));
+                    }
+                }
+            }
             if !added.is_empty() {
                 let line_start = self.source[..node.start]
                     .rfind('\n')
@@ -153,7 +177,12 @@ impl Document {
                     .take_while(|ch| *ch == ' ' || *ch == '\t')
                     .collect::<String>();
                 let mut insertion = String::new();
-                if let Some((_, last)) = node.children.last() {
+                if let Some((_, last)) = node
+                    .children
+                    .iter()
+                    .rev()
+                    .find(|(key, _)| new.contains_key(key))
+                {
                     let trailing_comma =
                         self.comments_removed[last.end..node.end - 1].contains(&b',');
                     if !trailing_comma {
@@ -228,7 +257,8 @@ fn parse_node(source: &[u8], cursor: &mut usize, path: &Path) -> Result<Node> {
                 *cursor = key_end;
                 whitespace(source, cursor);
                 *cursor += 1;
-                let child = parse_node(source, cursor, path)?;
+                let mut child = parse_node(source, cursor, path)?;
+                child.key_start = key_start;
                 children.push((key, child));
                 whitespace(source, cursor);
                 if source.get(*cursor) == Some(&b',') {
@@ -264,6 +294,7 @@ fn parse_node(source: &[u8], cursor: &mut usize, path: &Path) -> Result<Node> {
         serde_json::from_slice(&source[start..*cursor]).map_err(|_| native_merge::invalid(path))?;
     Ok(Node {
         start,
+        key_start: start,
         end: *cursor,
         value,
         children,

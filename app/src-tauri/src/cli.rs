@@ -122,6 +122,9 @@ async fn run(directory: std::path::PathBuf) -> Result<()> {
     let command = arguments.first().map(String::as_str).unwrap_or("help");
     if command == "help" || command == "--help" {
         println!("AE Switch Rust kernel\nserve\noverview\ndetect-agents\ndetect-agent-directory <agent-id> <installation-directory>\ndiscover <credentials-file>\nsave-provider (ProviderInput JSON on stdin)\nconfigure <agent-id> <provider-id> [model] (one detected existing profile required)\nconfigure-all <provider-id> [model] (detected clients only)\nconfigure-profile (AgentInput JSON with profile on stdin)\nprobe <agent-id> <provider-id> [model] (one detected existing profile required)\nprobe-profile (AgentInput JSON with profile on stdin)\nAE data remains in the portable directory. Client configuration is written only to the selected existing profile. Client programs are not bundled.");
+        println!("activity <agent-id> (read the running gateway without changing configuration)");
+        println!("configuration-safety <agent-id>\npreview-disconnect <agent-id>\ndisconnect-agent (agentId and previewToken JSON on stdin)");
+        println!("list-config-profiles\nsave-config-profile (SaveProfileInput JSON on stdin)\npreview-config-profile <id>\napply-config-profile (id/revision/fingerprint JSON on stdin)\ndelete-config-profile <id> <revision>");
         return Ok(());
     }
     if command == "detect-agents" {
@@ -141,7 +144,57 @@ async fn run(directory: std::path::PathBuf) -> Result<()> {
             .map_err(|_| AppError::new("serialization", "无法读取安装目录识别结果"))?,
         );
     }
+    if command == "activity" {
+        let id = agent(&argument(&arguments, 1, "agent-id")?)?;
+        return print(
+            serde_json::to_value(bridge::activity::read_saved_activity(&directory, id).await?)
+                .map_err(|_| AppError::new("serialization", "无法读取请求活动"))?,
+        );
+    }
     let mut store = Store::open(directory.clone())?;
+    if command == "list-config-profiles" {
+        return print(
+            serde_json::to_value(uni_switch_lib::config_profiles::list(&directory)?)
+                .map_err(|_| AppError::new("serialization", "无法读取配置方案"))?,
+        );
+    }
+    if command == "save-config-profile" {
+        let input: uni_switch_lib::config_profiles::SaveProfileInput =
+            json_input(std::io::stdin().lock())?;
+        return print(
+            serde_json::to_value(uni_switch_lib::config_profiles::save(&store, input)?)
+                .map_err(|_| AppError::new("serialization", "无法保存配置方案"))?,
+        );
+    }
+    if command == "delete-config-profile" {
+        let id = argument(&arguments, 1, "profile-id")?;
+        let revision = argument(&arguments, 2, "revision")?
+            .parse::<u64>()
+            .map_err(|_| AppError::new("arguments", "方案版本必须是正整数"))?;
+        uni_switch_lib::config_profiles::delete(&directory, &id, revision)?;
+        return print(json!({"deleted":true}));
+    }
+    if matches!(command, "configuration-safety" | "preview-disconnect") {
+        let id = agent(&argument(&arguments, 1, "agent-id")?)?;
+        return print(
+            serde_json::to_value(agent_hub::configuration_safety(&store, id)?)
+                .map_err(|_| AppError::new("serialization", "无法读取配置保护状态"))?,
+        );
+    }
+    if command == "disconnect-agent" {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct DisconnectInput {
+            agent_id: AgentId,
+            preview_token: String,
+        }
+        let input: DisconnectInput = json_input(std::io::stdin().lock())?;
+        return print(agent_hub::disconnect(
+            &store,
+            input.agent_id,
+            &input.preview_token,
+        )?);
+    }
     if command == "apply-workbuddy-default" {
         let (context, model) = agent_hub::workbuddy_default_context(&store)?;
         return print(
@@ -154,6 +207,21 @@ async fn run(directory: std::path::PathBuf) -> Result<()> {
     let (route, listener) = Route::start(&directory)?;
     store.set_bridge_route(route.clone());
     match command {
+        "preview-config-profile" => print(
+            serde_json::to_value(uni_switch_lib::config_profiles::preview(
+                &store,
+                &argument(&arguments, 1, "profile-id")?,
+            )?)
+            .map_err(|_| AppError::new("serialization", "无法预览配置方案"))?,
+        ),
+        "apply-config-profile" => {
+            let input: uni_switch_lib::config_profiles::ApplyProfileInput =
+                json_input(std::io::stdin().lock())?;
+            print(
+                serde_json::to_value(uni_switch_lib::config_profiles::apply(&store, input)?)
+                    .map_err(|_| AppError::new("serialization", "无法应用配置方案"))?,
+            )
+        }
         "overview" => print(
             json!({"hub":agent_hub::overview(&store)?,"providers":store.overview()?.providers}),
         ),

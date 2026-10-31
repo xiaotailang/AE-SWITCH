@@ -246,6 +246,20 @@ function Initialize-E2eInstalledClientFixtures {
         $runtimes[$id] = $file
         $shared[$file] = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
     }
+    $ompCliEntry = $null
+    if ([IO.Path]::GetFileName($runtimes.oh_my_pi) -ieq 'bun.exe') {
+        # Official npm installations expose Bun as the host. Dispatch the
+        # package's real bin entry; running bare Bun would never start OMP.
+        $ompNodeModules = $runtimes.oh_my_pi
+        for ($parentIndex = 0; $parentIndex -lt 4; $parentIndex++) { $ompNodeModules = Split-Path -Parent $ompNodeModules }
+        if ((Split-Path -Leaf $ompNodeModules) -cne 'node_modules') { throw 'The official OMP Bun host must reside in its ordinary node_modules package layout.' }
+        $ompPackageFile = Assert-E2eLocalPath (Join-Path $ompNodeModules '@oh-my-pi/pi-coding-agent/package.json')
+        $ompCliEntry = Assert-E2eLocalPath (Join-Path $ompNodeModules '@oh-my-pi/pi-coding-agent/dist/cli.js')
+        if (-not (Test-Path -LiteralPath $ompPackageFile -PathType Leaf) -or -not (Test-Path -LiteralPath $ompCliEntry -PathType Leaf)) { throw 'The official OMP package bin entry is missing.' }
+        try { $ompPackage = [IO.File]::ReadAllText($ompPackageFile, [Text.Encoding]::UTF8) | ConvertFrom-Json } catch { throw 'Invalid official OMP package metadata.' }
+        if ($ompPackage.name -cne '@oh-my-pi/pi-coding-agent' -or $ompPackage.bin.omp -cne 'dist/cli.js') { throw 'The official OMP package must declare its exact CLI bin entry.' }
+        foreach ($file in @($ompPackageFile, $ompCliEntry)) { $shared[$file] = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant() }
+    }
     foreach ($relative in @('.tools/git/bin/bash.exe', '.tools/git/usr/bin/bash.exe', '.tools/git/cmd/git.exe', '.tools/git/bin/git.exe', '.tools/git/mingw64/bin/git.exe', '.tools/pwsh/pwsh.exe', '.tools/agents/codex/node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/codex-path/rg.exe')) {
         $file = Assert-E2eLocalPath (Join-Path $e2eWorkspace $relative)
         if (Test-Path -LiteralPath $file -PathType Leaf) { $shared[$file] = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant() }
@@ -323,6 +337,8 @@ function Initialize-E2eInstalledClientFixtures {
             $lines.Add('& ' + $literalRuntime + " '" + $entries[$id].Replace("'", "''") + "' @args")
         } elseif ($id -in @('zcode', 'deepseek_harness')) {
             $lines.Add('& ' + $literalRuntime + " '" + $entries[$id].Replace("'", "''") + "' @args")
+        } elseif ($id -eq 'oh_my_pi' -and $ompCliEntry) {
+            $lines.Add('& ' + $literalRuntime + " '" + $ompCliEntry.Replace("'", "''") + "' @args")
         } else {
             if ($id -eq 'claude_code') { $lines.Add('$env:CLAUDE_CODE_GIT_BASH_PATH = ' + "'" + (Join-Path $e2eWorkspace '.tools/git/bin/bash.exe').Replace("'", "''") + "'") }
             if ($id -eq 'codex') { $lines.Add('$env:PATH = ' + "'" + (Join-Path (Split-Path -Parent (Split-Path -Parent $runtimes[$id])) 'codex-path').Replace("'", "''") + ";' + `$env:PATH") }
@@ -1378,7 +1394,17 @@ function Wait-E2eNativeRootReferenceNaturalExit {
             $context.receipt.observationCalls++
             $candidates=@(Get-CimInstance Win32_Process -ErrorAction Stop|Where-Object { ($_.ExecutablePath -and $_.ExecutablePath.StartsWith($root+'\',[StringComparison]::OrdinalIgnoreCase)) -or (Test-E2eNativeExternalRootReference $_.CommandLine $root) })
             foreach($candidate in $candidates) {
-                if($e2eOwnedNativeProcesses.ContainsKey([int]$candidate.ProcessId) -or -not $candidate.CreationDate) { throw 'Readonly reference has owned or missing creation identity.' }
+                if(-not $candidate.CreationDate) { throw 'Readonly reference has missing creation identity.' }
+                if($e2eOwnedNativeProcesses.ContainsKey([int]$candidate.ProcessId)) {
+                    $known=$e2eOwnedNativeProcesses[[int]$candidate.ProcessId]
+                    $known.process.Refresh()
+                    # CIM can retain a row briefly after the retained handle
+                    # exits. Ignore only the same creation identity; a reused
+                    # PID or live retained process still fails closed. Empty
+                    # scans and the final strict assertion remain mandatory.
+                    if($known.process.HasExited -and (Test-E2eNativeCreationTime $known.started $candidate.CreationDate)) { continue }
+                    throw 'Readonly reference has a live or reused retained process identity.'
+                }
                 $key=[string]$candidate.ProcessId+':'+$candidate.CreationDate.ToUniversalTime().Ticks
                 if($retained.ContainsKey($key)) { continue }
                 if($retained.Count -ge 128) { throw 'Readonly reference identity bound exceeded.' }
@@ -1388,9 +1414,14 @@ function Wait-E2eNativeRootReferenceNaturalExit {
                     $null=$process.Handle;$process.Refresh()
                     if($process.HasExited) { continue }
                     $started=$process.StartTime.ToUniversalTime();$image=Get-E2eNativeProcessPath $process
-                    if(-not (Test-E2eNativeCreationTime $started $candidate.CreationDate) -or $image.StartsWith($root+'\',[StringComparison]::OrdinalIgnoreCase)) { throw 'Readonly candidate identity is changed or is an unproved in-root executable.' }
+                    if(-not (Test-E2eNativeCreationTime $started $candidate.CreationDate)) { throw 'Readonly candidate creation identity changed.' }
                     $details=Get-E2eNativeProcessDetails $process
-                    if(-not (Test-E2eNativeExternalRootReference $details.CommandLine $root)) { throw 'Readonly handle does not prove this exact UUID reference.' }
+                    # A WebView can spawn a last child after the ownership
+                    # snapshot. Observe its retained identity and natural exit
+                    # without ever treating that observation as kill authority.
+                    $inRoot=$image.StartsWith($root+'\',[StringComparison]::OrdinalIgnoreCase)
+                    if($inRoot) { $null=Assert-E2eNativeOrdinaryFile $image }
+                    if(-not $inRoot -and -not (Test-E2eNativeExternalRootReference $details.CommandLine $root)) { throw 'Readonly handle does not prove this exact UUID reference.' }
                     $commandHash=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($details.CommandLine))).ToLowerInvariant()
                     $retained[$key]=@{process=$process;started=$started;image=$image;parent=$details.ParentProcessId;commandHash=$commandHash;exitObserved=$false}
                     $context.receipt.readonlyHandlesRetained++;$accepted=$true
@@ -1405,7 +1436,7 @@ function Wait-E2eNativeRootReferenceNaturalExit {
                 try {
                     $details=Get-E2eNativeProcessDetails $entry.process
                     $commandHash=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($details.CommandLine))).ToLowerInvariant()
-                    if($entry.process.StartTime.ToUniversalTime() -ne $entry.started -or (Get-E2eNativeProcessPath $entry.process) -ine $entry.image -or $details.ParentProcessId -ne $entry.parent -or $commandHash -cne $entry.commandHash -or -not (Test-E2eNativeExternalRootReference $details.CommandLine $root)) { throw 'Readonly retained reference identity changed while live.' }
+                    if($entry.process.StartTime.ToUniversalTime() -ne $entry.started -or (Get-E2eNativeProcessPath $entry.process) -ine $entry.image -or $details.ParentProcessId -ne $entry.parent -or $commandHash -cne $entry.commandHash -or (-not $entry.image.StartsWith($root+'\',[StringComparison]::OrdinalIgnoreCase) -and -not (Test-E2eNativeExternalRootReference $details.CommandLine $root))) { throw 'Readonly retained reference identity changed while live.' }
                     $live++
                 } catch { $entry.process.Refresh();if($entry.process.HasExited) { if(-not $entry.exitObserved) { $entry.exitObserved=$true;$context.receipt.naturalExitsObserved++ };continue };throw }
             }
@@ -1428,7 +1459,10 @@ function Wait-E2eNativeRootReferenceNaturalExit {
 function Stop-E2eNativeProcesses {
     $failures = [Collections.Generic.List[string]]::new()
     try { Record-E2eNativeChildren } catch { $failures.Add('child-audit-failed') }
-    $deadline = [DateTime]::UtcNow.AddSeconds(20)
+    # Proof includes a fresh identity check and image hash for each retained
+    # client/helper. A full eight-client run can exceed twenty seconds while
+    # checking these proofs; keep one bounded deadline for the whole cleanup.
+    $deadline = [DateTime]::UtcNow.AddSeconds(120)
     foreach ($identity in @($e2eOwnedNativeProcesses.Values | Sort-Object started -Descending)) {
         try {
             $identity.process.Refresh()

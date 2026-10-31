@@ -17,33 +17,60 @@ pub fn private_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn private_file_permissions(path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    private_permissions(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| AppError::io(path, error))?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[path = "writer/windows_private.rs"]
+mod windows_private;
 #[cfg(windows)]
 fn private_permissions(path: &Path) -> Result<()> {
-    use std::os::windows::process::CommandExt;
-    let user = std::env::var("USERNAME")
-        .map_err(|_| AppError::new("permissions", "无法确定文件权限所属的用户"))?;
-    let domain = std::env::var("USERDOMAIN").unwrap_or_default();
-    let account = if domain.is_empty() {
-        user
-    } else {
-        format!("{domain}\\{user}")
-    };
-    let grant = if path.is_dir() {
-        format!("{account}:(OI)(CI)F")
-    } else {
-        format!("{account}:F")
-    };
-    let output = std::process::Command::new("icacls.exe")
-        .arg(path)
-        .args(["/inheritance:r", "/grant:r", &grant, "/Q"])
-        .creation_flags(0x08000000)
-        .output()
-        .map_err(|err| AppError::io(path, err))?;
-    if !output.status.success() {
-        return Err(AppError::new(
-            "permissions",
-            format!("无法为 {} 设置当前用户私有权限", path.display()),
-        ));
+    windows_private::protect(path)
+}
+
+/// Existing private state can carry explicit ACL entries that are not removed
+/// by tightening its parent. Harden known credential/recovery files before any
+/// database or recovery reader opens them; never recurse into native profiles.
+pub(crate) fn protect_existing_private_state(root: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(root).map_err(|error| AppError::io(root, error))? {
+        let entry = entry.map_err(|error| AppError::io(root, error))?;
+        let path = entry.path();
+        // Windows resolves these names without regard to casing. A renamed
+        // database or an interrupted ownership journal must not retain an
+        // explicit public ACE merely because its on-disk spelling differs.
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        let private_json = name.ends_with(".json") || name.ends_with(".json.pending");
+        let sensitive = name.starts_with("uni-switch.db")
+            || name.starts_with("agent-") && private_json
+            || name.starts_with("config-profiles") && private_json
+            || matches!(
+                name.as_str(),
+                "runtime-integrity.key" | "protocol-bridge.json"
+            );
+        if sensitive {
+            crate::portable::validate_owned_path(&path)?;
+            crate::portable::validate_root(&path)?;
+            if !entry
+                .file_type()
+                .map_err(|error| AppError::io(&path, error))?
+                .is_file()
+            {
+                return Err(AppError::new(
+                    "permissions",
+                    "私有恢复数据不是普通文件，未读取或修改客户端",
+                ));
+            }
+            private_file_permissions(&path)?;
+        }
     }
     Ok(())
 }
@@ -51,6 +78,49 @@ fn private_permissions(path: &Path) -> Result<()> {
 pub fn write(path: &Path, content: Option<&str>) -> Result<()> {
     write_with_validation(path, content, crate::portable::validate_owned_path)
 }
+
+/// Native client configuration requires an expected snapshot and a guard that
+/// stays active through persistence. On Windows a non-sharing file handle
+/// prevents writes, deletion and replacement by other processes. Native writes
+/// use the caller's durable transaction journal rather than releasing that
+/// handle for a rename (which would reopen the original race).
+pub(crate) fn write_native_checked(
+    path: &Path,
+    expected: Option<&str>,
+    content: Option<&str>,
+    validate: impl Fn(&Path) -> Result<()>,
+) -> Result<()> {
+    #[cfg(windows)]
+    return windows_native::write(path, expected, content, validate);
+    #[cfg(not(windows))]
+    {
+        // Non-Windows native acceptance remains separately gated. Preserve the
+        // snapshot precondition even when the OS sharing guard is unavailable.
+        write_with_validation(path, content, |target| {
+            validate(target)?;
+            let current = match std::fs::read_to_string(target) {
+                Ok(text) => Some(text),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(AppError::io(target, error)),
+            };
+            if current.as_deref() != expected {
+                return Err(native_conflict());
+            }
+            Ok(())
+        })
+    }
+}
+
+fn native_conflict() -> AppError {
+    AppError::new(
+        "agent_configuration_changed",
+        "客户端配置正在使用或已被修改，外部修改未覆盖，请关闭客户端后重新预览",
+    )
+}
+
+#[cfg(windows)]
+#[path = "writer/windows_native.rs"]
+mod windows_native;
 
 /// Reuse atomic persistence for an explicitly authorized native file. The
 /// caller's validator must grant the exact file and reject unsafe ancestors;

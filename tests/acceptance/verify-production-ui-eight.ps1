@@ -1,10 +1,16 @@
 [CmdletBinding()]
 param(
   [Parameter(Mandatory)][string]$SetupFile,
-  [ValidateRange(60,7200)][int]$WholeRunTimeoutSeconds=3600
+  [ValidateRange(60,7200)][int]$WholeRunTimeoutSeconds=3600,
+  [Parameter(Mandatory)][string]$Model,
+  [Parameter(Mandatory)][ValidateSet('none','minimal','low','medium','high','xhigh','max','ultra')][string]$ReasoningEffort,
+  [switch]$CoreFeatures,
+  [switch]$CoreFeaturesOnly
 )
 $ErrorActionPreference='Stop'
 $e2eWorkspace=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
+if ([string]::IsNullOrWhiteSpace($Model) -or $Model.Length -gt 256 -or $Model -match '[\x00-\x1f\x7f]') { throw 'An explicit valid current-session model is required.' }
+if($CoreFeaturesOnly -and $CoreFeatures){throw 'Choose CoreFeaturesOnly or the normal CoreFeatures extension, not both.'}
 . (Join-Path $e2eWorkspace 'scripts/workspace-env.ps1')
 if($PSVersionTable.PSVersion.Major -lt 7){throw 'Workspace PowerShell 7 required'}
 $setup=Get-Content -LiteralPath $SetupFile -Raw -Encoding UTF8|ConvertFrom-Json -AsHashtable
@@ -94,10 +100,19 @@ if([IO.Path]::GetFullPath($SetupFile) -ine (Join-Path $e2eSandbox 'setup.json'))
 if(Test-Path -LiteralPath $productionOutput){throw 'Production output must be fresh'}
 $null=New-Item -ItemType Directory -Path $productionOutput
 $receipt=[ordered]@{schemaVersion=2;ownerId=$e2eIdentifier;sandbox=$e2eSandbox;sourceDigest=$setup.sourceDigest;buildAuditId=$setup.buildAuditId;productionSha256=$setup.productionSha256;scope='Eight production UI confirmations plus eight independent native IPC probes on the same saved configuration; official tool write/read, no second UI click';startedAt=[DateTimeOffset]::UtcNow.ToString('o');wrapperSha256=(Get-FileHash -LiteralPath $wrapper -Algorithm SHA256).Hash.ToLowerInvariant();importedFunctions=$imports.ToArray();qaHooksUsed=$false;discoveryContextInjected=$false;passed=$false;cleanup=@{removed=$false;processesExited=$false};unprovedExternalProcessStopped=$false}
+if($CoreFeaturesOnly){
+  $receipt.scope='Configuration-only real model discovery, native save/configure/readback for eight owned profiles, core UI features and temporary owned disconnect/restore; no official-client inference or tool execution'
+  $receipt.coreFeaturesOnly=$true
+  $receipt.inferenceExecuted=$false
+  $receipt.officialClientsExecuted=$false
+  $receipt.fullAcceptancePassed=$false
+}
 $receipt.buildBindings=$setup.buildBindings
 $receipt.sourceFiles=$setup.sourceFiles
 $receipt.supervisorSha256=(Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant()
 $helperNames=@('production-ui-eight.mjs','prepare-production-ui-eight.ps1','production-ui-eight-contract.mjs','acceptance-private-values.mjs','wait-existing-tauri-page.mjs','verify-production-ui-eight-evidence.mjs','production-ui-surface.mjs')
+if($CoreFeatures -or $CoreFeaturesOnly){$helperNames+=@('core-features-native.mjs')}
+if($CoreFeaturesOnly){$helperNames+=@('prepare-core-features-native.mjs','native-config-readback.mjs')}
 $receipt.helperBindings=@(@($PSCommandPath,$wrapper,(Join-Path $e2eWorkspace 'tests/acceptance/native-existing-readback.mjs'))+@($helperNames|ForEach-Object{Join-Path $PSScriptRoot $_})|ForEach-Object{@{path=$_;sha256=(Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant()}})
 if($setup.wrapperSha256 -cne $receipt.wrapperSha256 -or [IO.Path]::GetFullPath($setup.prepareHelper) -ine (Join-Path $PSScriptRoot 'prepare-production-ui-eight.ps1') -or (Get-FileHash -LiteralPath $setup.prepareHelper -Algorithm SHA256).Hash.ToLowerInvariant() -cne $setup.prepareHelperSha256){throw 'Prepared production source helpers changed before supervision'}
 $receipt.preparedFixtureFunctions=$fixtureFunctionsCurrent.ToArray()
@@ -159,16 +174,32 @@ try {
   $launchProof=@{ownerId=$e2eIdentifier;pid=$productProcess.Id;startedAt=$productIdentity.started.ToString('o');productionProgram=$productIdentity.path;productionSha256=$productIdentity.sha256;retainedHandleValidated=$true;ordinaryDiscoveryCwd=$productCwd;qaHooksUsed=$false;discoveryContextInjected=$false;cdpListener=@{pid=$webviewIdentity.process.Id;parentPid=$webviewIdentity.parentId;startedAt=$webviewIdentity.started.ToString('o');image=$webviewIdentity.path;sha256=$webviewIdentity.sha256;retainedDescendantValidated=$true}}
   [IO.File]::WriteAllText($launch,($launchProof|ConvertTo-Json -Depth 10)+"`n",$e2eUtf8)
   $receipt.productionPid=$productProcess.Id
+  $env:AE_PRODUCTION_UI_MODEL=$Model
+  $env:AE_PRODUCTION_UI_EFFORT=$ReasoningEffort
+  $receipt.model=$Model
+  $receipt.reasoningEffort=$ReasoningEffort
   $runner=Join-Path $e2eWorkspace 'tests/acceptance/production-ui-eight.mjs'
+  $runnerArguments=@(('"'+$runner+'"'),('"'+[IO.Path]::GetFullPath($SetupFile)+'"'),('"'+$launch+'"'))
+  if($CoreFeaturesOnly){
+    $runner=Join-Path $e2eWorkspace 'tests/acceptance/prepare-core-features-native.mjs'
+    $runnerArguments=@(('"'+$runner+'"'),'--setup',('"'+[IO.Path]::GetFullPath($SetupFile)+'"'),'--launch',('"'+$launch+'"'))
+  }
   $node=Join-Path $e2eWorkspace '.tools/node/node.exe'
   Assert-ProductionRunDeadline
-  $nodeProcess=Start-Process -FilePath $node -ArgumentList @('"'+$runner+'"','"'+[IO.Path]::GetFullPath($SetupFile)+'"','"'+$launch+'"') -WorkingDirectory $e2eWorkspace -WindowStyle Hidden -RedirectStandardOutput (Join-Path $productionOutput 'runner-stdout.log') -RedirectStandardError (Join-Path $productionOutput 'runner-stderr.log') -PassThru
+  $nodeProcess=Start-Process -FilePath $node -ArgumentList $runnerArguments -WorkingDirectory $e2eWorkspace -WindowStyle Hidden -RedirectStandardOutput (Join-Path $productionOutput 'runner-stdout.log') -RedirectStandardError (Join-Path $productionOutput 'runner-stderr.log') -PassThru
   $nodeIdentity=New-E2eNativeProcessIdentity $nodeProcess @{kind='shared-official-runtime';launcher=''}
   Assert-E2eNativeProcessIdentity $nodeIdentity -VerifyHash
   $e2eOwnedNativeProcesses[$nodeProcess.Id]=$nodeIdentity
   while(-not $nodeProcess.WaitForExit(20)){Assert-ProductionRunDeadline;Record-E2eNativeChildren;Assert-E2eNativeProcessIdentity $productIdentity}
   Assert-ProductionRunDeadline
   $receipt.runnerExitCode=$nodeProcess.ExitCode
+  if($CoreFeaturesOnly){
+    $results=Get-Content -LiteralPath (Join-Path $productionOutput 'prepare-core-features-native.json') -Raw -Encoding UTF8|ConvertFrom-Json
+    $receipt.nativeConfigurationPassed=$results.passed -eq $true -and $results.configuredCount -eq 8 -and $results.nativeIpcExecuted -eq $true -and $results.inferenceExecuted -eq $false -and $results.officialClientsExecuted -eq $false -and $results.probeAgentInvoked -eq $false -and $results.fullAcceptancePassed -eq $false -and @($results.clients|Where-Object {$_.configured -ne $true -or $_.nativeAuthenticationReadback -ne $true -or $_.modelRoutesReadback -ne $true -or $_.originalProfileMatched -ne $true -or $_.transactionSettled -ne $true -or $_.clientStarted -ne $false -or $_.inferenceExecuted -ne $false}).Count -eq 0
+    $receipt.nativeConfigurationPassed=$receipt.nativeConfigurationPassed -and $results.ownerId -ceq $e2eIdentifier -and @($results.clients).Count -eq 8 -and @($results.clients.id|Sort-Object -Unique).Count -eq 8 -and $results.realActivityRecordCount -eq 0 -and $results.observedMutationCounts.saveProvider -eq 1 -and $results.observedMutationCounts.configureAgent -eq 8 -and $results.observedMutationCounts.forbiddenExecutionCommands -eq 0
+    $receipt.configuredClientCount=$results.configuredCount
+    $receipt.passed=$receipt.nativeConfigurationPassed -and $nodeProcess.ExitCode -eq 0 -and -not $e2eNativeIdentityFailure
+  }else{
   $results=Get-Content -LiteralPath (Join-Path $productionOutput 'production-ui-results.json') -Raw -Encoding UTF8|ConvertFrom-Json
   $receipt.uiPassed=$results.passed -eq $true
   $receipt.passedCount=$results.passedCount
@@ -189,6 +220,29 @@ try {
   })
   $receipt.allEightLauncherObserved=@($receipt.launcherObservations|Where-Object retainedProcessObserved -NE $true).Count -eq 0
   $receipt.passed=$results.passed -eq $true -and $results.firstPassedCount -eq 8 -and $results.independentRetestPassedCount -eq 8 -and $nodeProcess.ExitCode -eq 0 -and $receipt.allEightLauncherObserved -and -not $e2eNativeIdentityFailure
+  }
+  if(($CoreFeatures -and $results.firstPassedCount -gt 0) -or ($CoreFeaturesOnly -and $receipt.nativeConfigurationPassed)){
+    Assert-E2eNativeProcessIdentity $productIdentity -VerifyHash
+    $coreRunner=Join-Path $e2eWorkspace 'tests/acceptance/core-features-native.mjs'
+    $coreOutput=Join-Path $productionOutput 'core-features-native'
+    $coreArguments=@(('"'+$coreRunner+'"'),'--cdp','http://127.0.0.1:9223','--output',('"'+$coreOutput+'"'))
+    if($CoreFeaturesOnly){$coreArguments+=@('--setup',('"'+[IO.Path]::GetFullPath($SetupFile)+'"'),'--disconnect-roundtrip','--configuration-only','--screenshots')}
+    $coreProcess=Start-Process -FilePath $node -ArgumentList $coreArguments -WorkingDirectory $e2eWorkspace -WindowStyle Hidden -RedirectStandardOutput (Join-Path $productionOutput 'core-native-stdout.log') -RedirectStandardError (Join-Path $productionOutput 'core-native-stderr.log') -PassThru
+    $coreIdentity=New-E2eNativeProcessIdentity $coreProcess @{kind='shared-official-runtime';launcher=''}
+    Assert-E2eNativeProcessIdentity $coreIdentity -VerifyHash
+    $e2eOwnedNativeProcesses[$coreProcess.Id]=$coreIdentity
+    while(-not $coreProcess.WaitForExit(20)){Assert-ProductionRunDeadline;Record-E2eNativeChildren;Assert-E2eNativeProcessIdentity $productIdentity}
+    $receipt.coreFeaturesNativeExitCode=$coreProcess.ExitCode
+    $coreResults=Get-Content -LiteralPath (Join-Path $coreOutput 'core-features-native.json') -Raw -Encoding UTF8|ConvertFrom-Json
+    $receipt.coreFeaturesNativePassed=$coreProcess.ExitCode -eq 0 -and $coreResults.passed -eq $true -and $coreResults.syntheticIpc -eq $false -and $coreResults.nativeIpcExecuted -eq $true -and $coreResults.acceptanceProfileRemoved -eq $true
+    if($CoreFeaturesOnly){
+      $receipt.temporaryDisconnectRestored=$coreResults.temporaryDisconnectRestored -eq $true
+      $receipt.roundtripOriginalFilesRestored=$coreResults.roundtripOriginalFilesRestored -eq $true
+      $receipt.roundtripIndependentNativeReadback=$coreResults.roundtripIndependentNativeReadback -eq $true
+      $receipt.coreFeaturesNativePassed=$receipt.coreFeaturesNativePassed -and $receipt.temporaryDisconnectRestored -and $receipt.roundtripOriginalFilesRestored -and $receipt.roundtripIndependentNativeReadback -and $coreResults.configurationOnly -eq $true -and $coreResults.ownedSetupValidated -eq $true -and $coreResults.ownerId -ceq $e2eIdentifier -and $coreResults.upstreamInferenceRequestedByThisExtension -eq $false
+    }
+    $receipt.passed=$receipt.passed -and $receipt.coreFeaturesNativePassed
+  }
 } catch {$receipt.failure=$_.Exception.Message;$receipt.passed=$false}
 finally {
   try {
@@ -204,7 +258,10 @@ finally {
     Write-ProductionSupervisor
     Remove-E2eOwnedTree $e2eSandbox
     $receipt.cleanup.removed=-not (Test-Path -LiteralPath $e2eSandbox)
-  } catch {$receipt.cleanup.failure=$_.Exception.Message;$receipt.passed=$false}
+   } catch {$receipt.cleanup.failure=$_.Exception.Message;$receipt.passed=$false}
+   # Retain the handle inventory even when cleanup fails. Otherwise a failed
+   # proof erases the only evidence needed for a later exact-owner cleanup.
+   $receipt.retainedProcesses=@($e2eOwnedNativeProcesses.Values|ForEach-Object {@{pid=$_.process.Id;parentPid=$_.parentId;startedAt=$_.started.ToString('o');image=$_.path;sha256=$_.sha256;kind=$_.kind;launcher=$_.launcher;exited=$_.process.HasExited}})
   foreach($identity in $e2eOwnedNativeProcesses.Values){$identity.process.Dispose()}
   $receipt.externalObservation=$(if($e2eNativeExternalGitObservation){@{invoked=$true;report=$e2eNativeExternalGitObservation.reportPath;sha256=$e2eNativeExternalGitObservation.reportSha256;passed=$e2eNativeExternalGitObservation.receipt.passed;budgetSeconds=$e2eNativeExternalGitObservation.receipt.budgetSeconds;deadlineNeverReset=$true;ownershipClaimed=$false;processesStopped=0}}else{@{invoked=$false;ownershipClaimed=$false;processesStopped=0}})
   $receipt.helperBindingsUnchangedThroughCleanup=$true

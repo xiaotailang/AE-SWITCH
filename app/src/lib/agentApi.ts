@@ -71,6 +71,36 @@ export interface AgentOverview {
   dataDirectory: string;
   bridgeHealthy: boolean;
 }
+export interface RequestActivity {
+  id: string;
+  agentId: AgentId;
+  startedAt: number;
+  model: string | null;
+  endpoint: string;
+  upstreamProtocol: "openai" | "anthropic";
+  streaming: boolean;
+  state:
+    | "in_progress"
+    | "completed"
+    | "failed"
+    | "interrupted"
+    | "incomplete"
+    | "cancelled";
+  status: number | null;
+  elapsedMs: number | null;
+  firstByteMs: number | null;
+  responseBytes: number;
+  usage: {
+    inputTokens: number | null;
+    outputTokens: number | null;
+    cachedTokens: number | null;
+    reasoningTokens: number | null;
+  };
+}
+export interface ActivitySnapshot {
+  capacity: number;
+  records: RequestActivity[];
+}
 export interface AgentConfiguration {
   agentId: AgentId;
   providerId: string;
@@ -195,6 +225,14 @@ function requireDesktop() {
     );
 }
 export const agentApi = {
+  activity: async (agentId: AgentId): Promise<ActivitySnapshot> => {
+    requireDesktop();
+    return invoke("agent_hub_activity", { agentId });
+  },
+  clearActivity: async (agentId: AgentId): Promise<ActivitySnapshot> => {
+    requireDesktop();
+    return invoke("clear_agent_hub_activity", { agentId });
+  },
   discover: async (): Promise<InstalledAgentDiscovery> => {
     requireDesktop();
     return invoke("agent_hub_discover");

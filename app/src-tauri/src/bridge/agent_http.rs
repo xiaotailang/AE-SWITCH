@@ -13,7 +13,7 @@ fn equal_token(left: &str, right: &str) -> bool {
         == 0
 }
 
-fn authenticated(headers: &HeaderMap, token: &str) -> bool {
+pub(super) fn authenticated(headers: &HeaderMap, token: &str) -> bool {
     if headers.contains_key(header::ORIGIN) {
         return false;
     }
@@ -241,7 +241,8 @@ pub(super) async fn responses(
     Json(body): Json<Value>,
 ) -> std::result::Result<Response, HttpError> {
     let provider = provider(&runtime, &headers, &id)?;
-    if provider.summary.upstream_protocol() == CodexProtocol::Anthropic {
+    let trace = runtime.activity.begin(&id, &provider, &body, "responses");
+    let result = if provider.summary.upstream_protocol() == CodexProtocol::Anthropic {
         super::responses(
             State(runtime),
             Path(format!("agent:{id}")),
@@ -259,7 +260,8 @@ pub(super) async fn responses(
             id.starts_with("selected:"),
         )
         .await
-    }
+    };
+    activity::observe(trace, result)
 }
 
 pub(super) async fn compact(
@@ -269,7 +271,10 @@ pub(super) async fn compact(
     Json(body): Json<Value>,
 ) -> std::result::Result<Response, HttpError> {
     let provider = provider(&runtime, &headers, &id)?;
-    if provider.summary.upstream_protocol() == CodexProtocol::Anthropic {
+    let trace = runtime
+        .activity
+        .begin(&id, &provider, &body, "responses/compact");
+    let result = if provider.summary.upstream_protocol() == CodexProtocol::Anthropic {
         super::compact(
             State(runtime),
             Path(format!("agent:{id}")),
@@ -288,7 +293,8 @@ pub(super) async fn compact(
             id.starts_with("selected:"),
         )
         .await
-    }
+    };
+    activity::observe(trace, result)
 }
 
 pub(super) async fn messages(
@@ -299,7 +305,8 @@ pub(super) async fn messages(
 ) -> std::result::Result<Response, HttpError> {
     let provider = provider(&runtime, &headers, &id)?;
     normalize_claude_model(&id, &provider, &mut body)?;
-    if provider.summary.upstream_protocol() == CodexProtocol::Openai {
+    let trace = runtime.activity.begin(&id, &provider, &body, "messages");
+    let result = if provider.summary.upstream_protocol() == CodexProtocol::Openai {
         reverse_http::messages(
             State(runtime),
             Path(("agent".into(), id)),
@@ -317,7 +324,8 @@ pub(super) async fn messages(
             id.starts_with("selected:"),
         )
         .await
-    }
+    };
+    activity::observe(trace, result)
 }
 
 pub(super) async fn count_tokens(
@@ -328,7 +336,10 @@ pub(super) async fn count_tokens(
 ) -> std::result::Result<Response, HttpError> {
     let provider = provider(&runtime, &headers, &id)?;
     normalize_claude_model(&id, &provider, &mut body)?;
-    if provider.summary.upstream_protocol() == CodexProtocol::Openai {
+    let trace = runtime
+        .activity
+        .begin(&id, &provider, &body, "messages/count_tokens");
+    let result = if provider.summary.upstream_protocol() == CodexProtocol::Openai {
         reverse_http::count_tokens(
             State(runtime),
             Path(("agent".into(), id)),
@@ -346,7 +357,8 @@ pub(super) async fn count_tokens(
             id.starts_with("selected:"),
         )
         .await
-    }
+    };
+    activity::observe(trace, result)
 }
 
 pub(super) async fn models(
@@ -465,6 +477,20 @@ pub(super) async fn chat(
     Json(body): Json<Value>,
 ) -> std::result::Result<Response, HttpError> {
     let provider = provider(&runtime, &headers, &id)?;
+    let trace = runtime
+        .activity
+        .begin(&id, &provider, &body, "chat/completions");
+    let result = chat_response(runtime, provider, headers, id, body).await;
+    activity::observe(trace, result)
+}
+
+async fn chat_response(
+    runtime: Runtime,
+    provider: StoredProvider,
+    headers: HeaderMap,
+    id: String,
+    body: Value,
+) -> std::result::Result<Response, HttpError> {
     if provider.summary.upstream_protocol() == CodexProtocol::Openai {
         return forward(
             runtime,

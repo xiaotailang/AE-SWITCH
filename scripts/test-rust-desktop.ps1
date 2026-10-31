@@ -1,9 +1,14 @@
+[CmdletBinding()]
+param([switch]$Release, [string]$TargetDirectory)
 $ErrorActionPreference = 'Stop'
 # Cargo emits UTF-8 JSON even when a hidden PowerShell host inherited the
 # Windows legacy console code page. Decode native stdout before JSON parsing.
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 $OutputEncoding = [Text.UTF8Encoding]::new($false)
-. (Join-Path $PSScriptRoot 'workspace-env.ps1')
+if ($Release) { . (Join-Path $PSScriptRoot 'release-env.ps1') }
+else { . (Join-Path $PSScriptRoot 'workspace-env.ps1') }
+if ($TargetDirectory) { $env:CARGO_TARGET_DIR = [IO.Path]::GetFullPath($TargetDirectory) }
+$desktopTestProfile = if ($Release) { 'release' } else { 'debug' }
 $desktopTestRoot = [IO.Path]::GetFullPath($env:CARGO_TARGET_DIR)
 $desktopTestWorkspace = [IO.Path]::GetFullPath($env:AE_WORKSPACE)
 if (-not $desktopTestRoot.StartsWith($desktopTestWorkspace + '\', [StringComparison]::OrdinalIgnoreCase) -or $desktopTestRoot -match '^[Cc]:') { throw 'Desktop test artifacts must stay inside the workspace.' }
@@ -11,7 +16,9 @@ if (-not $desktopTestRoot.StartsWith($desktopTestWorkspace + '\', [StringCompari
 # GNU Rust's test harness does not receive Tauri's binary manifest. Its native
 # dialog imports require Common Controls v6, just like the actual desktop app.
 # Embed that loader manifest in our freshly compiled, unsigned test executables.
-$desktopTestBuild = & cargo test --manifest-path (Join-Path $desktopTestWorkspace 'app/src-tauri/Cargo.toml') --all-features -j 1 --no-run --message-format=json
+$desktopTestArguments = @('test', '--manifest-path', (Join-Path $desktopTestWorkspace 'app/src-tauri/Cargo.toml'), '--all-features', '-j', '2', '--no-run', '--message-format=json')
+if ($Release) { $desktopTestArguments += '--release' }
+$desktopTestBuild = & cargo @desktopTestArguments
 if ($LASTEXITCODE -ne 0) { throw 'Desktop test compilation failed.' }
 $desktopTestExecutables = @($desktopTestBuild | ForEach-Object {
     $artifact = $_ | ConvertFrom-Json
@@ -37,7 +44,7 @@ $desktopTestManifest = [Text.Encoding]::UTF8.GetBytes(@'
 '@)
 foreach ($desktopTestExecutable in $desktopTestExecutables) {
     $desktopTestExecutable = [IO.Path]::GetFullPath($desktopTestExecutable)
-    if (-not $desktopTestExecutable.StartsWith((Join-Path $desktopTestRoot 'debug/deps') + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Unexpected desktop test executable path.' }
+    if (-not $desktopTestExecutable.StartsWith((Join-Path $desktopTestRoot ($desktopTestProfile + '/deps')) + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Unexpected desktop test executable path.' }
     $desktopTestAncestor = $desktopTestExecutable
     while ($desktopTestAncestor.Length -gt $desktopTestWorkspace.Length) {
         if ((Get-Item -LiteralPath $desktopTestAncestor -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Desktop test artifact uses a junction or link.' }
@@ -49,15 +56,15 @@ foreach ($desktopTestExecutable in $desktopTestExecutables) {
     $desktopTestCommitted = [AeDesktopTestManifest]::EndUpdateResource($desktopTestHandle, -not $desktopTestUpdated)
     if (-not $desktopTestUpdated -or -not $desktopTestCommitted) { throw 'The desktop test loader manifest was not installed.' }
 }
-Copy-Item -LiteralPath (Join-Path $desktopTestRoot 'debug/WebView2Loader.dll') -Destination (Join-Path $desktopTestRoot 'debug/deps/WebView2Loader.dll') -Force
+Copy-Item -LiteralPath (Join-Path $desktopTestRoot ($desktopTestProfile + '/WebView2Loader.dll')) -Destination (Join-Path $desktopTestRoot ($desktopTestProfile + '/deps/WebView2Loader.dll')) -Force
 if (Test-Path -LiteralPath (Join-Path $desktopTestRoot 'release') -PathType Container) {
     foreach ($desktopTestDll in Get-ChildItem -LiteralPath (Join-Path $desktopTestRoot 'release') -Filter 'vcruntime*.dll' -File) {
-        Copy-Item -LiteralPath $desktopTestDll.FullName -Destination (Join-Path $desktopTestRoot 'debug/deps') -Force
+        Copy-Item -LiteralPath $desktopTestDll.FullName -Destination (Join-Path $desktopTestRoot ($desktopTestProfile + '/deps')) -Force
     }
 }
 # Process-discovery fixtures copy their harness into an isolated temporary
 # directory. Let those helpers resolve the same workspace-owned native DLLs.
-$env:PATH = (Join-Path $desktopTestRoot 'debug/deps') + ';' + (Join-Path $desktopTestRoot 'debug') + ';' + $env:PATH
+$env:PATH = (Join-Path $desktopTestRoot ($desktopTestProfile + '/deps')) + ';' + (Join-Path $desktopTestRoot $desktopTestProfile) + ';' + $env:PATH
 foreach ($desktopTestExecutable in $desktopTestExecutables) {
     & $desktopTestExecutable --quiet
     if ($LASTEXITCODE -ne 0) { throw "Desktop Rust tests failed: $desktopTestExecutable" }

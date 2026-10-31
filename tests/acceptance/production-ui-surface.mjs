@@ -24,6 +24,23 @@ const surfaceCommands = new Set([
   "plugin:event|unlisten",
 ]);
 const savedDetails = ".hub-connection-panel > form > .hub-extra-settings";
+export function exactPreparedProfileOption(optionValues, expectedProfile) {
+  const candidates = optionValues.flatMap((value) => {
+    try {
+      const profile = JSON.parse(value);
+      return profile && typeof profile === "object" && !Array.isArray(profile)
+        ? [{ value, profile }]
+        : [];
+    } catch {
+      return [];
+    }
+  });
+  const matches = candidates.filter(({ profile }) => {
+    try { assert.deepEqual(profile, expectedProfile); return true; } catch { return false; }
+  });
+  assert.equal(matches.length, 1, "The exact prepared profile must appear once in ordinary discovered options");
+  return { value: matches[0].value, candidateCount: candidates.length };
+}
 export const SURFACE_CHECKS = Object.freeze({
   common: [
     "current single-page native surface and four steps",
@@ -443,22 +460,30 @@ export async function verifyProductionSurface({
             const agent = hub.agents.find((item) => item.id === id);
             assert.ok(agent);
             await selectAgent(agent.name);
+            const profileSelect = page.locator("#hub-installed-profile");
+            const expectedProfile = setup.fixtures.payload.discoveredProfiles[id];
+            let preparedOption;
             await poll(
-              () => page.locator("#hub-installed-profile").inputValue(),
-              (value) => !!value,
-              id + " ordinary profile",
+              () => profileSelect.locator("option").evaluateAll((options) => options.map((option) => option.value)),
+              (values) => {
+                try { preparedOption = exactPreparedProfileOption(values, expectedProfile); return true; } catch { return false; }
+              },
+              id + " exact ordinary prepared profile option",
             );
+            if ((await profileSelect.inputValue()) !== preparedOption.value)
+              await profileSelect.selectOption({ value: preparedOption.value });
+            await poll(() => profileSelect.inputValue(), (value) => value === preparedOption.value, id + " explicitly selected prepared profile");
             assert.deepEqual(
               JSON.parse(
-                await page.locator("#hub-installed-profile").inputValue(),
+                await profileSelect.inputValue(),
               ),
-              setup.fixtures.payload.discoveredProfiles[id],
+              expectedProfile,
               "Ordinary installed profile does not match the owned fixture",
             );
-            assert.equal(
-              await page.locator(".hub-profile-settings").getAttribute("open"),
-              null,
-            );
+            if (preparedOption.candidateCount === 1)
+              assert.equal(await page.locator(".hub-profile-settings").getAttribute("open"), null);
+            receipt.preparedProfiles ??= [];
+            receipt.preparedProfiles.push({ agentId: id, discoveredCandidateCount: preparedOption.candidateCount, exactPreparedProfileSelected: true });
             assert.equal(await button("确认连接").isDisabled(), true);
           }
         },

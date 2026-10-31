@@ -21,7 +21,9 @@ const packageDirectory = path.resolve(
   process.argv[2] ??
     path.join(workspace, "artifacts/AE-Switch-portable-win-x64"),
 );
-const reportDirectory = path.join(workspace, "artifacts/acceptance");
+const reportDirectory = path.resolve(
+  process.argv[3] ?? path.join(workspace, "artifacts/acceptance"),
+);
 const slash = (value) => value.split(path.sep).join("/");
 const childOf = (parent, target) => {
   const relative = path.relative(parent, target);
@@ -36,7 +38,10 @@ const samePath = (left, right) =>
 if (
   !/^G:/iu.test(workspace) ||
   !childOf(workspace, packageDirectory) ||
-  samePath(workspace, packageDirectory)
+  samePath(workspace, packageDirectory) ||
+  !childOf(workspace, reportDirectory) ||
+  samePath(workspace, reportDirectory) ||
+  childOf(packageDirectory, reportDirectory)
 )
   throw new Error("The final package must be inside this G: workspace.");
 
@@ -123,6 +128,8 @@ async function digest(filename) {
 const commonDirectories = new Set([
   ".git",
   ".cache",
+  "rtk",
+  ".rtk",
   "__pycache__",
   ".pytest_cache",
   ".ruff_cache",
@@ -145,6 +152,14 @@ const excludedFiles = new Set([
   ".env.vault",
   "端点测试用.txt",
   "direct_url.json",
+  "runtime-integrity.key",
+  "agent-disconnect.pending.json",
+  "agent-configuration.pending.json",
+  "agent-native-configuration.pending.json",
+  "agent-selection.json",
+  "protocol-bridge.json",
+  "config-profiles.json",
+  "config-profiles.pending.json",
 ]);
 const excludedSource = (relative, directory) => {
   const parts = slash(relative).toLowerCase().split("/");
@@ -153,7 +168,10 @@ const excludedSource = (relative, directory) => {
     ? commonDirectories.has(name) ||
         (parts[0] === "app" && appDirectories.has(name))
     : excludedFiles.has(name) ||
-        /\.(?:pyc|pyo|log)$/u.test(name) ||
+        /^agent-ownership-.+\.json(?:\.pending)?$/iu.test(name) ||
+        /\.(?:pyc|pyo|log|(?:db|sqlite3?)(?:-(?:shm|wal|journal))?)$/u.test(
+          name,
+        ) ||
         (parts[0] === "app" && name.endsWith(".pdb"));
 };
 async function walk(root, { source = false, prefix = "" } = {}) {
@@ -244,16 +262,20 @@ for (const rootName of ["app", "scripts", "docs", "tests"]) {
       sourceProblems.push(relative);
   }
 }
-const readme = path.join(workspace, "README.md");
-await assertOrdinaryAncestors(readme);
-expectedSource.add("README.md");
+for (const name of ["README.md", ".gitignore"]) {
+  const file = path.join(workspace, name);
+  await assertOrdinaryAncestors(file);
+  expectedSource.add(name);
+  sourceFileCount++;
+  const packaged = packageTree.files.get(sourcePrefix + name);
+  if (!packaged || (await digest(file)) !== (await digest(packaged.filename)))
+    sourceProblems.push(name);
+}
+expectedSource.add("LICENSE");
 sourceFileCount++;
-const packagedReadme = packageTree.files.get(sourcePrefix + "README.md");
-if (
-  !packagedReadme ||
-  (await digest(readme)) !== (await digest(packagedReadme.filename))
-)
-  sourceProblems.push("README.md");
+const exportedLicense = packageTree.files.get(sourcePrefix + "LICENSE");
+if (!exportedLicense || (await digest(path.join(workspace, "app/LICENSE"))) !== (await digest(exportedLicense.filename)))
+  sourceProblems.push("LICENSE");
 const unexpectedSource = [...packageTree.files.keys()].filter(
   (name) =>
     name.startsWith(sourcePrefix) &&
@@ -326,7 +348,7 @@ const correspondence = {
   hashes,
   sourceFileCount,
   sourceScope:
-    "Packager app/scripts/docs/tests roots plus README.md; same directory/file exclusions.",
+    "Packager app/scripts/docs/tests roots plus README.md and .gitignore; same directory/file exclusions.",
   sourceMismatchPaths: sourceProblems,
   unexpectedSourcePaths: unexpectedSource,
   files: comparisons,
@@ -349,12 +371,26 @@ const privateConfigurationPaths = [];
 const topLevelForbidden =
   /^(?:data|\.cache|\.tools|\.git|\.omx|\.codex|\.claude|\.aws|\.ssh|\.env(?:\..*)?|端点测试用\.txt|acceptance-credentials\.txt|credentials?(?:\..*)?|auth\.json|providers\.json|protocol-bridge\.json)$/iu;
 const exactPrivateNames = new Set([
+  "runtime-integrity.key",
   "端点测试用.txt",
   "acceptance-credentials.txt",
   "auth.json",
   "providers.json",
   "protocol-bridge.json",
+  "agent-disconnect.pending.json",
+  "agent-configuration.pending.json",
+  "agent-native-configuration.pending.json",
+  "agent-selection.json",
+  "config-profiles.json",
+  "config-profiles.pending.json",
 ]);
+// Ownership receipts and profile transaction journals can contain original
+// user configuration, secrets and local paths. Reject the basename anywhere,
+// even if a future packaging mistake places one outside the normal data root.
+const privateRuntimeName = (name) =>
+  exactPrivateNames.has(name) ||
+  /^agent-ownership-.+\.json(?:\.pending)?$/iu.test(name) ||
+  /^agent-ownership-.+\.pending\.json$/iu.test(name);
 for (const entry of await fs.readdir(packageDirectory)) {
   if (
     topLevelForbidden.test(entry) ||
@@ -392,6 +428,13 @@ function decodedKeyInJson(text) {
 }
 for (const [relative, file] of packageTree.files) {
   const filename = path.posix.basename(relative).toLowerCase();
+  if (privateRuntimeName(filename)) privateConfigurationPaths.push(relative);
+  if (
+    relative.startsWith(sourcePrefix) &&
+    (/(?:^|\/)(?:rtk|\.rtk)\//iu.test(relative) ||
+      /\.(?:db|sqlite3?)(?:-(?:shm|wal|journal))?$/iu.test(relative))
+  )
+    privateConfigurationPaths.push(relative);
   if (
     (relative.startsWith(sourcePrefix) ||
       relative.startsWith("verification/") ||

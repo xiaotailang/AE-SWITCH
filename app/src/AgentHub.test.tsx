@@ -22,6 +22,9 @@ import {
   type WorkBuddyDefaultSelection,
 } from "./lib/agentApi";
 import type { Provider } from "./types";
+import { configurationSafetyApi } from "./lib/configurationSafetyApi";
+import { configProfilesApi } from "./lib/configProfilesApi";
+import { loadModelPreferences } from "./lib/modelPreferences";
 
 vi.mock("./components/WindowChrome", () => ({ WindowChrome: () => null }));
 vi.mock("./lib/api", async (original) => ({
@@ -2474,6 +2477,113 @@ describe("Agent Hub 真实状态与配置流程", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(message);
     expect(screen.getByText("当前选择尚未配置")).toBeVisible();
     expect(screen.getByText("验证阶段：核对当前工具配置")).toBeVisible();
+    expect(screen.queryByText("工具写读验证通过")).toBeNull();
+  });
+
+  it("核心功能折叠时不读取配置方案或保护信息，只有配置成功才记最近使用", async () => {
+    const list = vi.spyOn(configProfilesApi, "list").mockResolvedValue([]);
+    const inspect = vi.spyOn(configurationSafetyApi, "inspect");
+    await mount(false);
+    expect(list).not.toHaveBeenCalled();
+    expect(inspect).not.toHaveBeenCalled();
+    expect(
+      screen.getByText("高级功能", { selector: "summary" }).closest("details"),
+    ).not.toHaveAttribute("open");
+    expect(
+      screen.getByText("请求活动", { selector: "summary" }).closest("details"),
+    ).not.toHaveAttribute("open");
+    expect(
+      screen.getByText("配置保护与安全断开", { selector: "summary" }),
+    ).toBeVisible();
+    await enterConnection();
+    expect(loadModelPreferences("claude_code", provider.id).recent).toEqual({});
+    vi.mocked(agentApi.configure).mockRejectedValueOnce(
+      new Error("controlled configuration failure"),
+    );
+    await userEvent.click(screen.getByRole("button", { name: "确认连接" }));
+    await screen.findByText(/controlled configuration failure/);
+    expect(loadModelPreferences("claude_code", provider.id).recent).toEqual({});
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "确认连接" })).toBeEnabled(),
+    );
+    await userEvent.click(screen.getByRole("button", { name: "确认连接" }));
+    await waitFor(() =>
+      expect(
+        loadModelPreferences("claude_code", provider.id).recent[provider.model],
+      ).toBeGreaterThan(0),
+    );
+    await userEvent.click(
+      screen.getByText("高级功能", { selector: "summary" }),
+    );
+    expect(list).not.toHaveBeenCalled();
+    await userEvent.click(
+      screen.getByText("配置方案", { selector: "summary" }),
+    );
+    await waitFor(() => expect(list).toHaveBeenCalledTimes(1));
+    expect(inspect).not.toHaveBeenCalled();
+    await userEvent.click(
+      screen.getByText("高级功能", { selector: "summary" }),
+    );
+    expect(screen.queryByRole("heading", { name: "具名配置方案" })).toBeNull();
+    await userEvent.click(
+      screen.getByText("高级功能", { selector: "summary" }),
+    );
+    expect(
+      screen.getByText("配置方案", { selector: "summary" }).closest("details"),
+    ).not.toHaveAttribute("open");
+    expect(list).toHaveBeenCalledTimes(1);
+  });
+
+  it("正式配置保护操作锁住全页，恢复成功清除旧工具通过状态", async () => {
+    const report = {
+      status: "healthy" as const,
+      canDisconnect: true,
+      previewToken: "preview-fingerprint",
+      files: [{ slot: "config", managedFields: 3, changedFields: 0 }],
+    };
+    vi.spyOn(configurationSafetyApi, "inspect").mockResolvedValue(report);
+    let finish: (() => void) | undefined;
+    const disconnect = vi
+      .spyOn(configurationSafetyApi, "disconnect")
+      .mockImplementation(
+        () =>
+          new Promise<void>((resolve) => {
+            finish = () => {
+              configured = false;
+              resolve();
+            };
+          }),
+      );
+    await mount(false);
+    await enterConnection();
+    await userEvent.click(screen.getByRole("button", { name: "确认连接" }));
+    await screen.findByText("工具写读验证通过");
+    await userEvent.click(
+      screen.getByText("配置保护与安全断开", { selector: "summary" }),
+    );
+    await screen.findByText("AE 管理的连接字段与最近写入一致。");
+    await userEvent.click(screen.getByRole("button", { name: "预览断开" }));
+    await screen.findByRole("button", { name: "恢复原配置并断开" });
+    await userEvent.click(
+      screen.getByRole("button", { name: "恢复原配置并断开" }),
+    );
+    await waitFor(() =>
+      expect(disconnect).toHaveBeenCalledWith(
+        "claude_code",
+        "preview-fingerprint",
+      ),
+    );
+    expect(screen.getByRole("button", { name: "确认连接" })).toBeDisabled();
+    for (const button of within(
+      screen.getByRole("navigation", { name: "选择 Agent" }),
+    ).getAllByRole("button"))
+      expect(button).toBeDisabled();
+    await act(async () => {
+      finish?.();
+    });
+    await screen.findByText(
+      "已断开 AE 连接并恢复受管字段，请让客户端重新加载配置。",
+    );
     expect(screen.queryByText("工具写读验证通过")).toBeNull();
   });
 });

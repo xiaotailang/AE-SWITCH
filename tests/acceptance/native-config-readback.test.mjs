@@ -17,11 +17,15 @@ import {
 } from "./native-config-readback.mjs";
 
 const workspaceRoot = path.resolve(process.cwd());
-const pythonDirectory = path.join(
+const installationsFile = process.env.AE_ACCEPTANCE_INSTALLATIONS_MANIFEST;
+const installations = installationsFile
+  ? JSON.parse(await fs.readFile(await assertOwnedReadbackPath(workspaceRoot, installationsFile), "utf8"))
+  : null;
+const pythonDirectory = installations ? path.dirname(installations.python) : path.join(
   workspaceRoot,
   ".tools/python/cpython-3.14.6-windows-x86_64-none",
 );
-const yamlLibraryDirectory = path.join(
+const yamlLibraryDirectory = installations?.hermesSitePackages ?? path.join(
   workspaceRoot,
   ".tools/agents/hermes/.venv/Lib/site-packages",
 );

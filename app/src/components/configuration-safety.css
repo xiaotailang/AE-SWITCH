@@ -1,0 +1,34 @@
+.hub-configuration-safety {
+  border-top: 1px solid var(--hub-line);
+  margin-top: 16px;
+  padding-top: 14px;
+}
+.hub-configuration-safety > summary {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+}
+.hub-configuration-safety section {
+  padding-top: 10px;
+}
+.hub-configuration-safety-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+.hub-configuration-safety-warning {
+  color: var(--hub-error);
+  font-size: 13px;
+  line-height: 1.6;
+}
+.hub-configuration-safety-preview {
+  padding: 12px;
+  border: 1px solid var(--hub-line);
+  border-radius: 8px;
+  margin-top: 12px;
+  font-size: 13px;
+}
+.hub-configuration-safety-preview ul {
+  padding-left: 20px;
+}

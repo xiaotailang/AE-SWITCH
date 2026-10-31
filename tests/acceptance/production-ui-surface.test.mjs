@@ -8,7 +8,24 @@ import {
   assertFailedDiscovery,
   assertSurfaceReceipt,
   verifyProductionSurface,
+  exactPreparedProfileOption,
 } from "./production-ui-surface.mjs";
+
+test("select the exact prepared native profile among other real discovered profiles", () => {
+  const expected = { directory: "G:/owned/zcode", executablePath: "G:/owned/zcode.ps1", workspaceDirectory: "G:/owned/workspace" };
+  const foreign = { ...expected, directory: "G:/another-real/zcode" };
+  const selected = JSON.stringify(expected);
+  assert.deepEqual(exactPreparedProfileOption(["", "manual", JSON.stringify(foreign), selected], expected), { value: selected, candidateCount: 2 });
+  assert.deepEqual(exactPreparedProfileOption([selected], expected), { value: selected, candidateCount: 1 });
+});
+
+test("reject missing or duplicate exact prepared profiles without falling back", () => {
+  const expected = { directory: "G:/owned/zcode", executablePath: "G:/owned/zcode.ps1" };
+  const selected = JSON.stringify(expected);
+  assert.throws(() => exactPreparedProfileOption(["", JSON.stringify({ ...expected, directory: "G:/other" })], expected));
+  assert.throws(() => exactPreparedProfileOption([selected, selected], expected));
+  assert.throws(() => exactPreparedProfileOption(["null", "[]", "42", "broken"], expected));
+});
 
 const request = (url, method = "POST") => ({
   url: () => url,

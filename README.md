@@ -4,7 +4,11 @@
 
 支持配置 Claude Code、Codex、Hermes Agent、oh-my-pi、OpenCode、Z Code、WorkBuddy 和 DeepSeek Harness。八个官方客户端由用户自行安装；AE 包只包含自身和必要运行依赖，不修改客户端程序文件。
 
-**完整验收和公开发布尚未通过。** 当前构建 `1d89fd33…`（219 个生产输入）Rust 380 通过、0 失败、3 忽略，前端 271 项通过。七工具首次 7/7、独立复验 7/7，官方 CLI 同会话恢复 7/7，均绑定同一当前程序。WorkBuddy 当前修订桌面闭环按用户安排延期，托盘恢复因测试环境鼠标输入未执行而未验，完整验收和公开发布状态保持 `false`。 详见[当前验证记录](docs/current-validation.md)。
+已公开发布 [reasoning-compatibility 预发布](https://github.com/xiaotailang/AE-SWITCH/releases/tag/v0.1.0-reasoning-compatibility.1)，完整正式验收仍未完成。2026-10-30 本地开发新增“请求活动”：查看当前客户端经过 AE 的请求状态、耗时和响应报告的 token 用量，记录仅在内存中保留。见[本轮开发记录](docs/development-2026-10-30.md)与[当前验证记录](docs/current-validation.md)；旧构建的七工具及历史恢复成功不自动继承到新程序。
+
+当前续作进一步提供模型搜索、收藏与最近使用、具名多客户端配置方案，以及字段级配置漂移检测和安全断开。详见[核心功能与本轮验证](docs/core-features-development-2026-10-30.md)。方案仅引用已保存连接；恢复记录属于私有数据，不能公开分享使用后的 `data/`。
+
+日常界面以四步连接为主：搜索直接可用，收藏和最近使用收进“常用模型”，具名方案收进“高级功能”，请求活动默认收起。底层配置保护和方案恢复保留；新构建与真实接入复验单独记录在[常用流程精简与接入验证](docs/practical-core-development-2026-10-30.md)。
 
 ## 开始使用
 

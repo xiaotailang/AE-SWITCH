@@ -10,7 +10,75 @@ mod existing;
 mod jsonc;
 mod launchers;
 mod native_merge;
+mod ownership;
 pub use existing::ExistingProfile;
+pub use ownership::{ConfigurationFileStatus, ConfigurationSafety};
+
+pub fn configuration_safety(
+    root: &Path,
+    agent: AgentId,
+    profile: Option<&ExistingProfile>,
+) -> Result<ConfigurationSafety> {
+    ownership::inspect(root, agent, profile)
+}
+
+pub fn disconnect_configuration(
+    root: &Path,
+    agent: AgentId,
+    profile: Option<&ExistingProfile>,
+    preview_token: &str,
+    selection_before: &str,
+    selection_after: &str,
+) -> Result<()> {
+    ownership::disconnect(
+        root,
+        agent,
+        profile,
+        preview_token,
+        selection_before,
+        selection_after,
+    )
+}
+
+pub(crate) fn configuration_snapshots(
+    root: &Path,
+    agent: AgentId,
+    profile: Option<&ExistingProfile>,
+) -> Result<Vec<(PathBuf, Option<String>)>> {
+    ownership::configuration_snapshots(root, agent, profile)
+}
+
+#[cfg(test)]
+pub(crate) fn write_configuration_snapshot(
+    root: &Path,
+    agent: AgentId,
+    profile: Option<&ExistingProfile>,
+    path: &Path,
+    contents: Option<&str>,
+) -> Result<()> {
+    ownership::write_configuration_snapshot(root, agent, profile, path, contents)
+}
+
+pub(crate) fn write_configuration_snapshot_checked(
+    root: &Path,
+    agent: AgentId,
+    profile: Option<&ExistingProfile>,
+    path: &Path,
+    expected: Option<&str>,
+    contents: Option<&str>,
+) -> Result<()> {
+    ownership::write_configuration_snapshot_checked(root, agent, profile, path, expected, contents)
+}
+
+pub(crate) fn plan_configuration_ownership(
+    root: &Path,
+    agent: AgentId,
+    profile: Option<&ExistingProfile>,
+    snapshots: &[(PathBuf, Option<String>)],
+    writes: &[(PathBuf, String)],
+) -> Result<Vec<(PathBuf, Option<String>)>> {
+    ownership::plan_configuration_ownership(root, agent, profile, snapshots, writes)
+}
 
 // Official OMP CHAT_MODEL_ROLE_IDS; independent runner-kind roles stay unchanged.
 const OMP_CHAT_MODEL_ROLES: &[&str] = &[
@@ -211,7 +279,9 @@ pub(crate) fn configure_existing_with_selection(
         &mut environment,
         Some(profile),
     )?;
+    ownership::prepare(root, agent, Some(profile), &snapshots, &writes)?;
     existing::commit(root, agent, profile, &snapshots, writes, selection)?;
+    ownership::finish(root, agent)?;
     let definition = definitions()
         .into_iter()
         .find(|item| item.id == agent)
@@ -367,7 +437,9 @@ pub(crate) fn configure_with_selection(
             native_merge::snapshot(root, path, &mut snapshots)?;
         }
     }
+    ownership::prepare(root, agent, None, &snapshots, &writes)?;
     commit_native_configuration(root, &snapshots, writes)?;
+    ownership::finish(root, agent)?;
     let definition = definitions()
         .into_iter()
         .find(|item| item.id == agent)
@@ -794,6 +866,56 @@ fn add_bundled_tools(
 }
 
 type NativePlan = (Vec<native_merge::Snapshot>, Vec<(PathBuf, String)>);
+
+/// Plan an update of an already configured client without changing its target.
+/// Private launcher/runtime files are preserved; only the existing portable
+/// environment's model/connection fields and native configuration are updated.
+pub(crate) fn plan_profile_configuration(
+    root: &Path,
+    agent: AgentId,
+    base_url: &str,
+    token: &str,
+    model: &str,
+    profile: Option<&ExistingProfile>,
+) -> Result<Vec<(PathBuf, String)>> {
+    validate_inputs(root, base_url, token, model)?;
+    let directory = profile
+        .map(|profile| PathBuf::from(&profile.directory))
+        .unwrap_or_else(|| root.join("agents").join(agent.as_str()));
+    if let Some(profile) = profile {
+        existing::validate_profile(agent, profile)?;
+    }
+    let environment_path = directory.join("configuration/environment.json");
+    let mut environment = if profile.is_none() {
+        let text = native_merge::read(root, &environment_path)?
+            .ok_or_else(|| AppError::new("not_configured", "请先配置方案中引用的客户端"))?;
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&text)
+            .map_err(|_| AppError::new("invalid_state", "客户端环境记录损坏，未修改配置"))?
+    } else {
+        serde_json::Map::new()
+    };
+    if profile.is_none() {
+        environment.insert("AE_GATEWAY_TOKEN".into(), token.into());
+        environment.insert("AE_SWITCH_API_KEY".into(), token.into());
+    }
+    let (_, mut writes) = plan_agent_configuration(
+        root,
+        &directory,
+        agent,
+        base_url,
+        token,
+        model,
+        &mut environment,
+        profile,
+    )?;
+    if profile.is_none() {
+        writes.push((
+            environment_path,
+            native_merge::text(&serde_json::Value::Object(environment))?,
+        ));
+    }
+    Ok(writes)
+}
 
 #[allow(clippy::too_many_arguments)]
 fn plan_agent_configuration(
@@ -2119,7 +2241,7 @@ pub(crate) fn recover_configuration(root: &Path) -> Result<()> {
     existing::recover(root)?;
     let path = root.join(CONFIGURATION_JOURNAL);
     let Some(contents) = native_merge::read_limit(root, &path, 32 * 1024 * 1024)? else {
-        return Ok(());
+        return ownership::recover(root);
     };
     let journal: ConfigurationJournal = serde_json::from_str(&contents).map_err(|_| {
         AppError::new(
@@ -2140,7 +2262,8 @@ pub(crate) fn recover_configuration(root: &Path) -> Result<()> {
     } else {
         restore_configuration(root, &journal)?;
     }
-    writer::write(&path, None)
+    writer::write(&path, None)?;
+    ownership::recover(root)
 }
 
 fn set_launcher_permissions(path: &Path) -> Result<()> {

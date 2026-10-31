@@ -1,3 +1,4 @@
+pub mod activity;
 mod agent_http;
 pub mod convert;
 pub mod reverse;
@@ -154,6 +155,7 @@ struct Runtime {
     store: Arc<Mutex<Store>>,
     token: String,
     client: reqwest::Client,
+    activity: activity::ActivityLog,
 }
 type HttpError = (StatusCode, Json<Value>);
 fn error(status: StatusCode, message: impl Into<String>) -> HttpError {
@@ -470,8 +472,10 @@ pub async fn serve(listener: TcpListener, route: Route, store: Arc<Mutex<Store>>
         store,
         token: route.token,
         client,
+        activity: activity::ActivityLog::default(),
     };
     let app = Router::new()
+        .merge(activity::routes())
         .route("/health", get(health))
         .route("/agents/{id}/v1/models", get(agent_http::models))
         .route("/agents/{id}/v1/responses", post(agent_http::responses))

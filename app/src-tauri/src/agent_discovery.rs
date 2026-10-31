@@ -696,7 +696,7 @@ fn fixture_context(path: &Path) -> Result<Context> {
     }
     let fixture = crate::portable::validate_root(path)
         .ok()
-        .filter(|_| std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() <= 64 * 1024))
+        .filter(|_| std::fs::metadata(path).is_ok_and(|metadata| metadata.len() <= 64 * 1024))
         .and_then(|_| std::fs::read(path).ok())
         .and_then(|bytes| serde_json::from_slice::<Fixture>(&bytes).ok());
     if let Some(fixture) = fixture {

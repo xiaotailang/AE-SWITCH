@@ -61,16 +61,28 @@ pub(super) fn read_authorized<'a>(
 /// Native transactions authorize exact selected files, independently from AE's
 /// private portable directory. Recheck the grant and ancestors at each atomic
 /// writer boundary; never grant an entire external directory.
+#[cfg(test)]
 pub(super) fn write_authorized<'a>(
     path: &Path,
     allowed: impl IntoIterator<Item = &'a std::path::PathBuf>,
+    content: Option<&str>,
+) -> Result<()> {
+    let allowed: Vec<_> = allowed.into_iter().collect();
+    let expected = read_authorized(path, allowed.iter().copied())?;
+    write_authorized_checked(path, allowed.iter().copied(), expected.as_deref(), content)
+}
+
+pub(super) fn write_authorized_checked<'a>(
+    path: &Path,
+    allowed: impl IntoIterator<Item = &'a std::path::PathBuf>,
+    expected: Option<&str>,
     content: Option<&str>,
 ) -> Result<()> {
     if content.is_some_and(|text| text.len() > 4 * 1024 * 1024) {
         return Err(invalid(path));
     }
     let allowed: Vec<_> = allowed.into_iter().collect();
-    crate::writer::write_with_validation(path, content, |target| {
+    crate::writer::write_native_checked(path, expected, content, |target| {
         read_authorized(target, allowed.iter().copied()).map(|_| ())
     })
 }
@@ -418,6 +430,8 @@ struct Line {
 struct Node {
     value: Value,
     start: usize,
+    entry_start: usize,
+    entry_end: usize,
     end: usize,
     indent: usize,
     children: Vec<(String, Node)>,
@@ -441,6 +455,8 @@ impl Yaml {
                 node: Node {
                     value: fallback,
                     start: 0,
+                    entry_start: 0,
+                    entry_end: 0,
                     end: 0,
                     indent: 0,
                     children: vec![],
@@ -457,6 +473,8 @@ impl Yaml {
                 node: Node {
                     value,
                     start: 0,
+                    entry_start: 0,
+                    entry_end: end,
                     end,
                     indent: 0,
                     children: vec![],
@@ -490,6 +508,8 @@ impl Yaml {
                 node: Node {
                     value: fallback,
                     start: 0,
+                    entry_start: 0,
+                    entry_end: 0,
                     end: 0,
                     indent: 0,
                     children: vec![],
@@ -685,6 +705,8 @@ fn parse_block(lines: &[Line], path: &Path) -> Result<Node> {
         return Ok(Node {
             value: scalar(&first.body, path)?,
             start: first.start,
+            entry_start: first.start,
+            entry_end: first.end,
             end: first.end,
             indent: first.indent,
             children: vec![],
@@ -741,6 +763,8 @@ fn parse_block(lines: &[Line], path: &Path) -> Result<Node> {
                 Node {
                     value: scalar(body, path)?,
                     start,
+                    entry_start: line.start,
+                    entry_end: line.end,
                     end: start + body[..end].trim_end().len(),
                     indent: indent + 2,
                     children: vec![],
@@ -773,6 +797,8 @@ fn parse_block(lines: &[Line], path: &Path) -> Result<Node> {
                     )
                     .into(),
                     start,
+                    entry_start: line.start,
+                    entry_end: lines[next - 1].end,
                     end: lines[next - 1].end,
                     indent,
                     children: vec![],
@@ -786,6 +812,8 @@ fn parse_block(lines: &[Line], path: &Path) -> Result<Node> {
                 Node {
                     value: scalar(body, path)?,
                     start,
+                    entry_start: line.start,
+                    entry_end: line.end,
                     end: line.start + colon + raw[..end].trim_end().len(),
                     indent,
                     children: vec![],
@@ -811,12 +839,16 @@ fn parse_block(lines: &[Line], path: &Path) -> Result<Node> {
         if node.end < node.start {
             node.end = node.start;
         }
+        node.entry_start = line.start - line.indent;
+        node.entry_end = lines[next - 1].end;
         children.push((key, node));
         index = next;
     }
     Ok(Node {
         value,
         start: first.start,
+        entry_start: first.start,
+        entry_end: lines.last().expect("nonempty").end,
         end: lines.last().expect("nonempty").end,
         indent,
         children,
@@ -836,6 +868,18 @@ fn changes(
         return Ok(());
     }
     if node.block {
+        if value.as_object().is_some_and(|map| map.is_empty()) {
+            edits.push((
+                node.start,
+                node.end,
+                if node.start > node.entry_start {
+                    " {}".into()
+                } else {
+                    "{}".into()
+                },
+            ));
+            return Ok(());
+        }
         let mut additions = String::new();
         if node.sequence {
             let rows = value.as_array().ok_or_else(|| invalid(path))?;
@@ -855,13 +899,11 @@ fn changes(
         } else {
             let map = value.as_object().ok_or_else(|| invalid(path))?;
             for (key, child) in &node.children {
-                changes(
-                    child,
-                    map.get(key).ok_or_else(|| invalid(path))?,
-                    newline,
-                    edits,
-                    path,
-                )?;
+                if let Some(value) = map.get(key) {
+                    changes(child, value, newline, edits, path)?;
+                } else {
+                    edits.push((child.entry_start, child.entry_end, String::new()));
+                }
             }
             for (key, value) in map {
                 if !node.children.iter().any(|(old, _)| old == key) {

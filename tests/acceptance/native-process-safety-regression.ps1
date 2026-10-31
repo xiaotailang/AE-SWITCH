@@ -79,6 +79,10 @@ try {
         . ([scriptblock]::Create($selected[0].Extent.Text))
     }
     Initialize-E2eNativeProcessInterop
+    # This fixture deliberately uses roots outside the production sandbox
+    # layout. Its strict process assertion remains real; the exact-layout
+    # natural-exit observer is covered in native-root-reference-regression.ps1.
+    function Wait-E2eNativeRootReferenceNaturalExit { Assert-E2eNativeProcessesExited }
     # Only identity acquisition and process observations are simulated; the production ownership,
     # queue, argv, stop and exit-check functions above run unchanged.
     function Get-E2eNativeProcessById([int]$ProcessId) {

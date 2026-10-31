@@ -153,7 +153,7 @@ function Copy-PackageTree([string]$Source, [string]$Relative, [string[]]$Exclude
     New-Item -ItemType Directory -Path $target -Force | Out-Null
     $arguments = @($Source, $target, '/E', '/XJ', '/R:1', '/W:1', '/COPY:DAT', '/DCOPY:DAT', '/NFL', '/NDL', '/NJH', '/NJS', '/NP')
     $arguments += @('/XD', '.git', '.cache', 'rtk', '.rtk', '__pycache__', '.pytest_cache', '.ruff_cache', '.mypy_cache', '.turbo', 'coverage') + $ExcludedDirectories
-    $arguments += @('/XF', '.env', '.env.local', '.env.production', '.env.development', '.env.vault', '*.pyc', '*.pyo', '*.log', '*.db', '*.db-shm', '*.db-wal', '*.db-journal', '*.sqlite', '*.sqlite-shm', '*.sqlite-wal', '*.sqlite-journal', '*.sqlite3', '*.sqlite3-shm', '*.sqlite3-wal', '*.sqlite3-journal', '端点测试用.txt', 'direct_url.json') + $ExcludedFiles
+    $arguments += @('/XF', '.env', '.env.local', '.env.production', '.env.development', '.env.vault', '*.pyc', '*.pyo', '*.log', '*.db', '*.db-shm', '*.db-wal', '*.db-journal', '*.sqlite', '*.sqlite-shm', '*.sqlite-wal', '*.sqlite-journal', '*.sqlite3', '*.sqlite3-shm', '*.sqlite3-wal', '*.sqlite3-journal', '端点测试用.txt', 'direct_url.json', 'runtime-integrity.key', 'agent-ownership-*.json', 'agent-ownership-*.json.pending', 'agent-disconnect.pending.json', 'agent-configuration.pending.json', 'agent-native-configuration.pending.json', 'agent-selection.json', 'protocol-bridge.json', 'config-profiles.json', 'config-profiles.pending.json') + $ExcludedFiles
     & robocopy.exe @arguments | Out-File -LiteralPath $packageLog -Append -Encoding utf8
     if ($LASTEXITCODE -ge 8) { throw "Failed to copy $Source (robocopy exit $LASTEXITCODE)" }
     Package-Log "Copied $Relative"
@@ -177,6 +177,7 @@ try {
     Copy-PackageTree (Join-Path $packageWorkspace 'app') 'source/ae-switch/app' @('node_modules', 'dist', 'target', '.omx', 'data') @('*.pdb')
     Copy-PackageTree (Join-Path $packageWorkspace 'scripts') 'source/ae-switch/scripts'
     Copy-PackageTree (Join-Path $packageWorkspace 'docs') 'source/ae-switch/docs'
+    Copy-PackageFile $packageLicense 'source/ae-switch/LICENSE'
     if (Test-Path -LiteralPath (Join-Path $packageWorkspace 'README.md') -PathType Leaf) { Copy-PackageFile (Join-Path $packageWorkspace 'README.md') 'source/ae-switch/README.md' }
     Copy-PackageFile (Require-File (Join-Path $packageWorkspace '.gitignore') 'public workspace ignore rules') 'source/ae-switch/.gitignore'
     if (Test-Path -LiteralPath (Join-Path $packageWorkspace 'tests')) { Copy-PackageTree (Join-Path $packageWorkspace 'tests') 'source/ae-switch/tests' }

@@ -699,7 +699,7 @@
   color: var(--hub-muted);
 }
 
-.hub-button:hover:not(:disabled) {
+.agent-hub .hub-button:hover:not(:disabled) {
   border-color: var(--hub-accent);
   background: var(--hub-accent-soft);
 }
@@ -711,7 +711,7 @@
   font-weight: 600;
 }
 
-.hub-button.primary:hover:not(:disabled) {
+.agent-hub .hub-button.primary:hover:not(:disabled) {
   filter: brightness(1.08);
   background: var(--hub-button);
 }

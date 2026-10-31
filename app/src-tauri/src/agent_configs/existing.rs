@@ -697,7 +697,12 @@ fn restore(root: &Path, journal: &Journal, paths: &BTreeMap<&str, PathBuf>) -> R
                 "恢复前客户端配置发生变化，备份已保留",
             ));
         }
-        native_merge::write_authorized(path, paths.values(), change.before.as_deref())?;
+        native_merge::write_authorized_checked(
+            path,
+            paths.values(),
+            Some(&change.after),
+            change.before.as_deref(),
+        )?;
         if read_native(path, paths)? != change.before {
             return Err(AppError::new(
                 "verify_failed",
@@ -812,7 +817,12 @@ pub(super) fn commit(
                 ));
             }
             check_existing_ancestors(path)?;
-            native_merge::write_authorized(path, paths.values(), Some(&change.after))?;
+            native_merge::write_authorized_checked(
+                path,
+                paths.values(),
+                change.before.as_deref(),
+                Some(&change.after),
+            )?;
             if read_native(path, &paths)?.as_deref() != Some(change.after.as_str()) {
                 return Err(AppError::new("verify_failed", "原生客户端配置回读校验失败"));
             }
