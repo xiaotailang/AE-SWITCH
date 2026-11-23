@@ -542,17 +542,34 @@ impl Store {
         Ok((base_url, key, query, token))
     }
 
+    fn key_for_connection(
+        explicit: Option<String>,
+        saved: Option<&StoredProvider>,
+        endpoint: &url::Url,
+    ) -> Result<Option<String>> {
+        if let Some(key) = explicit.filter(|key| !key.trim().is_empty()) {
+            return Ok(Some(key));
+        }
+        let Some(saved) = saved else {
+            return Ok(None);
+        };
+        if validate_url(&saved.summary.base_url)?.origin() != endpoint.origin() {
+            return Err(AppError::new(
+                "endpoint_key_required",
+                "端点来源已更换，请输入该端点的 API Key",
+            ));
+        }
+        Ok(Some(saved.api_key.clone()))
+    }
+
     pub fn connection(&self, input: ConnectionInput) -> Result<(String, String)> {
-        validate_url(input.base_url.trim())?;
+        let endpoint = validate_url(input.base_url.trim())?;
         let old = input
             .provider_id
             .as_deref()
             .map(|id| self.provider(id))
             .transpose()?;
-        let key = input
-            .api_key
-            .filter(|k| !k.trim().is_empty())
-            .or_else(|| old.map(|p| p.api_key))
+        let key = Self::key_for_connection(input.api_key, old.as_ref(), &endpoint)?
             .ok_or_else(|| AppError::new("missing_key", "请填写 API Key 后再查询"))?;
         if key.chars().any(char::is_control) {
             return Err(AppError::new("invalid_key", "API Key 不能包含控制字符"));
@@ -579,12 +596,16 @@ impl Store {
             .as_ref()
             .is_some_and(|p| p.summary.codex_options.per_model_context);
         validate(&mut input)?;
-        let key = input
-            .api_key
-            .filter(|key| !key.trim().is_empty())
-            .map(|key| key.trim().to_owned())
-            .or_else(|| old.as_ref().map(|p| p.api_key.clone()))
+        let endpoint = validate_url(&input.base_url)?;
+        let key = Self::key_for_connection(input.api_key, old.as_ref(), &endpoint)?
             .ok_or_else(|| AppError::new("missing_key", "请填写 API Key"))?;
+        let key = key.trim().to_owned();
+        crate::context_policy::validate_endpoint_bindings(
+            &input.codex_options.models,
+            &input.base_url,
+            &key,
+            &input.auth_mode,
+        )?;
         let balance_token = if let Some(query) = input
             .codex_options
             .balance_query
@@ -622,6 +643,9 @@ impl Store {
             key_suffix: suffix,
             updated_at: now(),
         };
+        if provider.codex_options.context_policy.is_some() {
+            crate::context_policy::selected(&provider, &provider.model)?;
+        }
         let stored = StoredProvider {
             summary: provider.clone(),
             api_key: key,
@@ -711,6 +735,7 @@ impl Store {
             projected.summary.codex_options.models.push(ProviderModel {
                 id: provider.summary.model.clone(),
                 context_window: Some(256_000),
+                context_capabilities: None,
                 reasoning_efforts: vec![],
                 enabled: true,
             });
@@ -1634,6 +1659,7 @@ impl Store {
             provider.summary.codex_options.models = vec![ProviderModel {
                 id: provider.summary.model.clone(),
                 context_window: None,
+                context_capabilities: None,
                 reasoning_efforts: vec![],
                 enabled: true,
             }];

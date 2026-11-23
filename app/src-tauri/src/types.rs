@@ -92,6 +92,11 @@ pub struct CodexOptions {
     /// its restoration baseline. Old providers continue following the client.
     pub per_model_context: bool,
     pub auto_compact_token_limit: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_policy: Option<crate::context_policy::ContextPolicy>,
+    /// Runtime-only projection of the exact configured client selection.
+    #[serde(skip)]
+    pub applied_context_policy: Option<crate::context_policy::AppliedContextPolicy>,
     pub models: Vec<ProviderModel>,
     pub models_synced_at: Option<u64>,
     pub balance_query: Option<BalanceQuery>,
@@ -122,6 +127,8 @@ pub struct ProviderModel {
     pub id: String,
     #[serde(default)]
     pub context_window: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_capabilities: Option<crate::context_policy::ContextCapabilities>,
     #[serde(default)]
     pub reasoning_efforts: Vec<String>,
     #[serde(default = "selected_by_default")]
@@ -453,6 +460,19 @@ pub fn validate(input: &mut ProviderInput) -> Result<()> {
         }
     }
     let options = &mut input.codex_options;
+    if let Some(policy) = &options.context_policy {
+        if policy.model != input.model || !(1..=95).contains(&policy.compact_percent) {
+            return Err(AppError::new(
+                "invalid_context_policy",
+                "上下文选择必须绑定当前模型，压缩比例必须在 1–95% 之间",
+            ));
+        }
+    }
+    for model in &options.models {
+        if let Some(capabilities) = &model.context_capabilities {
+            crate::context_policy::validate_capabilities(capabilities)?;
+        }
+    }
     if !input.edited_context_model_ids.is_empty() {
         let mut edited = std::collections::HashSet::new();
         for id in &input.edited_context_model_ids {
@@ -499,6 +519,7 @@ pub fn validate(input: &mut ProviderInput) -> Result<()> {
         options.models = vec![ProviderModel {
             id: input.model.clone(),
             context_window: None,
+            context_capabilities: None,
             reasoning_efforts: vec![],
             enabled: true,
         }];

@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { AppliedContextPolicy } from "../types";
 import { desktopRuntime } from "./api";
 import type { AgentId } from "./agentApi";
 
@@ -7,6 +8,7 @@ export interface ConfigProfileEntry {
   providerId: string;
   model: string;
   reasoningEffort: string | null;
+  contextPolicy?: AppliedContextPolicy | null;
 }
 export interface ConfigProfile {
   id: string;
@@ -26,6 +28,7 @@ export interface ConfigProfilePreviewEntry extends ConfigProfileEntry {
   previousProviderName: string;
   previousModel: string;
   previousReasoningEffort: string | null;
+  previousContextPolicy?: AppliedContextPolicy | null;
   targetMode: "existing" | "private";
   changed: boolean;
 }

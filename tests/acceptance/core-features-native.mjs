@@ -530,6 +530,7 @@ async function nativeState() {
       providerId: agent.providerId,
       model: agent.model,
       reasoningEffort: agent.reasoningEffort || null,
+      contextPolicy: agent.contextPolicy || null,
       profile: agent.profile || null,
       configurationRevision: agent.configurationRevision || 0,
     }));
@@ -537,12 +538,13 @@ async function nativeState() {
 }
 const selectionProjection = (agents) =>
   agents.map(
-    ({ id, configured, providerId, model, reasoningEffort, profile }) => ({
+    ({ id, configured, providerId, model, reasoningEffort, contextPolicy, profile }) => ({
       id,
       configured,
       providerId,
       model,
       reasoningEffort,
+      contextPolicy,
       profile,
     }),
   );
@@ -754,7 +756,7 @@ try {
   assert(
     nativeProfile.entries.every(
       (entry) =>
-        Object.keys(entry).sort().join(",") ===
+        Object.keys(entry).filter((key) => key !== "contextPolicy").sort().join(",") ===
         "agentId,model,providerId,reasoningEffort",
     ),
     "Saved profile must contain only reference metadata",
@@ -768,6 +770,7 @@ try {
         old.reasoningEffort === entry.reasoningEffort,
       "Profile choice must equal the real preexisting selection",
     );
+      assert.deepEqual(entry.contextPolicy || null, old.contextPolicy || null, "Saved context policy must match the exact client snapshot");
   }
   await previewTrigger.click();
   await profiles
@@ -987,6 +990,12 @@ try {
     );
   }
 
+  stageLabel = "model-restored-after-profile-apply";
+  await page.waitForFunction(
+    (expected) => document.getElementById("hub-model")?.value === expected,
+    selected.model,
+    { timeout: 10000 },
+  );
   originalModel = await page.locator("#hub-model").inputValue();
   stageLabel = "model-search-favorite-recent";
   assert(originalModel, "A saved native model must be selected");
@@ -1000,27 +1009,45 @@ try {
     originalModel,
     "Native model search must preserve selected model",
   );
+  stageLabel = "model-search-escape";
   await search.press("Escape");
+  await page.waitForFunction(
+    () => document.querySelector('input[aria-label="搜索模型"]')?.value === "",
+    null,
+    { timeout: 10000 },
+  );
   assert.equal(
     await search.inputValue(),
     "",
     "Escape must clear model search locally",
   );
   await disclosure("常用模型");
+  stageLabel = "model-favorite-toggle";
   const favorite = page.locator(".hub-model-favorite");
   originalFavorite = (await favorite.getAttribute("aria-pressed")) === "true";
   await favorite.click();
+  await page.waitForFunction(
+    (expected) => document.querySelector(".hub-model-favorite")?.getAttribute("aria-pressed") === String(expected),
+    !originalFavorite,
+    { timeout: 10000 },
+  );
   assert.equal(
     (await favorite.getAttribute("aria-pressed")) === "true",
     !originalFavorite,
     "Native model favorite toggle must update",
   );
   await favorite.click();
+  await page.waitForFunction(
+    (expected) => document.querySelector(".hub-model-favorite")?.getAttribute("aria-pressed") === String(expected),
+    originalFavorite,
+    { timeout: 10000 },
+  );
   assert.equal(
     (await favorite.getAttribute("aria-pressed")) === "true",
     originalFavorite,
     "Original favorite state must be restored",
   );
+  stageLabel = "model-recent-selection";
   await page.getByRole("button", { name: /^最近使用 \d+$/ }).click();
   const recentCount = await page
     .getByRole("button", { name: /^最近使用 \d+$/ })

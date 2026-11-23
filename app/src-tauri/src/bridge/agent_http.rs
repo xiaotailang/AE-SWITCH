@@ -68,51 +68,44 @@ fn claude_internal_alias(model: &str) -> bool {
         })
 }
 
-fn normalize_claude_model(
+fn enforce_selected_model(
     id: &str,
     provider: &StoredProvider,
     body: &mut Value,
+    messages: bool,
 ) -> std::result::Result<(), HttpError> {
-    if id != "selected:claude_code" {
+    if !id.starts_with("selected:") {
         return Ok(());
     }
     let requested = body["model"]
         .as_str()
         .ok_or_else(|| error(StatusCode::BAD_REQUEST, "请求缺少 model"))?;
-    let model = reverse::model_ids(provider)
-        .into_iter()
-        .find(|model| model == requested || reverse::model_alias(model) == requested)
-        .or_else(|| claude_internal_alias(requested).then(|| provider.summary.model.clone()))
-        .ok_or_else(|| {
-            error(
-                StatusCode::BAD_REQUEST,
-                "请求模型尚未启用，请同步并选择模型",
-            )
-        })?;
-    body["model"] = model.into();
-    Ok(())
-}
-
-fn resource_url(base: &str, resource: &str) -> String {
-    let mut base = base.trim_end_matches('/');
-    for suffix in [
-        "/messages/count_tokens",
-        "/chat/completions",
-        "/responses/compact",
-        "/responses",
-        "/messages",
-        "/models",
-    ] {
-        if let Some(root) = base.strip_suffix(suffix) {
-            base = root;
-            break;
+    let selected = &provider.summary.model;
+    if requested == selected {
+        return Ok(());
+    }
+    if messages && id == "selected:claude_code" {
+        let resolved = reverse::model_ids(provider)
+            .into_iter()
+            .find(|model| model == requested || reverse::model_alias(model) == requested);
+        if resolved.as_ref() == Some(selected)
+            || resolved.is_none()
+                && claude_internal_alias(requested)
+                && !provider
+                    .summary
+                    .codex_options
+                    .models
+                    .iter()
+                    .any(|model| model.id == requested)
+        {
+            body["model"] = selected.clone().into();
+            return Ok(());
         }
     }
-    if base.ends_with("/v1") {
-        format!("{base}/{resource}")
-    } else {
-        format!("{base}/v1/{resource}")
-    }
+    Err(error(
+        StatusCode::BAD_REQUEST,
+        "请求模型与该客户端已确认的模型不同，请在 AE Switch 重新选择并确认连接",
+    ))
 }
 
 pub(super) fn apply_selected_reasoning_effort(
@@ -129,13 +122,41 @@ pub(super) fn apply_selected_reasoning_effort(
         return;
     };
     if chat {
+        body.as_object_mut().unwrap().remove("reasoning");
         body["reasoning_effort"] = effort.into();
     } else {
+        body.as_object_mut().unwrap().remove("reasoning_effort");
         if !body["reasoning"].is_object() {
             body["reasoning"] = json!({});
         }
         body["reasoning"]["effort"] = effort.into();
     }
+}
+
+fn suppress_paid_context_beta(provider: &StoredProvider) -> bool {
+    let Some(policy) = provider
+        .summary
+        .codex_options
+        .applied_context_policy
+        .as_ref()
+    else {
+        return false;
+    };
+    if policy.long_context_enabled {
+        return false;
+    }
+    provider
+        .summary
+        .codex_options
+        .models
+        .iter()
+        .find(|model| model.id == policy.model)
+        .and_then(|model| {
+            crate::context_policy::capabilities(model, &provider.summary.base_url)
+                .ok()
+                .flatten()
+        })
+        .is_some_and(|limits| crate::context_policy::long_context_available(&limits))
 }
 
 async fn forward(
@@ -152,7 +173,7 @@ async fn forward(
     }
     let mut request = runtime
         .client
-        .post(resource_url(&provider.summary.base_url, resource))
+        .post(provider_resource_url(&provider, resource)?)
         .header("user-agent", "AE-Switch/0.1.0")
         .json(&body);
     request = if provider.summary.auth_mode == "x-api-key" {
@@ -162,11 +183,24 @@ async fn forward(
     };
     if resource.starts_with("messages") {
         request = request.header("anthropic-version", "2023-06-01");
-        if let Some(beta) = headers.get("anthropic-beta") {
-            request = request.header("anthropic-beta", beta);
+        let suppress = selected && suppress_paid_context_beta(&provider);
+        for beta in headers.get_all("anthropic-beta").iter() {
+            if !suppress {
+                request = request.header("anthropic-beta", beta);
+            } else if let Ok(beta) = beta.to_str() {
+                let retained = beta
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty() && !name.starts_with("context-1m-"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if !retained.is_empty() {
+                    request = request.header("anthropic-beta", retained);
+                }
+            }
         }
     }
-    let response = tokio::time::timeout(Duration::from_secs(60), request.send())
+    let response = tokio::time::timeout(UPSTREAM_HEADERS_WAIT, request.send())
         .await
         .map_err(|_| error(StatusCode::GATEWAY_TIMEOUT, "上游响应超时"))?
         .map_err(|_| {
@@ -198,7 +232,11 @@ async fn forward(
         ));
     }
     if body["stream"] != true {
-        return Ok((status, Json(read_json(response).await?)).into_response());
+        let mut direct = (status, Json(read_json(response).await?)).into_response();
+        direct
+            .extensions_mut()
+            .insert(activity::DirectUpstreamMetadata);
+        return Ok(direct);
     }
     if !response
         .headers()
@@ -212,7 +250,7 @@ async fn forward(
         let mut upstream = response.bytes_stream();
         let mut total = 0usize;
         loop {
-            match tokio::time::timeout(Duration::from_secs(90), upstream.next()).await {
+            match tokio::time::timeout(UPSTREAM_BODY_IDLE, upstream.next()).await {
                 Ok(Some(Ok(chunk))) => {
                     total = total.saturating_add(chunk.len());
                     if total > 32 * 1024 * 1024 { yield Err(std::io::Error::other("Upstream stream size limit exceeded")); break; }
@@ -224,32 +262,33 @@ async fn forward(
             }
         }
     };
-    Ok((
+    let mut direct = (
         [
             (header::CONTENT_TYPE, "text/event-stream"),
             (header::CACHE_CONTROL, "no-cache"),
         ],
         Body::from_stream(output),
     )
-        .into_response())
+        .into_response();
+    direct
+        .extensions_mut()
+        .insert(activity::DirectUpstreamMetadata);
+    Ok(direct)
 }
 
 pub(super) async fn responses(
     State(runtime): State<Runtime>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    Json(mut body): Json<Value>,
 ) -> std::result::Result<Response, HttpError> {
     let provider = provider(&runtime, &headers, &id)?;
+    enforce_selected_model(&id, &provider, &mut body, false)?;
+    crate::context_policy::guard_request(&provider.summary, &body)
+        .map_err(|e| error(StatusCode::PAYLOAD_TOO_LARGE, e.message))?;
     let trace = runtime.activity.begin(&id, &provider, &body, "responses");
     let result = if provider.summary.upstream_protocol() == CodexProtocol::Anthropic {
-        super::responses(
-            State(runtime),
-            Path(format!("agent:{id}")),
-            headers,
-            Json(body),
-        )
-        .await
+        super::responses_with_provider(runtime, provider, body).await
     } else {
         forward(
             runtime,
@@ -268,21 +307,19 @@ pub(super) async fn compact(
     State(runtime): State<Runtime>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    Json(mut body): Json<Value>,
 ) -> std::result::Result<Response, HttpError> {
     let provider = provider(&runtime, &headers, &id)?;
+    enforce_selected_model(&id, &provider, &mut body, false)?;
+    crate::context_policy::guard_request(&provider.summary, &body)
+        .map_err(|e| error(StatusCode::PAYLOAD_TOO_LARGE, e.message))?;
     let trace = runtime
         .activity
         .begin(&id, &provider, &body, "responses/compact");
     let result = if provider.summary.upstream_protocol() == CodexProtocol::Anthropic {
-        super::compact(
-            State(runtime),
-            Path(format!("agent:{id}")),
-            headers,
-            Json(body),
-        )
-        .await
-        .map(IntoResponse::into_response)
+        super::compact_with_provider(runtime, provider, body)
+            .await
+            .map(IntoResponse::into_response)
     } else {
         forward(
             runtime,
@@ -304,16 +341,13 @@ pub(super) async fn messages(
     Json(mut body): Json<Value>,
 ) -> std::result::Result<Response, HttpError> {
     let provider = provider(&runtime, &headers, &id)?;
-    normalize_claude_model(&id, &provider, &mut body)?;
+    enforce_selected_model(&id, &provider, &mut body, true)?;
+    crate::context_policy::guard_request(&provider.summary, &body)
+        .map_err(|e| error(StatusCode::PAYLOAD_TOO_LARGE, e.message))?;
     let trace = runtime.activity.begin(&id, &provider, &body, "messages");
     let result = if provider.summary.upstream_protocol() == CodexProtocol::Openai {
-        reverse_http::messages(
-            State(runtime),
-            Path(("agent".into(), id)),
-            headers,
-            Json(body),
-        )
-        .await
+        reverse_http::messages_with_provider(runtime, provider, body, id.starts_with("selected:"))
+            .await
     } else {
         forward(
             runtime,
@@ -335,18 +369,12 @@ pub(super) async fn count_tokens(
     Json(mut body): Json<Value>,
 ) -> std::result::Result<Response, HttpError> {
     let provider = provider(&runtime, &headers, &id)?;
-    normalize_claude_model(&id, &provider, &mut body)?;
+    enforce_selected_model(&id, &provider, &mut body, true)?;
     let trace = runtime
         .activity
         .begin(&id, &provider, &body, "messages/count_tokens");
     let result = if provider.summary.upstream_protocol() == CodexProtocol::Openai {
-        reverse_http::count_tokens(
-            State(runtime),
-            Path(("agent".into(), id)),
-            headers,
-            Json(body),
-        )
-        .await
+        reverse_http::count_tokens_with_provider(provider, body)
     } else {
         forward(
             runtime,
@@ -367,16 +395,17 @@ pub(super) async fn models(
     headers: HeaderMap,
 ) -> std::result::Result<Json<Value>, HttpError> {
     let provider = provider(&runtime, &headers, &id)?;
-    let mut ids: Vec<&str> = provider
-        .summary
-        .codex_options
-        .models
-        .iter()
-        .filter(|m| m.enabled)
-        .map(|m| m.id.as_str())
-        .collect();
-    if !ids.contains(&provider.summary.model.as_str()) {
-        ids.push(&provider.summary.model);
+    let mut ids = vec![provider.summary.model.as_str()];
+    if !id.starts_with("selected:") {
+        ids.extend(
+            provider
+                .summary
+                .codex_options
+                .models
+                .iter()
+                .filter(|m| m.enabled && m.id != provider.summary.model)
+                .map(|m| m.id.as_str()),
+        );
     }
     Ok(Json(
         json!({"object":"list","data":ids.iter().map(|id| json!({"id":id,"object":"model","owned_by":"configured-upstream"})).collect::<Vec<_>>()}),
@@ -474,14 +503,44 @@ pub(super) async fn chat(
     State(runtime): State<Runtime>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    Json(mut body): Json<Value>,
 ) -> std::result::Result<Response, HttpError> {
     let provider = provider(&runtime, &headers, &id)?;
+    enforce_selected_model(&id, &provider, &mut body, false)?;
+    crate::context_policy::guard_request(&provider.summary, &body)
+        .map_err(|e| error(StatusCode::PAYLOAD_TOO_LARGE, e.message))?;
     let trace = runtime
         .activity
         .begin(&id, &provider, &body, "chat/completions");
     let result = chat_response(runtime, provider, headers, id, body).await;
     activity::observe(trace, result)
+}
+
+fn chat_usage_from_messages(usage: &Value) -> Value {
+    let input = usage["input_tokens"].as_u64();
+    let output = usage["output_tokens"].as_u64();
+    let cached = usage["cache_read_input_tokens"].as_u64();
+    let written = usage["cache_creation_input_tokens"].as_u64();
+    let mut result = json!({});
+    if let Some(input) = input {
+        let input = input
+            .saturating_add(cached.unwrap_or(0))
+            .saturating_add(written.unwrap_or(0));
+        result["prompt_tokens"] = input.into();
+        if let Some(output) = output {
+            result["total_tokens"] = input.saturating_add(output).into();
+        }
+    }
+    if let Some(output) = output {
+        result["completion_tokens"] = output.into();
+    }
+    if let Some(cached) = cached {
+        result["prompt_tokens_details"] = json!({"cached_tokens":cached});
+    }
+    if let Some(written) = written {
+        result["cache_creation_input_tokens"] = written.into();
+    }
+    result
 }
 
 async fn chat_response(
@@ -536,9 +595,7 @@ async fn chat_response(
         if !tools.is_empty() {
             message["tool_calls"] = json!(tools);
         }
-        let input = data["usage"]["input_tokens"].as_u64().unwrap_or(0);
-        let output = data["usage"]["output_tokens"].as_u64().unwrap_or(0);
-        return Ok(Json(json!({"id":id,"object":"chat.completion","created":created,"model":model,"choices":[{"index":0,"message":message,"finish_reason":stop_reason(data["stop_reason"].as_str().unwrap_or("end_turn"))}],"usage":{"prompt_tokens":input,"completion_tokens":output,"total_tokens":input.saturating_add(output)}})).into_response());
+        return Ok(Json(json!({"id":id,"object":"chat.completion","created":created,"model":model,"choices":[{"index":0,"message":message,"finish_reason":stop_reason(data["stop_reason"].as_str().unwrap_or("end_turn"))}],"usage":chat_usage_from_messages(&data["usage"])})).into_response());
     }
     if !response
         .headers()
@@ -554,11 +611,10 @@ async fn chat_response(
         let mut decoder = stream::SseDecoder::default();
         let mut tool_indices = std::collections::BTreeMap::new();
         let mut finished = false;
-        let mut input_tokens = 0u64;
-        let mut output_tokens = 0u64;
+        let mut usage = json!({});
         yield Ok::<_, Infallible>(chat_event(&id, &model, created, json!({"role":"assistant"}), Value::Null));
         'read: loop {
-            let chunk = match tokio::time::timeout(Duration::from_secs(90), chunks.next()).await {
+            let chunk = match tokio::time::timeout(UPSTREAM_BODY_IDLE, chunks.next()).await {
                 Ok(Some(Ok(chunk))) => chunk,
                 Ok(None) => break,
                 _ => { yield Ok(Bytes::from("data: {\"error\":{\"message\":\"Upstream stream interrupted\"}}\n\n")); break; },
@@ -567,8 +623,9 @@ async fn chat_response(
             for event in events {
                 match event["type"].as_str() {
                     Some("message_start") => {
-                        let usage = &event["message"]["usage"];
-                        input_tokens = usage["input_tokens"].as_u64().unwrap_or(0).saturating_add(usage["cache_read_input_tokens"].as_u64().unwrap_or(0)).saturating_add(usage["cache_creation_input_tokens"].as_u64().unwrap_or(0));
+                        if event["message"]["usage"].is_object() {
+                            usage = event["message"]["usage"].clone();
+                        }
                     },
                     Some("content_block_start") if event["content_block"]["type"] == "text" => {
                         if let Some(text) = event["content_block"]["text"].as_str().filter(|text|!text.is_empty()) { yield Ok(chat_event(&id,&model,created,json!({"content":text}),Value::Null)); }
@@ -588,7 +645,13 @@ async fn chat_response(
                         }
                     },
                     Some("message_delta") => {
-                        output_tokens = event["usage"]["output_tokens"].as_u64().unwrap_or(output_tokens);
+                        if let Some(reported) = event["usage"].as_object() {
+                            for key in ["input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"] {
+                                if let Some(value) = reported.get(key).and_then(Value::as_u64) {
+                                    usage[key] = value.into();
+                                }
+                            }
+                        }
                         yield Ok(chat_event(&id, &model, created, json!({}), json!(stop_reason(event["delta"]["stop_reason"].as_str().unwrap_or("end_turn")))));
                     },
                     Some("message_stop") => { finished = true; break 'read; },
@@ -598,7 +661,7 @@ async fn chat_response(
             }
         }
         if finished {
-            if include_usage { yield Ok(Bytes::from(format!("data: {}\n\n", json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[],"usage":{"prompt_tokens":input_tokens,"completion_tokens":output_tokens,"total_tokens":input_tokens.saturating_add(output_tokens)}})))); }
+            if include_usage { yield Ok(Bytes::from(format!("data: {}\n\n", json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[],"usage":chat_usage_from_messages(&usage)})))); }
             yield Ok(Bytes::from("data: [DONE]\n\n"));
         }
     };
@@ -698,7 +761,7 @@ async fn responses_via_chat(
         let mut chunks = response.bytes_stream();
         let mut failure = None;
         'read: loop {
-            match tokio::time::timeout(Duration::from_secs(90), chunks.next()).await {
+            match tokio::time::timeout(UPSTREAM_BODY_IDLE, chunks.next()).await {
                 Ok(Some(Ok(chunk))) => match decoder.feed(&chunk) {
                     Ok(events) => for event in events {
                         match reverse.accept_chat(event) {

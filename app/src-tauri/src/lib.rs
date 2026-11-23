@@ -9,6 +9,7 @@ pub mod agent_verification;
 pub mod background;
 pub mod bridge;
 pub mod config_profiles;
+pub mod context_policy;
 pub mod desktop_platform;
 pub mod discovery;
 pub mod error;

@@ -203,6 +203,104 @@ fn repeated_configuration_preserves_first_original_native_contents() {
 }
 
 #[test]
+fn selected_native_subagent_models_roundtrip_exact_original_bytes() {
+    for (agent, original) in [
+        (
+            AgentId::ClaudeCode,
+            r#"{ "env": { "CLAUDE_CODE_SUBAGENT_MODEL": "old-child", "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "0" }, "permissions": { "allow": ["Read(*)"] } }"#,
+        ),
+        (
+            AgentId::OpenCode,
+            r#"{ "agent": { "custom": { "mode": "subagent", "model": "other/child", "permission": { "edit": "ask" } } } }"#,
+        ),
+        (
+            AgentId::Hermes,
+            "model:
+  default: old-main
+fallback_providers:
+  - provider: other
+    model: alternate-main
+fallback_model:
+  provider: old-provider
+  model: legacy-main
+delegation:
+  model: explicit-child
+  provider: explicit-provider
+  base_url: 'https://fixture.invalid/v1'
+  api_key: child-key
+  api_mode: anthropic_messages
+  fallback_providers:
+    - provider: other
+      model: alternate-child
+  max_concurrent_children: 2
+auxiliary:
+  compression:
+    fallback_chain:
+      - provider: other
+        model: alternate-summary
+    timeout: 47
+",
+        ),
+    ] {
+        let (_temporary, data, profile) = fixture(agent);
+        let path = paths(&data, agent, Some(&profile)).unwrap()["config"].clone();
+        std::fs::write(&path, original.as_bytes()).unwrap();
+        apply(&data, agent, &profile, "first-model");
+        apply(&data, agent, &profile, "second-model");
+
+        let candidate = std::fs::read_to_string(&path).unwrap();
+        let configured = document(&path, Some(&candidate)).unwrap();
+        match agent {
+            AgentId::ClaudeCode => {
+                assert_eq!(
+                    configured["env"]["CLAUDE_CODE_SUBAGENT_MODEL"],
+                    "second-model"
+                );
+                assert_eq!(configured["env"]["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"], "1");
+                assert_eq!(configured["permissions"]["allow"], json!(["Read(*)"]));
+            }
+            AgentId::OpenCode => {
+                assert_eq!(
+                    configured["agent"]["custom"]["model"],
+                    "ae_switch/second-model"
+                );
+                assert_eq!(configured["agent"]["custom"]["permission"]["edit"], "ask");
+            }
+            AgentId::Hermes => {
+                assert_eq!(configured["model"]["default"], "second-model");
+                assert_eq!(configured["fallback_providers"], json!([]));
+                assert_eq!(configured["fallback_model"], json!({}));
+                let delegation = &configured["delegation"];
+                for route in ["model", "provider", "base_url", "api_key", "api_mode"] {
+                    assert_eq!(delegation[route], "");
+                }
+                assert_eq!(delegation["fallback_providers"], json!([]));
+                assert_eq!(delegation["max_concurrent_children"], 2);
+                assert_eq!(
+                    configured["auxiliary"]["compression"]["fallback_chain"],
+                    json!([])
+                );
+                assert_eq!(configured["auxiliary"]["compression"]["timeout"], 47);
+            }
+            _ => unreachable!(),
+        }
+
+        let report = inspect(&data, agent, Some(&profile)).unwrap();
+        let selection = std::fs::read_to_string(data.join("agent-selection.json")).unwrap();
+        disconnect(
+            &data,
+            agent,
+            Some(&profile),
+            report.preview_token.as_deref().unwrap(),
+            &selection,
+            "{}",
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), original.as_bytes());
+    }
+}
+
+#[test]
 fn managed_field_changes_block_restore_and_reapply_without_touching_files() {
     let (_temporary, data, profile) = fixture(AgentId::ClaudeCode);
     apply(&data, AgentId::ClaudeCode, &profile, "first");

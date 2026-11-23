@@ -1,0 +1,22 @@
+{
+  "verifiedAt": "2026-11-08",
+  "pricingScope": "OpenAI official API https://api.openai.com/v1 only; excludes third-party gateways and subscriptions",
+  "models": [
+    {
+      "ids": ["gpt-6.1-sol"],
+      "standardWindow": 272000,
+      "longWindow": 1050000,
+      "inputMultiplier": 2,
+      "outputMultiplier": 1.5,
+      "sourceUrl": "https://developers.openai.com/api/docs/models/gpt-6.1-sol"
+    },
+    {
+      "ids": ["gpt-5.4", "gpt-5.4-2026-03-05", "gpt-5.4-pro"],
+      "standardWindow": 272000,
+      "longWindow": 1050000,
+      "inputMultiplier": 2,
+      "outputMultiplier": 1.5,
+      "sourceUrl": "https://developers.openai.com/api/docs/models/gpt-5.4"
+    }
+  ]
+}

@@ -34,6 +34,7 @@ fn fixture_mode(native: bool) -> (tempfile::TempDir, Store, String, String) {
                     models: vec![ProviderModel {
                         id: model.into(),
                         context_window: Some(256000),
+                        context_capabilities: None,
                         reasoning_efforts: vec![],
                         enabled: true,
                     }],

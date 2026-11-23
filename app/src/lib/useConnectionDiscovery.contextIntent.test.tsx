@@ -147,7 +147,11 @@ describe("explicit context intent", () => {
     const hook = renderHook(
       ({ baseUrl }) =>
         useConnectionDiscovery(
-          { ...connection, baseUrl },
+          {
+            ...connection,
+            baseUrl,
+            apiKey: baseUrl === provider.baseUrl ? null : "new-origin-key",
+          },
           "auto",
           "codex",
           provider,

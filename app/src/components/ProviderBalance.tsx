@@ -5,7 +5,13 @@ import { useBalance } from "../lib/useBalance";
 import { BalanceValue } from "./BalanceValue";
 import { formatBalanceAmount } from "../lib/formatBalance";
 
-export function ProviderBalance({ provider }: { provider: Provider }) {
+export function ProviderBalance({
+  provider,
+  announce = true,
+}: {
+  provider: Provider;
+  announce?: boolean;
+}) {
   const [expanded, setExpanded] = useState(false);
   const detailId = useId();
   const balance = useBalance(
@@ -21,7 +27,7 @@ export function ProviderBalance({ provider }: { provider: Provider }) {
       </span>
       <span
         className="balance-summary"
-        role="status"
+        role={announce ? "status" : undefined}
         title={
           balance.result
             ? `查询于 ${new Date(balance.result.checkedAt * 1000).toLocaleString()}`

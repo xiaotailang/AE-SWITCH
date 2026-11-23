@@ -148,6 +148,7 @@ fn quick_input(provider: Provider, target: Target) -> QuickModelInput {
         models: vec![ProviderModel {
             id: provider.model.clone(),
             context_window: Some(256_000),
+            context_capabilities: None,
             reasoning_efforts: vec![],
             enabled: true,
         }],
@@ -208,6 +209,7 @@ fn client_preferences_explicit_context_edit_uses_per_model_lengths_and_restores_
         .map(|(id, size)| ProviderModel {
             id: id.into(),
             context_window: Some(size),
+            context_capabilities: None,
             reasoning_efforts: vec![],
             enabled: true,
         })
@@ -265,6 +267,7 @@ fn client_preferences_inactive_context_intent_is_validated_and_applies_later() {
     value.codex_options.models = vec![ProviderModel {
         id: "test-model".into(),
         context_window: Some(128000),
+        context_capabilities: None,
         reasoning_efforts: vec![],
         enabled: true,
     }];
@@ -287,6 +290,7 @@ fn client_preferences_inactive_context_intent_is_validated_and_applies_later() {
         rejected.codex_options.models.push(ProviderModel {
             id: "disabled-model".into(),
             context_window: Some(128000),
+            context_capabilities: None,
             reasoning_efforts: vec![],
             enabled: false,
         });
@@ -343,6 +347,7 @@ fn client_preferences_explicit_context_rejects_profile_override_without_any_writ
     value.codex_options.models = vec![ProviderModel {
         id: "test-model".into(),
         context_window: Some(128000),
+        context_capabilities: None,
         reasoning_efforts: vec![],
         enabled: true,
     }];
@@ -548,6 +553,7 @@ fn client_preferences_future_unmanaged_values_allow_valid_model_menu_changes() {
         .map(|id| ProviderModel {
             id: (*id).into(),
             context_window: None,
+            context_capabilities: None,
             reasoning_efforts: vec![],
             enabled: true,
         })
@@ -759,12 +765,14 @@ fn disabling_desktop_conversion_after_model_fast_and_sync_preserves_other_target
         ProviderModel {
             id: value.model.clone(),
             context_window: Some(256_000),
+            context_capabilities: None,
             reasoning_efforts: vec![],
             enabled: true,
         },
         ProviderModel {
             id: "quick-selected-model".into(),
             context_window: Some(256_000),
+            context_capabilities: None,
             reasoning_efforts: vec![],
             enabled: true,
         },
@@ -1147,6 +1155,7 @@ fn explicit_reasoning_repair_survives_model_updates_and_fast_does_not_repair() {
     value.codex_options.models = vec![ProviderModel {
         id: value.model.clone(),
         enabled: true,
+        context_capabilities: None,
         reasoning_efforts: vec![],
         context_window: Some(256_000),
     }];
@@ -1185,6 +1194,7 @@ fn explicit_reasoning_repair_survives_model_updates_and_fast_does_not_repair() {
                     request.models.push(ProviderModel {
                         id: request.model.clone(),
                         enabled: true,
+                        context_capabilities: None,
                         reasoning_efforts: vec![],
                         context_window: Some(256_000),
                     });
@@ -1423,6 +1433,7 @@ fn model_refresh_replaces_catalog_and_removed_client_selection_without_reintrodu
             .map(|id| ProviderModel {
                 id: (*id).into(),
                 context_window: Some(512_000),
+                context_capabilities: None,
                 reasoning_efforts: vec![],
                 enabled: *id != "gpt-off",
             })
@@ -1442,18 +1453,21 @@ fn model_refresh_replaces_catalog_and_removed_client_selection_without_reintrodu
             ProviderModel {
                 id: "gpt-kept".into(),
                 context_window: Some(512_000),
+                context_capabilities: None,
                 reasoning_efforts: vec![],
                 enabled: true,
             },
             ProviderModel {
                 id: "gpt-new".into(),
                 context_window: Some(256_000),
+                context_capabilities: None,
                 reasoning_efforts: vec![],
                 enabled: true,
             },
             ProviderModel {
                 id: "gpt-off".into(),
                 context_window: Some(512_000),
+                context_capabilities: None,
                 reasoning_efforts: vec![],
                 enabled: false,
             },
@@ -1514,6 +1528,7 @@ fn inline_model_settings_apply_to_each_active_client_and_preserve_other_settings
         value.codex_options.models = vec![ProviderModel {
             id: value.model.clone(),
             context_window: Some(256_000),
+            context_capabilities: None,
             reasoning_efforts: vec![],
             enabled: true,
         }];
@@ -1528,6 +1543,7 @@ fn inline_model_settings_apply_to_each_active_client_and_preserve_other_settings
         request.models.push(ProviderModel {
             id: request.model.clone(),
             context_window: Some(512_000),
+            context_capabilities: None,
             reasoning_efforts: vec![],
             enabled: true,
         });
@@ -1620,6 +1636,7 @@ fn inline_context_and_repair_preserve_client_model_effort_and_fast_without_noop_
     value.codex_options.models = vec![ProviderModel {
         id: value.model.clone(),
         context_window: Some(256_000),
+        context_capabilities: None,
         reasoning_efforts: vec![],
         enabled: true,
     }];
@@ -1833,6 +1850,7 @@ fn applied_codex_model_context_edits_preserve_other_config_lines() {
         .map(|id| ProviderModel {
             id: id.into(),
             context_window: Some(256_000),
+            context_capabilities: None,
             reasoning_efforts: vec![],
             enabled: true,
         })
@@ -1966,6 +1984,7 @@ fn fast_toggle_preserves_client_choices_catalog_and_restores_original() {
         .map(|id| ProviderModel {
             id: (*id).into(),
             context_window: Some(128_000),
+            context_capabilities: None,
             reasoning_efforts: vec!["low".into()],
             enabled: true,
         })
@@ -2098,6 +2117,7 @@ fn fast_toggle_rejects_external_changes_without_partial_save() {
         value.codex_options.models = vec![ProviderModel {
             id: "test-model".into(),
             context_window: Some(256_000),
+            context_capabilities: None,
             reasoning_efforts: vec![],
             enabled: true,
         }];
@@ -2466,6 +2486,7 @@ fn one_shared_supplier_has_independent_client_snapshots_and_pending_edits() {
     value.codex_options.models = vec![ProviderModel {
         id: value.model.clone(),
         context_window: Some(256000),
+        context_capabilities: None,
         reasoning_efforts: vec![],
         enabled: true,
     }];
@@ -2553,6 +2574,7 @@ fn completed_confirm_journal_recovers_a_new_provider_only_after_all_files_exist(
     value.codex_options.models = vec![ProviderModel {
         id: value.model.clone(),
         context_window: Some(256000),
+        context_capabilities: None,
         reasoning_efforts: vec![],
         enabled: true,
     }];
@@ -2727,6 +2749,7 @@ fn bridge_routes_use_private_applied_snapshot_and_restore_transactionally() {
     value.codex_options.models = vec![ProviderModel {
         id: value.model.clone(),
         context_window: Some(256_000),
+        context_capabilities: None,
         reasoning_efforts: vec![],
         enabled: true,
     }];
@@ -2833,6 +2856,7 @@ fn reverse_bridges_have_independent_snapshots_aliases_and_restore_cli_environmen
         .map(|id| ProviderModel {
             id: (*id).into(),
             context_window: Some(256000),
+            context_capabilities: None,
             reasoning_efforts: vec![],
             enabled: true,
         })
@@ -2922,6 +2946,7 @@ fn reasoning_repair_preserves_client_choices_and_survives_sync_and_restore() {
         .map(|id| ProviderModel {
             id: (*id).into(),
             context_window: Some(128000),
+            context_capabilities: None,
             reasoning_efforts: vec!["low".into()],
             enabled: true,
         })
@@ -3113,6 +3138,7 @@ fn interrupted_reasoning_repair_commits_provider_only_with_all_files() {
     updated.summary.codex_options.models = vec![ProviderModel {
         id: "test-model".into(),
         context_window: None,
+        context_capabilities: None,
         reasoning_efforts: vec![],
         enabled: true,
     }];
@@ -3203,6 +3229,7 @@ fn desktop_display_repair_captures_original_preferences_preserves_other_settings
     value.codex_options.models = vec![ProviderModel {
         id: "test-model".into(),
         context_window: None,
+        context_capabilities: None,
         reasoning_efforts: vec![],
         enabled: true,
     }];
@@ -3299,12 +3326,14 @@ fn codex_model_refresh_writes_per_model_context_without_changing_client_choices_
         ProviderModel {
             id: "test-model".into(),
             context_window: Some(256_000),
+            context_capabilities: None,
             reasoning_efforts: vec![],
             enabled: true,
         },
         ProviderModel {
             id: "second".into(),
             context_window: Some(512_000),
+            context_capabilities: None,
             reasoning_efforts: vec![],
             enabled: true,
         },
@@ -3328,6 +3357,7 @@ fn codex_model_refresh_writes_per_model_context_without_changing_client_choices_
     models.push(ProviderModel {
         id: "disabled".into(),
         context_window: Some(1_000_000),
+        context_capabilities: None,
         reasoning_efforts: vec![],
         enabled: false,
     });
@@ -3388,6 +3418,7 @@ fn automatic_model_write_rejects_other_connections_invalid_values_and_external_f
     value.codex_options.models = vec![ProviderModel {
         id: "test-model".into(),
         context_window: Some(256_000),
+        context_capabilities: None,
         reasoning_efforts: vec![],
         enabled: true,
     }];
@@ -3448,6 +3479,62 @@ fn automatic_model_write_rejects_other_connections_invalid_values_and_external_f
 }
 
 #[test]
+fn saved_api_key_is_only_reused_at_the_same_endpoint_origin() {
+    let (_temp, mut store) = fixture();
+    let mut value = input(Family::Codex, "Origin-scoped connection");
+    value.base_url = "https://api.example.test/v1".into();
+    let provider = store.save(value.clone()).unwrap();
+    value.id = Some(provider.id.clone());
+    value.api_key = None;
+
+    let mut connection = ConnectionInput {
+        provider_id: Some(provider.id.clone()),
+        base_url: "https://API.example.test:443/proxy/v1/".into(),
+        api_key: None,
+        balance_access_token: None,
+    };
+    assert_eq!(
+        store.connection(connection.clone()).unwrap().1,
+        "test-key-1234"
+    );
+    value.base_url = connection.base_url.clone();
+    store.save(value.clone()).unwrap();
+
+    for endpoint in [
+        "https://other.example.test/v1",
+        "http://api.example.test/v1",
+        "https://api.example.test:8443/v1",
+    ] {
+        connection.base_url = endpoint.into();
+        value.base_url = endpoint.into();
+        assert_eq!(
+            store.connection(connection.clone()).unwrap_err().code,
+            "endpoint_key_required"
+        );
+        assert_eq!(
+            store.save(value.clone()).unwrap_err().code,
+            "endpoint_key_required"
+        );
+    }
+    assert_eq!(
+        store.provider(&provider.id).unwrap().api_key,
+        "test-key-1234"
+    );
+    connection.api_key = Some("replacement-credential".into());
+    assert_eq!(
+        store.connection(connection).unwrap().1,
+        "replacement-credential"
+    );
+    value.api_key = Some("replacement-credential".into());
+    let updated = store.save(value).unwrap();
+    assert_eq!(updated.id, provider.id);
+    assert_eq!(
+        store.provider(&provider.id).unwrap().api_key,
+        "replacement-credential"
+    );
+}
+
+#[test]
 fn balance_account_credentials_are_private_retained_and_bound_to_site() {
     let (_temp, mut store) = fixture();
     let mut value = input(Family::Codex, "账户余额");
@@ -3500,13 +3587,25 @@ fn balance_account_credentials_are_private_retained_and_bound_to_site() {
     let mut other = connection;
     other.base_url = "https://other.example.test/v1".into();
     assert!(store.balance_connection(other.clone(), q).is_err());
+    assert_eq!(
+        store
+            .auto_balance_connection(other.clone(), None)
+            .unwrap_err()
+            .code,
+        "endpoint_key_required"
+    );
+    other.api_key = Some("replacement-credential".into());
     assert!(store
         .auto_balance_connection(other, None)
         .unwrap()
         .3
         .is_none());
     value.base_url = "https://other.example.test/v1".into();
-    assert!(store.save(value.clone()).is_err());
+    value.api_key = Some("replacement-credential".into());
+    assert_eq!(
+        store.save(value.clone()).unwrap_err().code,
+        "missing_balance_token"
+    );
     value.balance_access_token = Some("new-console-token".into());
     assert!(store.save(value.clone()).is_ok());
     value.codex_options.balance_query = None;
@@ -3582,12 +3681,14 @@ fn codex_options_catalog_switch_and_restore_are_transactional() {
             ProviderModel {
                 id: "test-model".into(),
                 context_window: Some(128000),
+                context_capabilities: None,
                 reasoning_efforts: vec!["low".into(), "high".into()],
                 enabled: true,
             },
             ProviderModel {
                 id: "backup-model".into(),
                 context_window: None,
+                context_capabilities: None,
                 reasoning_efforts: vec![],
                 enabled: true,
             },
@@ -3697,6 +3798,7 @@ fn modified_catalog_is_preserved_and_invalid_options_are_rejected() {
     value.codex_options.models = vec![ProviderModel {
         id: "test-model".into(),
         context_window: None,
+        context_capabilities: None,
         reasoning_efforts: vec![],
         enabled: true,
     }];
@@ -3732,6 +3834,7 @@ fn codex_model_menu_choices_do_not_block_switch_or_restore_but_routing_changes_d
         .map(|id| ProviderModel {
             id: id.into(),
             context_window: None,
+            context_capabilities: None,
             reasoning_efforts: vec![],
             enabled: true,
         })
@@ -3835,6 +3938,7 @@ fn desktop_writes_profile_and_library_preserves_mcp_and_restores_new_settings() 
         id: (*id).into(),
         enabled: *id != "ignored-model",
         context_window: None,
+        context_capabilities: None,
         reasoning_efforts: Vec::new(),
     })
     .collect();

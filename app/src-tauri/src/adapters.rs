@@ -579,6 +579,7 @@ pub fn model_catalog(provider: &StoredProvider) -> Value {
     let fallback = [crate::types::ProviderModel {
         id: provider.summary.model.clone(),
         context_window: None,
+        context_capabilities: None,
         reasoning_efforts: vec![],
         enabled: true,
     }];
@@ -1376,6 +1377,7 @@ pub(crate) fn read_model_preferences(
                         id: id.into(),
                         enabled: true,
                         context_window: None,
+                        context_capabilities: None,
                         reasoning_efforts: Vec::new(),
                     })
                     .collect();

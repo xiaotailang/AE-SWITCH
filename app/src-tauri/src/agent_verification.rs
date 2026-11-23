@@ -24,6 +24,9 @@ const TOOL_EVENT_SHAPE_LIMIT: usize = 32;
 const TOOL_INPUT_KEY_LIMIT: usize = 16;
 const TOOL_METADATA_LABEL_LIMIT: usize = 96;
 
+#[path = "agent_verification/file_observation.rs"]
+mod file_observation;
+
 #[derive(Default)]
 struct Capture {
     stdout: Vec<u8>,
@@ -55,6 +58,7 @@ struct Evidence {
     readback_marker_observed: bool,
     assistant_marker_observed: bool,
     file_matches_marker: bool,
+    file_observation: Option<file_observation::Observation>,
 }
 
 #[derive(Debug)]
@@ -182,7 +186,11 @@ pub async fn verify_selected(
     let stable_codex_workspace = cfg!(windows) && agent == AgentId::Codex && profile.is_some();
     let relative_artifact = if matches!(
         agent,
-        AgentId::DeepSeekHarness | AgentId::OhMyPi | AgentId::OpenCode
+        AgentId::DeepSeekHarness
+            | AgentId::OhMyPi
+            | AgentId::OpenCode
+            | AgentId::Zcode
+            | AgentId::WorkBuddy
     ) || stable_codex_workspace
     {
         artifact.to_string_lossy().into_owned()
@@ -211,7 +219,8 @@ pub async fn verify_selected(
             Some(execution_workspace),
         );
         match command {
-            Ok(command) => {
+            Ok(mut command) => {
+                crate::agent_runner::apply_context_environment(&root, agent, &mut command)?;
                 let mut command = Command::from(command);
                 command
                     .stdin(Stdio::null())
@@ -255,6 +264,13 @@ pub async fn verify_selected(
     let expected_contents = verification_contents(agent, &marker);
     evidence.file_matches_marker = validate_owned_workspace(&workspace, &owned_workspace, nonce)
         && exact_owned_contents(&owned_workspace, &artifact, &expected_contents);
+    if validate_owned_workspace(&workspace, &owned_workspace, nonce) {
+        evidence.file_observation = Some(file_observation::inspect(
+            &owned_workspace,
+            &artifact,
+            &expected_contents,
+        ));
+    }
     let cleanup_succeeded =
         cleanup_owned_workspace(agent, &workspace, &owned_workspace, nonce, &filename);
     let (stage, message) = outcome(&capture, &evidence, cleanup_succeeded);
@@ -330,6 +346,16 @@ fn verification_prompt(agent: AgentId, relative_artifact: &str, marker: &str) ->
     let mut prompt = format!(
         "Only operate on the verification file {relative_artifact} inside the already-created owned verification directory. Do not read or change any other files. {creation} Then use your file read tool to read that same file back. Your final answer must be exactly the content returned by the read tool. Do not use network tools or delegate work."
     );
+    if matches!(agent, AgentId::Zcode | AgentId::WorkBuddy) {
+        // Their native Write takes file_path/content. An explicit JSON value
+        // removes ambiguity about path escaping, quotes and terminal newlines;
+        // the expected bytes and all independent evidence gates stay unchanged.
+        let input = json!({"file_path": relative_artifact, "content": marker});
+        prompt.push_str(&format!(
+            " Call Write using exactly this JSON object as the tool input: {input}. Its content value is exactly {} ASCII characters. Do not write the JSON object itself, the surrounding quotes, a markdown fence, a literal backslash-n, a BOM, a space or a final newline into the file. After that Write succeeds, make a separate Read call with file_path set to the same exact path. Use the returned file text without read-tool line numbers as the final answer.",
+            marker.len(),
+        ));
+    }
     if cfg!(windows) && agent == AgentId::Codex {
         // Keep the Windows CLI read in an independently observable text-read
         // operation. Byte arrays, aliases and a remembered marker are not proof
@@ -387,6 +413,23 @@ fn outcome(
     } else if capture.terminal_completion_required && !capture.terminal_completed_observed {
         ("tool", "官方工具没有报告未截断的 completed 回合终结事件。")
     } else if !evidence.verified(true) {
+        if !evidence.file_matches_marker {
+            if let Some(observation) = &evidence.file_observation {
+                match observation.status {
+                    "missing" => return ("tool", "官方工具没有创建本次指定的验证文件。"),
+                    "line_ending_mismatch" => {
+                        return (
+                            "tool",
+                            "验证文件的换行与本次要求不符，未判定为工具写读通过。",
+                        )
+                    }
+                    "unexpected_utf8_bom" => {
+                        return ("tool", "验证文件包含额外 UTF-8 BOM，未判定为工具写读通过。")
+                    }
+                    _ => {}
+                }
+            }
+        }
         (
             "tool",
             "未同时确认助手回复、精确文件内容及关联的写入和读取工具事件。",
@@ -447,6 +490,7 @@ fn report(
             "assistantMarkerObserved": evidence.assistant_marker_observed,
             "fileMatchesMarker": evidence.file_matches_marker,
             "processSucceeded": capture.process_succeeded, "exitCode": capture.exit_code,
+            "fileObservation": evidence.file_observation,
             "timedOut": capture.timed_out, "outputLimitExceeded": capture.output_limit_exceeded,
             "inheritedPipesOpen": capture.inherited_pipes_open,
             "capturedStdoutBytes": capture.stdout.len(), "capturedStderrBytes": capture.stderr.len(),
@@ -2422,6 +2466,30 @@ exit 0
                 !tool_evidence(AgentId::Codex, &events, "owned.txt", "MARKER")
                     .readback_marker_observed
             );
+        }
+    }
+
+    #[test]
+    fn native_write_probe_preserves_unicode_paths_and_exact_content_as_json_arguments() {
+        let path = r#"G:\客户项目\owner's folder\a \"quoted\" probe.txt"#;
+        let marker = "AE_TOOL_VERIFIED_synthetic";
+        for agent in [AgentId::Zcode, AgentId::WorkBuddy] {
+            let prompt = verification_prompt(agent, path, marker);
+            let input = prompt
+                .split_once("JSON object as the tool input: ")
+                .unwrap()
+                .1
+                .split_once(". Its content value")
+                .unwrap()
+                .0;
+            let input: Value = serde_json::from_str(input).unwrap();
+            assert_eq!(input["file_path"], path);
+            assert_eq!(input["content"], marker);
+            assert_eq!(verification_contents(agent, marker), marker);
+            assert!(prompt.contains("make a separate Read call"));
+            if agent == AgentId::Zcode {
+                assert!(prompt.contains("explicit offset: 0 and limit: 10"));
+            }
         }
     }
 

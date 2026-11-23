@@ -28,6 +28,8 @@ pub struct ProfileEntry {
     pub provider_id: String,
     pub model: String,
     pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_policy: Option<crate::context_policy::AppliedContextPolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,9 +70,11 @@ pub struct PreviewEntry {
     pub provider_name: String,
     pub model: String,
     pub reasoning_effort: Option<String>,
+    pub context_policy: Option<crate::context_policy::AppliedContextPolicy>,
     pub previous_provider_name: String,
     pub previous_model: String,
     pub previous_reasoning_effort: Option<String>,
+    pub previous_context_policy: Option<crate::context_policy::AppliedContextPolicy>,
     pub target_mode: &'static str,
     pub changed: bool,
 }
@@ -281,6 +285,7 @@ pub fn save(store: &Store, input: SaveProfileInput) -> Result<ConfigProfile> {
             provider_id: selection.provider_id.clone(),
             model: selection.model.clone(),
             reasoning_effort: selection.reasoning_effort.clone(),
+            context_policy: selection.context_policy.clone(),
         });
     }
     if entries.is_empty() {
@@ -397,6 +402,15 @@ fn plan(store: &Store, profile: ConfigProfile) -> Result<Plan> {
             entry.reasoning_effort.as_deref(),
         )?;
         let provider = store.agent_provider(&entry.provider_id)?;
+        let context_policy = if let Some(policy) = &entry.context_policy {
+            crate::context_policy::validate_applied(&provider.summary, policy)?;
+            if policy.model != entry.model {
+                return Err(invalid());
+            }
+            Some(policy.clone())
+        } else {
+            crate::context_policy::resolve(&provider.summary, &entry.model, None)?
+        };
         digest.update(serde_json::to_vec(&provider).map_err(|_| invalid())?);
         let old_provider = store.agent_provider(&previous.provider_id)?;
         let base = format!(
@@ -421,6 +435,7 @@ fn plan(store: &Store, profile: ConfigProfile) -> Result<Plan> {
             &route.token,
             &entry.model,
             previous.profile.as_ref(),
+            context_policy.as_ref(),
         )?;
         let checked_snapshots = agent_configs::configuration_snapshots(
             root,
@@ -477,16 +492,19 @@ fn plan(store: &Store, profile: ConfigProfile) -> Result<Plan> {
         }
         let changed = previous.provider_id != entry.provider_id
             || previous.model != entry.model
-            || previous.reasoning_effort != entry.reasoning_effort;
+            || previous.reasoning_effort != entry.reasoning_effort
+            || previous.context_policy != context_policy;
         entries.push(PreviewEntry {
             agent_id: entry.agent_id,
             provider_id: entry.provider_id.clone(),
             provider_name: provider.summary.name,
             model: entry.model.clone(),
             reasoning_effort: entry.reasoning_effort.clone(),
+            context_policy: context_policy.clone(),
             previous_provider_name: old_provider.summary.name,
             previous_model: previous.model.clone(),
             previous_reasoning_effort: previous.reasoning_effort.clone(),
+            previous_context_policy: previous.context_policy.clone(),
             target_mode: if previous.profile.is_some() {
                 "existing"
             } else {
@@ -500,6 +518,7 @@ fn plan(store: &Store, profile: ConfigProfile) -> Result<Plan> {
                 provider_id: entry.provider_id.clone(),
                 model: entry.model.clone(),
                 reasoning_effort: entry.reasoning_effort.clone(),
+                context_policy,
                 configuration_revision: previous
                     .configuration_revision
                     .checked_add(1)

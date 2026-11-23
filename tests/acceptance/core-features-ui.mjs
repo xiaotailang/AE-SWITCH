@@ -244,6 +244,13 @@ async function client(name) {
     .getByRole("navigation", { name: "选择 Agent" })
     .getByRole("button", { name: new RegExp(name) })
     .click();
+  await page.getByRole("heading", { name, exact: true }).waitFor();
+  // Changing clients resets preference state in a React effect. A native
+  // details toggle can otherwise observe the previous client's still-open
+  // DOM, skip the click, then lose its controls when that reset commits.
+  await page.waitForFunction(
+    () => !document.querySelector(".hub-model-preferences")?.open,
+  );
 }
 async function verified() {
   await visible(
@@ -341,6 +348,15 @@ try {
       id,
       enabled: true,
       contextWindow: 256000,
+      contextCapabilities: {
+        standardWindow: 64000,
+        longWindow: 256000,
+        source: "endpoint",
+        inputMultiplier: 2,
+        outputMultiplier: 1.5,
+        endpoint: "https://synthetic-provider.invalid/v1",
+        credentialScope: "a".repeat(64),
+      },
       reasoningEfforts: ["low", "high"],
     }));
     const calls = [];
@@ -697,6 +713,17 @@ try {
     .locator("#hub-model option[value='fixture-small']")
     .waitFor({ state: "attached" });
   await page.locator("#hub-model").selectOption("fixture-small");
+  const longContext = page.getByRole("switch", { name: "长上下文", exact: true });
+  await longContext.waitFor({ state: "visible" });
+  assert.equal(await longContext.isChecked(), false);
+  assert.equal(await page.getByRole("spinbutton", { name: "自动压缩阈值（%）" }).inputValue(), "80");
+  await page.getByText(/压缩阈值 51,200 Token（80%）/).waitFor();
+  await longContext.check();
+  await page.getByText(/压缩阈值 204,800 Token（80%）/).waitFor();
+  await longContext.uncheck();
+  await page.getByText(/压缩阈值 51,200 Token（80%）/).waitFor();
+  assert.equal(await count("save_provider"), 0);
+  check("long context defaults off, requires an explicit toggle, restores the short budget and does not save a draft");
   const search = page.getByRole("textbox", { name: "搜索模型" });
   await search.fill("fixture large");
   await expectValue(page.locator("#hub-model"), "fixture-small");

@@ -31,8 +31,29 @@ export interface ProviderInput {
 export interface ProviderModel {
   id: string;
   contextWindow: number | null;
+  contextCapabilities?: ContextCapabilities | null;
   reasoningEfforts: string[];
   enabled: boolean;
+}
+export interface ContextCapabilities {
+  standardWindow: number;
+  longWindow: number;
+  source: "endpoint" | "official_model" | "conservative";
+  inputMultiplier: number | null;
+  outputMultiplier: number | null;
+  surcharge?: boolean | null;
+  endpoint?: string | null;
+  credentialScope?: string | null;
+}
+export interface ContextPolicy {
+  model: string;
+  longContextEnabled: boolean;
+  compactPercent: number;
+}
+export interface AppliedContextPolicy extends ContextPolicy {
+  contextWindow: number;
+  autoCompactTokenLimit: number;
+  capabilityScope?: string | null;
 }
 export interface BalanceQuery {
   adapter?:
@@ -62,6 +83,7 @@ export interface CodexOptions {
   fastMode: boolean | null;
   contextWindow: number | null;
   autoCompactTokenLimit: number | null;
+  contextPolicy?: ContextPolicy | null;
   models: ProviderModel[];
   modelsSyncedAt: number | null;
   balanceQuery: BalanceQuery | null;

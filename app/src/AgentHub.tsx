@@ -38,13 +38,20 @@ import { useConnectionDiscovery } from "./lib/useConnectionDiscovery";
 import { WindowChrome } from "./components/WindowChrome";
 import { TutorialDialog } from "./components/TutorialDialog";
 import { RequestActivityPanel } from "./components/RequestActivityPanel";
+import { ProviderBalance } from "./components/ProviderBalance";
 import { AgentModelPicker } from "./components/AgentModelPicker";
 import { ConfigurationSafetyPanel } from "./components/ConfigurationSafetyPanel";
 import { ConfigProfilesPanel } from "./components/ConfigProfilesPanel";
+import { ContextPolicySettings } from "./components/ContextPolicySettings";
+import {
+  contextCapabilities,
+  contextChoice,
+  effectiveContext,
+} from "./lib/contextPolicy";
 import { rememberModelUse } from "./lib/modelPreferences";
 import { APP_VERSION } from "./lib/appVersion";
 import { projectUrl } from "./lib/projectLinks";
-import type { Provider, ProviderInput } from "./types";
+import type { ContextPolicy, Provider, ProviderInput } from "./types";
 import claudeCodeLogo from "./assets/agents/claude-code.png";
 import codexLogo from "./assets/agents/codex.png";
 import codexLightLogo from "./assets/brands/codex.png";
@@ -144,6 +151,16 @@ export default function AgentHub() {
     value: string | null;
   } | null>(null);
   const [showKey, setShowKey] = useState(false);
+  const [contextSelection, setContextSelection] = useState<{
+    context: string;
+    value: ContextPolicy;
+  } | null>(null);
+  const [savedContextDraft, setSavedContextDraft] = useState<{
+    agentId: AgentId;
+    providerId: string;
+    value: ContextPolicy;
+    capabilities: string;
+  } | null>(null);
   const [busy, setBusy] = useState<
     | "save"
     | "confirm"
@@ -351,6 +368,7 @@ export default function AgentHub() {
     ].every((value) => value.trim().length > 0);
   const providers = overview.data?.providers ?? [];
   const provider = providers.find((item) => item.id === providerId);
+  const activeProvider = providers.find((item) => item.id === agent.providerId);
   const target = selectedAgent === "claude_code" ? "claude_cli" : "codex";
   const discovery = useConnectionDiscovery(
     {
@@ -362,6 +380,7 @@ export default function AgentHub() {
     target,
     provider,
     "auto",
+    "endpoint",
   );
   const models =
     discovery.verified && !discovery.failure
@@ -401,6 +420,36 @@ export default function AgentHub() {
     reasoningChoice?.context === reasoningContext
       ? reasoningChoice.value
       : savedReasoning;
+  const contextKey = JSON.stringify([
+    reasoningContext,
+    selectedModel?.contextWindow,
+    selectedModel?.contextCapabilities,
+  ]);
+  const contextEndpoint = discovery.verified ? discovery.baseUrl : baseUrl;
+  const contextLimits = contextCapabilities(selectedModel, contextEndpoint);
+  const contextPolicy =
+    selectedModel && contextLimits
+      ? contextSelection?.context === contextKey
+        ? contextSelection.value
+        : contextChoice(
+            selectedModel,
+            provider?.model === discovery.model &&
+              provider.baseUrl.replace(/\/+$/, "") ===
+                baseUrl.replace(/\/+$/, "") &&
+              !apiKey.trim()
+              ? savedContextDraft?.agentId === selectedAgent &&
+                savedContextDraft.providerId === provider.id &&
+                savedContextDraft.capabilities === JSON.stringify(contextLimits)
+                ? savedContextDraft.value
+                : agent.providerId === provider.id &&
+                    agent.model === discovery.model &&
+                    agent.contextPolicy
+                  ? agent.contextPolicy
+                  : null
+              : null,
+            contextEndpoint,
+          )
+      : null;
   const enabled =
     desktopRuntime &&
     discovery.ready &&
@@ -594,6 +643,8 @@ export default function AgentHub() {
 
   function chooseProvider(next?: Provider) {
     setReasoningChoice(null);
+    setContextSelection(null);
+    setSavedContextDraft(null);
     setProviderId(next?.id ?? "");
     setBaseUrl(next?.baseUrl ?? DEFAULT_ENDPOINT);
     setApiKey("");
@@ -629,6 +680,20 @@ export default function AgentHub() {
           !readyReasoningLevels.includes(reasoningEffort)))
     )
       throw new Error("模型的思考等级信息已变化，请重新同步并选择。");
+    const readyContextModel = ready.models.find(
+      (model) => model.id === ready.model,
+    );
+    if (
+      contextPolicy &&
+      (!readyContextModel ||
+        ready.model !== discovery.model ||
+        JSON.stringify(
+          contextCapabilities(readyContextModel, ready.baseUrl),
+        ) !== JSON.stringify(contextLimits))
+    )
+      throw new Error("模型的上下文能力已变化，请重新选择长上下文开关。");
+    if (contextPolicy && readyContextModel)
+      effectiveContext(readyContextModel, contextPolicy, ready.baseUrl);
     let host = "API 供应商";
     try {
       host = new URL(baseUrl).hostname;
@@ -646,17 +711,31 @@ export default function AgentHub() {
       reasoningEffort,
       codexOptions: {
         fastMode: null,
-        contextWindow: null,
-        autoCompactTokenLimit: null,
         balanceQuery: null,
         ...provider?.codexOptions,
         upstreamProtocol: ready.protocol,
         protocolDetectedAt: ready.syncedAt,
         models: ready.models,
         modelsSyncedAt: ready.syncedAt,
+        contextPolicy,
+        contextWindow: null,
+        autoCompactTokenLimit: null,
+        perModelContext: false,
       },
     };
     const saved = await api.save(input);
+    setSavedContextDraft(
+      contextPolicy
+        ? {
+            agentId: selectedAgent,
+            providerId: saved.id,
+            value: contextPolicy,
+            capabilities: JSON.stringify(
+              contextCapabilities(readyContextModel, ready.baseUrl),
+            ),
+          }
+        : null,
+    );
     setProviderId(saved.id);
     setName(saved.name);
     setBaseUrl(saved.baseUrl);
@@ -1116,6 +1195,8 @@ export default function AgentHub() {
                       spellCheck={false}
                       onChange={(event) => {
                         setReasoningChoice(null);
+                        setContextSelection(null);
+                        setSavedContextDraft(null);
                         setBaseUrl(event.target.value);
                         setNotice(null);
                         setProbe(null);
@@ -1131,10 +1212,11 @@ export default function AgentHub() {
                     <input
                       id="hub-api-key"
                       type={showKey ? "text" : "password"}
-                      required={!provider}
+                      required={!provider?.hasKey || discovery.needsEndpointKey}
                       autoComplete="off"
+                      aria-describedby="hub-api-key-note"
                       placeholder={
-                        provider?.hasKey
+                        provider?.hasKey && !discovery.needsEndpointKey
                           ? `已保存密钥 ····${provider.keySuffix}，留空保留`
                           : "输入你的 API Key"
                       }
@@ -1143,6 +1225,8 @@ export default function AgentHub() {
                       spellCheck={false}
                       onChange={(event) => {
                         setReasoningChoice(null);
+                        setContextSelection(null);
+                        setSavedContextDraft(null);
                         setApiKey(event.target.value);
                         setNotice(null);
                         setProbe(null);
@@ -1163,9 +1247,11 @@ export default function AgentHub() {
                       )}
                     </button>
                   </div>
-                  <p>
+                  <p id="hub-api-key-note">
                     <ShieldCheck size={12} aria-hidden />
-                    密钥不会显示在工作台列表中。
+                    {provider?.hasKey && discovery.needsEndpointKey
+                      ? "已切换至其他站点，请输入此端点的 API Key。"
+                      : "密钥不会显示在工作台列表中。"}
                   </p>
                 </div>
               </div>
@@ -1204,6 +1290,7 @@ export default function AgentHub() {
                   }
                   onChange={(model) => {
                     setReasoningChoice(null);
+                    setContextSelection(null);
                     discovery.selectDefault(model);
                     setNotice(null);
                     setProbe(null);
@@ -1231,7 +1318,14 @@ export default function AgentHub() {
                   ) : models.length ? (
                     <>
                       <Check size={13} aria-hidden />
-                      {models.length} 个可用模型
+                      {models.length} 个可用模型 ·{" "}
+                      {discovery.protocol === "anthropic"
+                        ? "Anthropic"
+                        : "OpenAI 兼容"}{" "}
+                      ·{" "}
+                      {discovery.authMode === "x-api-key"
+                        ? "x-api-key"
+                        : "Bearer"}
                     </>
                   ) : (
                     <>
@@ -1283,6 +1377,19 @@ export default function AgentHub() {
                         : "选择模型后可设置思考程度。"}
                 </p>
               </fieldset>
+
+              <ContextPolicySettings
+                model={selectedModel}
+                value={contextPolicy}
+                disabled={!!busy || discovery.busy || !models.length}
+                agentId={selectedAgent}
+                baseUrl={contextEndpoint}
+                onChange={(value) => {
+                  setContextSelection({ context: contextKey, value });
+                  setProbe(null);
+                  setNotice(null);
+                }}
+              />
 
               <details className="hub-extra-settings">
                 <summary>已保存连接</summary>
@@ -1947,6 +2054,9 @@ export default function AgentHub() {
               agentId={selectedAgent}
               agentName={agent.name}
             />
+            {activeProvider && (
+              <ProviderBalance provider={activeProvider} announce={false} />
+            )}
             <details
               className="hub-advanced-features"
               onToggle={(event) => {

@@ -27,6 +27,8 @@ pub(crate) struct Selection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) context_policy: Option<crate::context_policy::AppliedContextPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) profile: Option<ExistingProfile>,
     #[serde(default)]
     pub(crate) configuration_revision: u64,
@@ -122,7 +124,7 @@ pub fn restart_context(
     Ok(context)
 }
 
-fn selections(root: &Path) -> Result<BTreeMap<String, Selection>> {
+pub(crate) fn selections(root: &Path) -> Result<BTreeMap<String, Selection>> {
     Ok(read_selections(root)?.0)
 }
 
@@ -219,6 +221,7 @@ fn override_environment_variables(
             "CLAUDE_CODE_USE_GATEWAY",
             "ANTHROPIC_UNIX_SOCKET",
             "CLAUDE_CODE_SUBAGENT_MODEL",
+            "CLAUDE_CODE_SUBAGENT_MODEL_FORCE",
             "ANTHROPIC_SMALL_FAST_MODEL",
             "ANTHROPIC_CUSTOM_HEADERS",
         ],
@@ -320,7 +323,7 @@ pub fn overview(store: &Store) -> Result<Value> {
         let (warnings,variables)=profile_warnings(definition.id,profile);
         let directory = profile.map(|profile| PathBuf::from(&profile.directory)).unwrap_or(private_directory.clone());
         let launcher = if configured { Some(profile.map(|profile| PathBuf::from(&profile.executable_path)).unwrap_or_else(|| private_directory.join(agent_configs::launcher_file_name()))) } else { None };
-        json!({"id":definition.id,"name":definition.name,"description":definition.description,"protocol":definition.protocol,"configured":configured,"directory":directory,"launcher":launcher,"model":selection.map(|s| &s.model),"reasoningEffort":selection.and_then(|s| s.reasoning_effort.as_ref()),"providerId":selection.map(|s| &s.provider_id),"profile":profile,"mode":if profile.is_some(){"existing"}else{"private"},"needsRestart":configured,"configurationRevision":selection.map_or(0,|selection|selection.configuration_revision),"appliedAtMs":selection.map_or(0,|selection|selection.applied_at_ms),"canLaunch":configured&&launch_reason.is_none(),"reason":validation.err().map(|error|error.message),"launchReason":launch_reason,"warnings":warnings,"overrideEnvironmentVariables":variables})
+        json!({"id":definition.id,"name":definition.name,"description":definition.description,"protocol":definition.protocol,"configured":configured,"directory":directory,"launcher":launcher,"model":selection.map(|s| &s.model),"reasoningEffort":selection.and_then(|s| s.reasoning_effort.as_ref()),"contextPolicy":selection.and_then(|s| s.context_policy.as_ref()),"providerId":selection.map(|s| &s.provider_id),"profile":profile,"mode":if profile.is_some(){"existing"}else{"private"},"needsRestart":configured,"configurationRevision":selection.map_or(0,|selection|selection.configuration_revision),"appliedAtMs":selection.map_or(0,|selection|selection.applied_at_ms),"canLaunch":configured&&launch_reason.is_none(),"reason":validation.err().map(|error|error.message),"launchReason":launch_reason,"warnings":warnings,"overrideEnvironmentVariables":variables})
     }).collect();
     Ok(json!({"agents":agents,"dataDirectory":store.data_directory,"bridgeHealthy":false}))
 }
@@ -412,6 +415,13 @@ pub(crate) fn gateway_provider(store: &Store, id: &str) -> Result<StoredProvider
     validate_reasoning_effort(&provider, &saved.model, saved.reasoning_effort.as_deref())?;
     provider.summary.model = saved.model;
     provider.summary.reasoning_effort = saved.reasoning_effort;
+    provider.summary.codex_options.applied_context_policy =
+        if let Some(policy) = saved.context_policy {
+            crate::context_policy::validate_applied(&provider.summary, &policy)?;
+            Some(policy)
+        } else {
+            crate::context_policy::resolve(&provider.summary, &provider.summary.model, None)?
+        };
     Ok(provider)
 }
 
@@ -420,6 +430,10 @@ pub fn configure(store: &Store, input: AgentInput) -> Result<Value> {
     let model = selected_model(store, &input)?;
     let reasoning_effort =
         selected_reasoning_effort(&store.agent_provider(&input.provider_id)?, &model)?;
+    let context_policy = crate::context_policy::selected(
+        &store.agent_provider(&input.provider_id)?.summary,
+        &model,
+    )?;
     let profile = input
         .profile
         .as_ref()
@@ -455,6 +469,7 @@ pub fn configure(store: &Store, input: AgentInput) -> Result<Value> {
             provider_id: input.provider_id.clone(),
             model: model.clone(),
             reasoning_effort: reasoning_effort.clone(),
+            context_policy: context_policy.clone(),
             profile: profile.clone(),
             configuration_revision,
             applied_at_ms,
@@ -487,6 +502,7 @@ pub fn configure(store: &Store, input: AgentInput) -> Result<Value> {
         .map_err(|_| AppError::new("serialization", "无法读取 Agent 配置"))?;
     result["providerId"] = json!(input.provider_id);
     result["reasoningEffort"] = json!(reasoning_effort);
+    result["contextPolicy"] = json!(context_policy);
     result["profile"] = json!(profile);
     result["mode"] = json!(if result["profile"].is_null() {
         "private"
@@ -520,6 +536,7 @@ pub fn probe_context(store: &Store, input: &AgentInput) -> Result<ProbeContext> 
     let provider = store.agent_provider(&input.provider_id)?;
     let model = selected_model(store, input)?;
     let reasoning_effort = selected_reasoning_effort(&provider, &model)?;
+    let context_policy = crate::context_policy::selected(&provider.summary, &model)?;
     let profile = input
         .profile
         .as_ref()
@@ -530,6 +547,7 @@ pub fn probe_context(store: &Store, input: &AgentInput) -> Result<ProbeContext> 
         selection.provider_id == input.provider_id
             && selection.model == model
             && selection.reasoning_effort == reasoning_effort
+            && selection.context_policy == context_policy
             && selection.profile == profile
     }) {
         return Err(AppError::new(
@@ -823,7 +841,7 @@ pub fn launch(store: &Store, agent: AgentId) -> Result<()> {
         .ok_or_else(|| AppError::new("not_configured", "请先配置此 Agent"))?;
     if let Some(profile) = saved.profile {
         // Reopening must not mutate selection/revision or cancel pending restarts.
-        return launch_existing(agent, &profile);
+        return launch_existing(root, agent, &profile);
     }
     configure(
         store,
@@ -898,11 +916,12 @@ pub fn launch(store: &Store, agent: AgentId) -> Result<()> {
     Ok(())
 }
 
-fn launch_existing(agent: AgentId, profile: &ExistingProfile) -> Result<()> {
+fn launch_existing(root: &Path, agent: AgentId, profile: &ExistingProfile) -> Result<()> {
     if agent == AgentId::DeepSeekHarness {
         return Err(AppError::new("task_required","DeepSeek Harness headless 需要明确任务，请在原终端提供 task 后运行；AE 不会代写或重放任务"));
     }
-    let command = crate::agent_runner::existing_command(agent, profile, &[], None)?;
+    let mut command = crate::agent_runner::existing_command(agent, profile, &[], None)?;
+    crate::agent_runner::apply_context_environment(root, agent, &mut command)?;
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -1023,6 +1042,7 @@ mod tests {
                     models: vec![crate::types::ProviderModel {
                         id: "selected-model".into(),
                         context_window: None,
+                        context_capabilities: None,
                         reasoning_efforts: vec![],
                         enabled: true,
                     }],
@@ -1100,6 +1120,7 @@ mod tests {
                     models: vec![crate::types::ProviderModel {
                         id: "disabled-selected".into(),
                         context_window: None,
+                        context_capabilities: None,
                         reasoning_efforts: vec![],
                         enabled: false,
                     }],

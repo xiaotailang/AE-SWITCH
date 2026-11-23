@@ -144,6 +144,33 @@ fn stream_handles_byte_splits_thinking_tool_json_and_usage() {
 }
 
 #[test]
+fn stream_decoder_limits_accumulated_data_and_preserves_multiline_events() {
+    let mut decoder = stream::SseDecoder::default();
+    assert!(decoder
+        .feed(b"data: {\"first\": 1,\r\n")
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        decoder.feed(b"data: \"second\": 2}\r\n\r\n").unwrap(),
+        vec![json!({"first":1,"second":2})]
+    );
+    assert_eq!(
+        decoder.feed(b"data: [DONE]\n\n").unwrap(),
+        vec![json!({"type":"uni_switch_done"})]
+    );
+
+    let payload = "x".repeat(1023);
+    let line = format!("data: {payload}\n");
+    for _ in 0..(stream::MAX_SSE_EVENT_BYTES / (payload.len() + 1)) {
+        assert!(decoder.feed(line.as_bytes()).unwrap().is_empty());
+    }
+    assert_eq!(
+        decoder.feed(line.as_bytes()).unwrap_err(),
+        "Claude 流式事件过大"
+    );
+}
+
+#[test]
 fn rejects_unsupported_inputs_and_invalid_tool_json() {
     for request in [
         json!({"model":"claude","input":"hello","previous_response_id":"resp_other"}),
@@ -165,15 +192,21 @@ fn old_records_default_to_direct_responses_and_urls_are_normalized() {
     let options: crate::types::CodexOptions = serde_json::from_value(json!({"models":[]})).unwrap();
     assert_eq!(options.protocol, crate::types::CodexProtocol::Openai);
     assert_eq!(
-        endpoint("https://example.test/anthropic"),
+        resource_url("https://example.test/anthropic", "messages", false)
+            .unwrap()
+            .as_str(),
         "https://example.test/anthropic/v1/messages"
     );
     assert_eq!(
-        endpoint("https://example.test/v1/"),
+        resource_url("https://example.test/v1/", "messages", false)
+            .unwrap()
+            .as_str(),
         "https://example.test/v1/messages"
     );
     assert_eq!(
-        endpoint("https://example.test/v1/messages"),
+        resource_url("https://example.test/v1/messages", "messages", false)
+            .unwrap()
+            .as_str(),
         "https://example.test/v1/messages"
     );
     assert_eq!(

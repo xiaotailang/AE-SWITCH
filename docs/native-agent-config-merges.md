@@ -21,7 +21,9 @@ JSON 文件保留未受管字段的语义，格式可能重新排版。Codex TOM
 | Z Code           | 默认选择及 `v2/agents-state.json` 中已有的 general-purpose、Explore 模型选择              | reasoning 选项、其他代理、disabledAgentIds 和历史；没有状态文件时不创建，没有路由变化时保持原字节                 |
 | WorkBuddy        | 所选 models.json 条目及官方 headless host 的主模型；默认标题、子代理与压缩沿用主选择      | 其他模型、偏好和历史。该范围不等于原厂桌面 GUI 已验收                                                             |
 
-此范围依据当前绑定版本的官方默认工作流。其他自定义代理、独立多模态任务、插件和用户主动选择的其他模型不由主任务成功推定已验证。
+新版接入还同步 Codex 已有的 `[agents].default_subagent_model`，以及 OpenCode 可作为子代理启动的配置项。Claude Code 2.1.257 起，AE 通过原生环境变量固定子代理、队友和工作流代理的模型。Hermes 的已有委派模型和端点覆盖交由父代理连接接管，已存在的备用推理路由在 AE 接入期间暂停，断开时随受管配置恢复。
+
+已配置客户端的网关路由对所有进入该路由的推理请求使用同一模型。Claude 原生角色别名解析到所选模型，明确指定的 OpenAI 思考等级随推理请求传递。独立配置文件、插件自建连接和供应商内部路由需要各自提供执行证据。
 
 DeepSeek 的所选 `ae-switch` 供应商使用 `apiKeyEnv` 引用网关凭据。既有模式写入原生 `.credentials.yaml` 的 profile 唯一 refs（`AE_SWITCH_<profile摘要>_API_KEY`），保留其他 refs/records；须确认有效 composition 加载默认本地凭据插件以及实际凭据路径，停用、替换或无法解析的覆盖会拒绝。旧私有模式仍使用 `AE_GATEWAY_TOKEN` 启动环境。官方请求链会让 `headers.Authorization` 覆盖 SDK 自动生成的 Bearer 认证，且请求头名称不区分大小写。因此，一键配置会把该供应商已有的每个 Authorization 字符串值更新为 `Bearer <当前网关令牌>`，包括旧令牌或空值，同时保留原请求头名称和大小写；没有该请求头时不创建。其他供应商的请求头和所选供应商的普通请求头（包括 `Proxy-Authorization`）保留。`headers` 必须是字符串值的对象，错误结构会在写入任何配置文件、环境文件或启动器之前拒绝配置；未知的直接 `apiKey` 字段保留，不推测其认证作用。
 

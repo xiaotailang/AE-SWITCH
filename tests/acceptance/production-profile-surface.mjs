@@ -18,6 +18,21 @@ const manualFields = ["原配置目录", "原用户目录", "客户端启动文�
 const savedDetails = ".hub-connection-panel > form > .hub-extra-settings";
 export const PROFILE_SCOPE =
   "Production Hermes multi-directory selection and manual required fields with an owned localhost synthetic model catalog; no supplier, configuration or inference acceptance";
+const freshDefaultEndpoint = "https://aiease-yun.com";
+
+export function assertFreshProfileDraft(initial) {
+  for (const key of ["provider", "name", "model"])
+    assert.equal(initial[key], "", "Profile lane requires an unsaved connection draft");
+  assert.ok(
+    initial.endpoint === freshDefaultEndpoint,
+    "Profile lane requires the shipped public default endpoint",
+  );
+  assert.equal(initial.keyEmpty, true);
+  assert.equal(initial.keyMasked, true);
+  assert.equal(initial.manual, false);
+  assert.ok(initial.agent);
+}
+
 export const PROFILE_CHECKS = Object.freeze([
   "fresh owned Hermes fixture is copied without changing original files",
   "ordinary Rust discovery returns two owned directories without automatic selection",
@@ -530,7 +545,7 @@ async function publicPageState(page) {
     manual: !!document.querySelector(".hub-manual-profile"),
     panels: [
       ...document.querySelectorAll(
-        ".hub-connection-panel > form > .hub-extra-settings, .hub-profile-settings, .hub-client-actions",
+        ".hub-connection-panel > form > .hub-extra-settings, .hub-profile-settings, .hub-advanced-paths, .hub-client-actions",
       ),
     ].map((element) => ({ className: element.className, open: element.open })),
   }));
@@ -671,16 +686,7 @@ export async function verifyProductionProfiles({
       "initial ordinary discovery readiness",
     );
     initial = await publicPageState(page);
-    for (const key of ["provider", "endpoint", "name", "model"])
-      assert.equal(
-        initial[key],
-        "",
-        "Profile lane requires an empty connection draft",
-      );
-    assert.equal(initial.keyEmpty, true);
-    assert.equal(initial.keyMasked, true);
-    assert.equal(initial.manual, false);
-    assert.ok(initial.agent);
+    assertFreshProfileDraft(initial);
     assert.equal(await page.getByRole("dialog").count(), 0);
     assert.equal(await page.locator(".hub-help").count(), 0);
     assert.equal(
@@ -773,7 +779,9 @@ export async function verifyProductionProfiles({
       await choose(fixture.named);
     });
     await check(PROFILE_CHECKS[4], async () => {
-      await button("手动指定已有客户端").click();
+      await details(".hub-profile-settings", true);
+      await details(".hub-advanced-paths", true);
+      await button("手动设置完整路径").click();
       manualValues = await Promise.all(
         manualFields.map((label) =>
           page.getByLabel(label, { exact: true }).inputValue(),
@@ -796,7 +804,7 @@ export async function verifyProductionProfiles({
         );
         receipt.manualRequiredFields.push(manualFields[index]);
       }
-      await button("使用自动探测结果").click();
+      await button("使用识别结果").click();
       assert.ok(
         same(
           JSON.parse(await page.locator("#hub-installed-profile").inputValue())
@@ -835,13 +843,13 @@ export async function verifyProductionProfiles({
         await page.locator("#hub-api-key").fill("");
         await page.locator("#hub-endpoint").fill("");
         await selectAgent("Hermes Agent");
-        if (await button("使用自动探测结果").count()) {
+        if (await button("使用识别结果").count()) {
           if (manualValues)
             for (let index = 0; index < manualFields.length; index++)
               await page
                 .getByLabel(manualFields[index], { exact: true })
                 .fill(manualValues[index]);
-          await button("使用自动探测结果").click();
+          await button("使用识别结果").click();
         }
         await page
           .locator("#hub-installed-profile")

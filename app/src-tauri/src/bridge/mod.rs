@@ -29,6 +29,11 @@ use std::{
     time::Duration,
 };
 
+// First byte and inactivity are separate limits. Active streams may run
+// longer than either limit without incurring a whole-request deadline.
+const UPSTREAM_HEADERS_WAIT: Duration = Duration::from_secs(300);
+const UPSTREAM_BODY_IDLE: Duration = Duration::from_secs(300);
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Route {
     pub port: u16,
@@ -187,22 +192,60 @@ fn authorize(
         .store
         .lock()
         .map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "配置服务繁忙"))?;
-    let result = if let Some(id) = id.strip_prefix("agent:") {
-        crate::agent_hub::gateway_provider(&store, id)
-    } else {
-        store.bridge_provider(id)
-    };
-    result.map_err(|e| error(StatusCode::CONFLICT, e.message))
+    store
+        .bridge_provider(id)
+        .map_err(|e| error(StatusCode::CONFLICT, e.message))
 }
-fn endpoint(base: &str) -> String {
-    let base = base.trim_end_matches('/');
-    if base.ends_with("/messages") {
-        base.to_owned()
-    } else if base.ends_with("/v1") {
-        format!("{base}/messages")
+fn resource_url(
+    base: &str,
+    resource: &str,
+    exact_prefix: bool,
+) -> std::result::Result<url::Url, HttpError> {
+    let mut url = url::Url::parse(base)
+        .map_err(|_| error(StatusCode::BAD_GATEWAY, "已保存的上游 API 端点无效"))?;
+    let path = url.path().trim_end_matches('/');
+    let explicit_prefix = [
+        "/messages/count_tokens",
+        "/chat/completions",
+        "/responses/compact",
+        "/responses",
+        "/messages",
+        "/models",
+    ]
+    .iter()
+    .find_map(|suffix| path.strip_suffix(*suffix));
+    let prefix = explicit_prefix.unwrap_or(path);
+    let versioned = prefix.rsplit('/').next().is_some_and(|segment| {
+        segment.strip_prefix('v').is_some_and(|version| {
+            !version.is_empty() && version.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    });
+    let path = if exact_prefix
+        || explicit_prefix.is_some()
+        || versioned
+        || prefix.ends_with("/backend-api/codex")
+    {
+        format!("{prefix}/{resource}")
     } else {
-        format!("{base}/v1/messages")
-    }
+        format!("{prefix}/v1/{resource}")
+    };
+    url.set_path(&path);
+    Ok(url)
+}
+
+fn provider_resource_url(
+    provider: &StoredProvider,
+    resource: &str,
+) -> std::result::Result<url::Url, HttpError> {
+    // OpenAI discovery saves the exact /models prefix. Older and native
+    // Anthropic entries may still contain a bare host that implies /v1.
+    let exact_prefix = provider.summary.upstream_protocol() == crate::types::CodexProtocol::Openai
+        && provider
+            .summary
+            .codex_options
+            .protocol_detected_at
+            .is_some();
+    resource_url(&provider.summary.base_url, resource, exact_prefix)
 }
 fn redact(message: &str, key: &str) -> String {
     message
@@ -218,7 +261,7 @@ async fn upstream(
 ) -> std::result::Result<reqwest::Response, HttpError> {
     let mut request = runtime
         .client
-        .post(endpoint(&provider.summary.base_url))
+        .post(provider_resource_url(provider, "messages")?)
         .header("anthropic-version", "2023-06-01")
         .json(body);
     if provider.summary.auth_mode == "x-api-key" {
@@ -226,7 +269,7 @@ async fn upstream(
     } else {
         request = request.bearer_auth(&provider.api_key);
     }
-    let response = tokio::time::timeout(Duration::from_secs(45), request.send())
+    let response = tokio::time::timeout(UPSTREAM_HEADERS_WAIT, request.send())
         .await
         .map_err(|_| error(StatusCode::GATEWAY_TIMEOUT, "等待 Claude 响应超时"))?
         .map_err(|_| {
@@ -258,7 +301,7 @@ async fn read_json(response: reqwest::Response) -> std::result::Result<Value, Ht
     let mut chunks = response.bytes_stream();
     let mut bytes = Vec::new();
     loop {
-        let next = tokio::time::timeout(Duration::from_secs(90), chunks.next())
+        let next = tokio::time::timeout(UPSTREAM_BODY_IDLE, chunks.next())
             .await
             .map_err(|_| error(StatusCode::GATEWAY_TIMEOUT, "Claude 响应超时"))?;
         let Some(chunk) = next else { break };
@@ -314,6 +357,14 @@ async fn responses(
     Json(body): Json<Value>,
 ) -> std::result::Result<Response, HttpError> {
     let provider = authorize(&runtime, &headers, &id)?;
+    responses_with_provider(runtime, provider, body).await
+}
+
+async fn responses_with_provider(
+    runtime: Runtime,
+    provider: StoredProvider,
+    body: Value,
+) -> std::result::Result<Response, HttpError> {
     validate_model(&provider, &body)?;
     let streaming = body["stream"] == true;
     let converted =
@@ -362,7 +413,7 @@ async fn responses(
         let mut chunks = response.bytes_stream();
         let mut failure = None;
         'read: loop {
-            match tokio::time::timeout(Duration::from_secs(90), chunks.next()).await {
+            match tokio::time::timeout(UPSTREAM_BODY_IDLE, chunks.next()).await {
                 Ok(Some(Ok(chunk))) => {
                     match decoder.feed(&chunk) {
                         Ok(events) => for event in events {
@@ -397,9 +448,17 @@ async fn compact(
     State(runtime): State<Runtime>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    Json(mut body): Json<Value>,
+    Json(body): Json<Value>,
 ) -> std::result::Result<Json<Value>, HttpError> {
     let provider = authorize(&runtime, &headers, &id)?;
+    compact_with_provider(runtime, provider, body).await
+}
+
+async fn compact_with_provider(
+    runtime: Runtime,
+    provider: StoredProvider,
+    mut body: Value,
+) -> std::result::Result<Json<Value>, HttpError> {
     validate_model(&provider, &body)?;
     body.as_object_mut()
         .ok_or_else(|| error(StatusCode::BAD_REQUEST, "请求必须是 JSON 对象"))?;

@@ -24,17 +24,50 @@ fn only_accepts_local_token_and_rejects_browser_origins() {
 #[test]
 fn canonicalizes_resource_without_duplicate_version_paths() {
     assert_eq!(
-        resource_url("https://example.test", "responses"),
+        resource_url("https://example.test", "responses", false)
+            .unwrap()
+            .as_str(),
         "https://example.test/v1/responses"
     );
     assert_eq!(
-        resource_url("https://example.test/v1/", "chat/completions"),
+        resource_url("https://example.test/v1/", "chat/completions", false)
+            .unwrap()
+            .as_str(),
         "https://example.test/v1/chat/completions"
     );
     assert_eq!(
-        resource_url("https://example.test/v1/messages", "responses"),
+        resource_url("https://example.test/v1/messages", "responses", false)
+            .unwrap()
+            .as_str(),
         "https://example.test/v1/responses"
     );
+}
+
+#[test]
+fn preserves_discovered_reverse_proxy_and_versioned_routes() {
+    for (base, exact, expected) in [
+        (
+            "https://example.test/backend-api/codex",
+            false,
+            "https://example.test/backend-api/codex/responses",
+        ),
+        (
+            "https://example.test/gateway/v2",
+            false,
+            "https://example.test/gateway/v2/responses",
+        ),
+        (
+            "https://example.test/gateway%20path",
+            true,
+            "https://example.test/gateway%20path/responses",
+        ),
+        ("https://responses", false, "https://responses/v1/responses"),
+    ] {
+        assert_eq!(
+            resource_url(base, "responses", exact).unwrap().as_str(),
+            expected
+        );
+    }
 }
 
 #[test]

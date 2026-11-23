@@ -131,6 +131,7 @@ pub fn existing_command(
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL",
                 "ANTHROPIC_SMALL_FAST_MODEL",
                 "CLAUDE_CODE_SUBAGENT_MODEL",
+                "CLAUDE_CODE_SUBAGENT_MODEL_FORCE",
                 "ANTHROPIC_CUSTOM_HEADERS",
                 "CLAUDE_CODE_USE_BEDROCK",
                 "CLAUDE_CODE_USE_VERTEX",
@@ -260,6 +261,31 @@ pub fn existing_command(
         command.args(arguments);
     }
     Ok(command)
+}
+
+/// Only AE-launched children inherit these owned choices; no global environment changes.
+pub(crate) fn apply_context_environment(
+    root: &Path,
+    agent: AgentId,
+    command: &mut std::process::Command,
+) -> Result<()> {
+    if agent == AgentId::WorkBuddy {
+        if let Some(policy) = crate::agent_hub::selections(root)?
+            .get(agent.as_str())
+            .and_then(|entry| entry.context_policy.as_ref())
+        {
+            command
+                .env(
+                    "CODEBUDDY_AUTO_COMPACT_WINDOW",
+                    policy.context_window.to_string(),
+                )
+                .env(
+                    "CODEBUDDY_AUTOCOMPACT_PCT_OVERRIDE",
+                    policy.compact_percent.to_string(),
+                );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -599,6 +625,7 @@ const VALUE_VARIABLES: &[&str] = &[
     "ANTHROPIC_DEFAULT_SONNET_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
     "CLAUDE_CODE_SUBAGENT_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL_FORCE",
     "ANTHROPIC_SMALL_FAST_MODEL",
     "ANTHROPIC_CUSTOM_HEADERS",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",

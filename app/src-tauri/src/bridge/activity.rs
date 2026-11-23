@@ -11,6 +11,10 @@ const MAX_NUMBER: u64 = 9_007_199_254_740_991;
 #[derive(Clone, Default)]
 pub(super) struct ActivityLog(Arc<Mutex<VecDeque<RequestActivity>>>);
 
+/// Marks a response whose model metadata came directly from the upstream wire.
+#[derive(Clone)]
+pub(super) struct DirectUpstreamMetadata;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RequestActivity {
@@ -18,6 +22,14 @@ pub struct RequestActivity {
     pub agent_id: AgentId,
     pub started_at: u64,
     pub model: Option<String>,
+    #[serde(default)]
+    pub configured_model: Option<String>,
+    #[serde(default)]
+    pub configured_effort: Option<String>,
+    #[serde(default)]
+    pub reported_model: Option<String>,
+    #[serde(default)]
+    pub reported_effort: Option<String>,
     pub endpoint: String,
     pub upstream_protocol: String,
     pub streaming: bool,
@@ -35,6 +47,8 @@ pub struct TokenUsage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cached_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_write_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
 }
 
@@ -68,6 +82,10 @@ impl ActivityLog {
                 .as_millis()
                 .min(MAX_NUMBER as u128) as u64,
             model,
+            configured_model: Some(provider.summary.model.clone()),
+            configured_effort: provider.summary.reasoning_effort.clone(),
+            reported_model: None,
+            reported_effort: None,
             endpoint: endpoint.into(),
             upstream_protocol: match provider.summary.upstream_protocol() {
                 crate::types::CodexProtocol::Openai => "openai",
@@ -92,6 +110,7 @@ impl ActivityLog {
             record,
             started: Instant::now(),
             finished: false,
+            api_key: provider.api_key.clone(),
         })
     }
 
@@ -117,6 +136,7 @@ pub(super) struct RequestTrace {
     record: RequestActivity,
     started: Instant,
     finished: bool,
+    api_key: String,
 }
 
 impl RequestTrace {
@@ -137,6 +157,20 @@ impl RequestTrace {
             Some(self.started.elapsed().as_millis().min(MAX_NUMBER as u128) as u64);
         self.finished = true;
         self.update();
+    }
+
+    fn update_metadata(&mut self, metadata: &ResponseMetadata, direct: bool) {
+        self.record.usage = metadata.usage.clone();
+        if direct {
+            self.record.reported_model = metadata
+                .reported_model
+                .as_ref()
+                .filter(|model| self.api_key.is_empty() || !model.contains(&self.api_key))
+                .cloned();
+            self.record
+                .reported_effort
+                .clone_from(&metadata.reported_effort);
+        }
     }
 }
 
@@ -170,10 +204,15 @@ pub(super) fn observe(
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.starts_with("text/event-stream"));
+    let direct = response
+        .extensions()
+        .get::<DirectUpstreamMetadata>()
+        .is_some();
     let (parts, body) = response.into_parts();
     let output = async_stream::stream! {
         let mut metadata = ResponseMetadata::new(sse);
         let mut stream = body.into_data_stream();
+        let mut last_update = Instant::now();
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
@@ -183,11 +222,16 @@ pub(super) fn observe(
                     }
                     trace.record.response_bytes = trace.record.response_bytes.saturating_add(bytes.len() as u64).min(MAX_NUMBER);
                     metadata.push(&bytes);
+                    if last_update.elapsed() >= Duration::from_secs(1) {
+                        trace.update_metadata(&metadata, direct);
+                        trace.update();
+                        last_update = Instant::now();
+                    }
                     // Forward the original bytes immediately, including tools and errors.
                     yield Ok::<_, axum::Error>(bytes);
                 }
                 Err(error) => {
-                    trace.record.usage = metadata.usage;
+                    trace.update_metadata(&metadata, direct);
                     trace.finish("interrupted");
                     yield Err(error);
                     return;
@@ -204,7 +248,7 @@ pub(super) fn observe(
         } else {
             "completed"
         };
-        trace.record.usage = metadata.usage;
+        trace.update_metadata(&metadata, direct);
         trace.finish(state);
     };
     Ok(Response::from_parts(parts, Body::from_stream(output)))
@@ -219,6 +263,8 @@ struct ResponseMetadata {
     line: Vec<u8>,
     line_oversized: bool,
     usage: TokenUsage,
+    reported_model: Option<String>,
+    reported_effort: Option<String>,
     terminal: bool,
     failed: bool,
     incomplete: bool,
@@ -233,6 +279,8 @@ impl ResponseMetadata {
             line: Vec::new(),
             line_oversized: false,
             usage: TokenUsage::default(),
+            reported_model: None,
+            reported_effort: None,
             terminal: false,
             failed: false,
             incomplete: false,
@@ -333,6 +381,24 @@ impl ResponseMetadata {
                     .iter()
                     .any(|choice| choice["finish_reason"].is_string())
             });
+        for payload in [&value, &value["message"], &value["response"]] {
+            if let Some(model) = payload["model"].as_str().filter(|model| {
+                !model.is_empty()
+                    && model.len() <= 256
+                    && model
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:/@".contains(&byte))
+            }) {
+                self.reported_model = Some(model.to_owned());
+            }
+            if let Some(effort) = payload["reasoning"]["effort"]
+                .as_str()
+                .or_else(|| payload["reasoning_effort"].as_str())
+                .filter(|effort| crate::types::valid_effort(effort))
+            {
+                self.reported_effort = Some(effort.to_owned());
+            }
+        }
         for usage in [
             &value["usage"],
             &value["message"]["usage"],
@@ -353,25 +419,30 @@ impl TokenUsage {
                 *target = Some(target.unwrap_or(0).max(value));
             }
         }
+        let read = number(&usage["cache_read_input_tokens"]);
+        let write = number(&usage["cache_creation_input_tokens"]);
+        let openai_cached = number(&usage["input_tokens_details"]["cached_tokens"])
+            .or_else(|| number(&usage["prompt_tokens_details"]["cached_tokens"]))
+            .or_else(|| number(&usage["prompt_cache_hit_tokens"]));
         let input = number(&usage["input_tokens"]).or_else(|| number(&usage["prompt_tokens"]));
         // Anthropic input_tokens excludes cached/created tokens; OpenAI includes them.
         let input = input.and_then(|input| {
-            input
-                .checked_add(number(&usage["cache_read_input_tokens"]).unwrap_or(0))?
-                .checked_add(number(&usage["cache_creation_input_tokens"]).unwrap_or(0))
-                .filter(|total| *total <= MAX_NUMBER)
+            let total = if usage["prompt_tokens"].is_number() || openai_cached.is_some() {
+                input
+            } else {
+                input
+                    .checked_add(read.unwrap_or(0))?
+                    .checked_add(write.unwrap_or(0))?
+            };
+            (total <= MAX_NUMBER).then_some(total)
         });
         merge(&mut self.input_tokens, input);
         merge(
             &mut self.output_tokens,
             number(&usage["output_tokens"]).or_else(|| number(&usage["completion_tokens"])),
         );
-        merge(
-            &mut self.cached_tokens,
-            number(&usage["cache_read_input_tokens"])
-                .or_else(|| number(&usage["input_tokens_details"]["cached_tokens"]))
-                .or_else(|| number(&usage["prompt_tokens_details"]["cached_tokens"])),
-        );
+        merge(&mut self.cached_tokens, openai_cached.or(read));
+        merge(&mut self.cache_write_tokens, write);
         merge(
             &mut self.reasoning_tokens,
             number(&usage["output_tokens_details"]["reasoning_tokens"])

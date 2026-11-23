@@ -216,22 +216,24 @@ fn release_routing_omp_all_official_chat_workflow_roles_use_the_selected_model()
 }
 
 #[test]
-fn release_routing_claude_unpinned_subagents_inherit_the_selected_model() {
+fn release_routing_claude_spawned_agents_receive_the_selected_model_override() {
     let temp = root();
     reconfigure_twice(temp.path(), AgentId::ClaudeCode);
     let directory = temp.path().join("agents/claude_code");
     let settings = native_json(&directory.join("home/.claude/settings.json"));
     let environment = native_json(&directory.join("configuration/environment.json"));
-    for name in [
-        "CLAUDE_CODE_SUBAGENT_MODEL",
-        "ANTHROPIC_SMALL_FAST_MODEL",
-        "ANTHROPIC_CUSTOM_HEADERS",
-    ] {
+    for name in ["ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_CUSTOM_HEADERS"] {
         assert!(settings["env"].get(name).is_none());
         assert!(environment.get(name).is_none());
     }
-    assert_eq!(settings["env"]["ANTHROPIC_MODEL"], "second-model");
-    assert_eq!(environment["ANTHROPIC_MODEL"], "second-model");
+    for (name, value) in [
+        ("ANTHROPIC_MODEL", "second-model"),
+        ("CLAUDE_CODE_SUBAGENT_MODEL", "second-model"),
+        ("CLAUDE_CODE_SUBAGENT_MODEL_FORCE", "1"),
+    ] {
+        assert_eq!(settings["env"][name], value);
+        assert_eq!(environment[name], value);
+    }
 }
 
 #[test]
@@ -269,11 +271,11 @@ fn release_routing_opencode_auxiliary_small_model_uses_selected_gateway() {
 }
 
 #[test]
-fn release_routing_opencode_builtin_and_selected_default_agent_models_follow_gateway() {
+fn release_routing_opencode_builtin_and_spawnable_agent_models_follow_gateway() {
     let temp = root();
     let mut before = serde_json::json!({
         "model":"foreign/main","small_model":"foreign/title","default_agent":"custom_default",
-        "agent":{"custom_default":{"name":"display-only-name","model":"foreign/default","permission":{"edit":"ask"}},"other_custom":{"model":"untouched/model","mode":"subagent"}},
+        "agent":{"custom_default":{"name":"display-only-name","model":"foreign/default","permission":{"edit":"ask"}},"subagent":{"model":"foreign/subagent","mode":"subagent","temperature":0.2},"dual":{"model":"foreign/dual","mode":"all","permission":{"edit":"ask"}},"unspecified":{"model":"foreign/unspecified"},"inherited":{"mode":"subagent","description":"leave model absent"},"other_custom":{"model":"untouched/model","mode":"primary"}},
         "mcp":{"custom":{"command":["keep-server"]}},"compaction":{"reserved":5432}
     });
     for agent in [
@@ -304,6 +306,9 @@ fn release_routing_opencode_builtin_and_selected_default_agent_models_follow_gat
         "title",
         "summary",
         "custom_default",
+        "subagent",
+        "dual",
+        "unspecified",
     ] {
         assert_eq!(
             after["agent"][agent]["model"], "ae_switch/second-model",
@@ -313,10 +318,9 @@ fn release_routing_opencode_builtin_and_selected_default_agent_models_follow_gat
         expected["model"] = "ae_switch/second-model".into();
         assert_eq!(after["agent"][agent], expected);
     }
-    assert_eq!(
-        after["agent"]["other_custom"],
-        before["agent"]["other_custom"]
-    );
+    for agent in ["other_custom", "inherited"] {
+        assert_eq!(after["agent"][agent], before["agent"][agent]);
+    }
     for key in ["default_agent", "mcp", "compaction"] {
         assert_eq!(after[key], before[key]);
     }
@@ -356,15 +360,29 @@ fn release_routing_malformed_omp_auxiliary_role_refuses_all_configuration_writes
 }
 
 #[test]
-fn release_routing_codex_review_model_follows_selected_model_in_active_profile() {
+fn release_routing_codex_review_and_spawn_model_defaults_follow_selected_model() {
     let temp = root();
-    let path = seed_native(temp.path(), AgentId::Codex, "home/.codex/config.toml", "review_model = 'foreign-review'\nprofile = 'work'\n[profiles.work]\nmodel = 'foreign-main'\nreview_model = 'profile-review'\n[profiles.other]\nreview_model = 'keep-other'\n[history]\npersistence = 'save-all'\n[mcp_servers.custom]\ncommand = 'keep-server'\n");
+    let path = seed_native(temp.path(), AgentId::Codex, "home/.codex/config.toml", "review_model = 'foreign-review'\nprofile = 'work'\n[agents]\ndefault_subagent_model = 'foreign-child' # preserve this comment\ndefault_subagent_reasoning_effort = 'low'\nmax_threads = 3\n[agents.custom]\nconfig_file = 'user-agent.toml'\n[profiles.work]\nmodel = 'foreign-main'\nreview_model = 'profile-review'\n[profiles.other]\nreview_model = 'keep-other'\n[history]\npersistence = 'save-all'\n[mcp_servers.custom]\ncommand = 'keep-server'\n");
     reconfigure_twice(temp.path(), AgentId::Codex);
     let document = std::fs::read_to_string(path)
         .unwrap()
         .parse::<toml_edit::DocumentMut>()
         .unwrap();
     assert_eq!(document["review_model"].as_str(), Some("second-model"));
+    assert_eq!(
+        document["agents"]["default_subagent_model"].as_str(),
+        Some("second-model")
+    );
+    assert!(document.to_string().contains("# preserve this comment"));
+    assert_eq!(document["agents"]["max_threads"].as_integer(), Some(3));
+    assert_eq!(
+        document["agents"]["default_subagent_reasoning_effort"].as_str(),
+        Some("low")
+    );
+    assert_eq!(
+        document["agents"]["custom"]["config_file"].as_str(),
+        Some("user-agent.toml")
+    );
     assert_eq!(
         document["profiles"]["work"]["review_model"].as_str(),
         Some("second-model")
@@ -2848,6 +2866,7 @@ fn deepseek_windows_pwsh_patch_is_relative_to_workspace_and_survives_move() {
             "token",
             "model",
             &mut environment,
+            None,
             None,
         )
         .unwrap();

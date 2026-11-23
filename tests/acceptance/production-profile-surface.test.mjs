@@ -7,6 +7,7 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   PROFILE_CHECKS,
   PROFILE_SCOPE,
+  assertFreshProfileDraft,
   assertProfileCommands,
   assertProfileDiscovery,
   assertProfileReceipt,
@@ -57,7 +58,7 @@ test("profile retry opens a collapsed location panel before strict two-profile d
     async evaluate(read) {
       if (String(read).includes("typeof window.__TAURI_INTERNALS__")) return true;
       return {
-        agent: "Hermes Agent", provider: "", endpoint: "", name: "",
+        agent: "Hermes Agent", provider: "", endpoint: "https://aiease-yun.com", name: "",
         model: "", profile: "", keyEmpty: true, keyMasked: true, manual: false,
         panels: [...panels].map(([selector, open]) => ({
           className: selector.includes("hub-extra-settings")
@@ -135,6 +136,19 @@ test("profile retry opens a collapsed location panel before strict two-profile d
       return true;
     },
   );
+});
+
+test("fresh native draft permits the shipped public default and rejects saved data or exposed credentials", () => {
+  const fresh = {
+    agent: "Hermes Agent", provider: "", name: "", model: "",
+    endpoint: "https://aiease-yun.com", keyEmpty: true, keyMasked: true, manual: false,
+  };
+  assert.doesNotThrow(() => assertFreshProfileDraft(fresh));
+  for (const changed of [
+    { endpoint: "" }, { endpoint: "https://unexpected.invalid" },
+    { provider: "saved-provider" }, { name: "saved-name" }, { model: "saved-model" },
+    { keyEmpty: false }, { keyMasked: false }, { manual: true }, { agent: "" },
+  ]) assert.throws(() => assertFreshProfileDraft({ ...fresh, ...changed }));
 });
 
 function newFixture() {

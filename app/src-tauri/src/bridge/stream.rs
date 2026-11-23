@@ -2,16 +2,18 @@ use super::convert::{self, ConversionResult, Tool};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
+pub(super) const MAX_SSE_EVENT_BYTES: usize = 4 * 1024 * 1024;
+
 // SSE is decoded by complete byte lines: a network chunk may split a UTF-8 character.
 #[derive(Default)]
 pub struct SseDecoder {
     buffer: Vec<u8>,
-    data: Vec<String>,
+    data: String,
 }
 impl SseDecoder {
     pub fn feed(&mut self, bytes: &[u8]) -> ConversionResult<Vec<Value>> {
         self.buffer.extend_from_slice(bytes);
-        if self.buffer.len() > 4 * 1024 * 1024 {
+        if self.buffer.len() > MAX_SSE_EVENT_BYTES {
             return Err("Claude 流式事件过大".into());
         }
         let mut events = Vec::new();
@@ -22,17 +24,20 @@ impl SseDecoder {
                 .trim_end_matches(['\r', '\n']);
             if line.is_empty() {
                 if !self.data.is_empty() {
-                    let data = self.data.join("\n");
-                    events.push(if data.trim() == "[DONE]" {
+                    events.push(if self.data.trim() == "[DONE]" {
                         json!({"type":"uni_switch_done"})
                     } else {
-                        serde_json::from_str(&data).map_err(|_| "流式事件不是有效 JSON")?
+                        serde_json::from_str(&self.data).map_err(|_| "流式事件不是有效 JSON")?
                     });
                     self.data.clear();
                 }
             } else if let Some(data) = line.strip_prefix("data:") {
-                self.data
-                    .push(data.strip_prefix(' ').unwrap_or(data).to_owned());
+                let data = data.strip_prefix(' ').unwrap_or(data);
+                if self.data.len() + data.len() + 1 > MAX_SSE_EVENT_BYTES {
+                    return Err("Claude 流式事件过大".into());
+                }
+                self.data.push_str(data);
+                self.data.push('\n');
             }
         }
         Ok(events)

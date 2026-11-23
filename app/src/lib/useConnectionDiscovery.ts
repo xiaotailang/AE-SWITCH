@@ -26,32 +26,66 @@ export function modelAllowed(id: string, target: Target, protocol: Protocol) {
       desktopModelAllowed(id))
   );
 }
+const modelOrder = new Intl.Collator("en", { numeric: true });
+
 export function recommendedModel(models: ProviderModel[], protocol: Protocol) {
-  const score = (id: string) =>
-    (protocol === "anthropic"
-      ? /claude-sonnet/.test(id)
-        ? 100
-        : /claude-opus/.test(id)
-          ? 90
-          : /claude-haiku/.test(id)
-            ? 80
-            : 0
-      : /(?:^|\/)gpt-/.test(id)
-        ? 100
-        : /(?:^|\/)o[134]-?/.test(id)
-          ? 90
-          : 0) +
-    (/codex/i.test(id) ? 10 : 0) -
-    (/mini|nano/i.test(id) ? 3 : 0);
+  const familyScore = (id: string) => {
+    const name = id.split("/").at(-1)?.toLowerCase() ?? id;
+    const family =
+      protocol === "anthropic"
+        ? name.startsWith("claude-sonnet-")
+          ? 100
+          : name.startsWith("claude-opus-")
+            ? 90
+            : name.startsWith("claude-haiku-")
+              ? 80
+              : 0
+        : name.startsWith("gpt-")
+          ? 100
+          : /^o[134](?:-|$)/.test(name)
+            ? 90
+            : 0;
+    return (
+      family +
+      (/codex/.test(name) ? 10 : 0) -
+      (family && /(?:^|-)(?:mini|nano)(?:-|$)/.test(name) ? 3 : 0)
+    );
+  };
   return (
-    [...models].sort(
-      (a, b) =>
-        score(b.id) - score(a.id) ||
-        (score(a.id)
-          ? b.id.localeCompare(a.id, undefined, { numeric: true })
-          : a.id.localeCompare(b.id)),
-    )[0]?.id || ""
+    [...models].sort((a, b) => {
+      const aFamily = familyScore(a.id);
+      const bFamily = familyScore(b.id);
+      return (
+        Number(b.reasoningEfforts.length > 0) -
+          Number(a.reasoningEfforts.length > 0) ||
+        bFamily - aFamily ||
+        Number(b.contextWindow !== null) - Number(a.contextWindow !== null) ||
+        (aFamily
+          ? modelOrder.compare(b.id, a.id)
+          : modelOrder.compare(a.id, b.id)) ||
+        (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
+      );
+    })[0]?.id || ""
   );
+}
+
+function validEndpoint(value: string): URL | null {
+  try {
+    const url = new URL(value);
+    return ["http:", "https:"].includes(url.protocol) &&
+      !url.username &&
+      !url.password &&
+      !url.search &&
+      !url.hash
+      ? url
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function endpointIdentity(url: URL | null): string | null {
+  return url?.href.replace(/\/+$/, "") ?? null;
 }
 export function useConnectionDiscovery(
   input: ConnectionInput,
@@ -59,42 +93,70 @@ export function useConnectionDiscovery(
   target: Target,
   provider?: Provider,
   protocol: ProtocolPreference = "auto",
+  contextMode: "legacy" | "endpoint" = "legacy",
 ) {
+  const endpoint = validEndpoint(input.baseUrl);
+  const savedEndpoint = validEndpoint(provider?.baseUrl ?? "");
+  const inputEndpoint = endpointIdentity(endpoint);
+  const selectedProvider =
+    provider?.id === input.providerId ? provider : undefined;
+  const needsEndpointKey = !(
+    selectedProvider?.hasKey &&
+    endpoint &&
+    endpoint.origin === savedEndpoint?.origin
+  );
+  const explicitKey = input.apiKey?.trim() || null;
+  const ready =
+    !!endpoint &&
+    !!(explicitKey || !needsEndpointKey) &&
+    !/[\u0000-\u001f\u007f]/.test(input.apiKey || "");
+  const endpointProvider =
+    selectedProvider &&
+    inputEndpoint &&
+    inputEndpoint === endpointIdentity(savedEndpoint)
+      ? selectedProvider
+      : undefined;
   const fallbackProtocol =
     protocol !== "auto"
       ? protocol
-      : provider
-        ? providerProtocol(provider)
+      : endpointProvider
+        ? providerProtocol(endpointProvider)
         : "openai";
+  const savedConnectionMatches =
+    !!endpointProvider &&
+    !explicitKey &&
+    !needsEndpointKey &&
+    (authMode === "auto" || authMode === endpointProvider.authMode) &&
+    (protocol === "auto" || protocol === providerProtocol(endpointProvider));
+  const savedCatalog =
+    contextMode === "legacy" || savedConnectionMatches
+      ? endpointProvider
+      : undefined;
   const signature = JSON.stringify([
-    input.baseUrl,
-    input.providerId || null,
-    input.apiKey || `saved:${input.providerId || ""}`,
+    inputEndpoint ?? input.baseUrl,
+    input.providerId,
+    explicitKey,
+    contextMode === "endpoint" && !explicitKey && selectedProvider
+      ? [
+          selectedProvider.updatedAt,
+          selectedProvider.authMode,
+          selectedProvider.hasKey,
+          selectedProvider.keySuffix,
+        ]
+      : null,
     authMode,
     target,
     protocol,
+    contextMode,
   ]);
-  let ready = false;
-  try {
-    const url = new URL(input.baseUrl);
-    ready =
-      ["http:", "https:"].includes(url.protocol) &&
-      !!url.hostname &&
-      !url.username &&
-      !url.password &&
-      !url.search &&
-      !url.hash &&
-      !!(input.apiKey?.trim() || input.providerId) &&
-      !/[\u0000-\u001f\u007f]/.test(input.apiKey || "");
-  } catch {
-    /* Keep incomplete input editable. */
-  }
-  const initialModels = (provider?.codexOptions?.models || []).map((m) => ({
-    ...m,
-  }));
-  if (provider?.model && !initialModels.some((m) => m.id === provider.model))
+  const legacy = contextMode === "legacy";
+  const initialModel = legacy ? savedCatalog?.model || "" : "";
+  const initialModels = legacy
+    ? [...(savedCatalog?.codexOptions?.models ?? [])]
+    : [];
+  if (initialModel && !initialModels.some((m) => m.id === initialModel))
     initialModels.unshift({
-      id: provider.model,
+      id: initialModel,
       enabled: true,
       contextWindow: target === "codex" ? DEFAULT_MODEL_CONTEXT : null,
       reasoningEfforts: [],
@@ -102,6 +164,7 @@ export function useConnectionDiscovery(
   const [state, setState] = useState({
     signature,
     providerId: input.providerId,
+    inputEndpoint,
     baseUrl: input.baseUrl,
     models: initialModels,
     contexts: Object.fromEntries(
@@ -114,39 +177,37 @@ export function useConnectionDiscovery(
       initialModels.map((m) => [m.id, m.contextWindow]),
     ) as Record<string, number | null>,
     editedContextModelIds: [] as string[],
-    model: provider?.model || "",
-    syncedAt: provider?.codexOptions?.modelsSyncedAt || (null as number | null),
+    model: initialModel,
+    syncedAt: legacy
+      ? (savedCatalog?.codexOptions?.modelsSyncedAt ?? null)
+      : null,
     protocol: fallbackProtocol as Protocol,
     authMode: (authMode === "auto"
-      ? provider?.authMode || "bearer"
+      ? endpointProvider?.authMode || "bearer"
       : authMode) as Provider["authMode"],
     busy: false,
     failure: "",
     failureError: null as unknown,
-    verified: !!provider,
+    verified: legacy && savedConnectionMatches,
   });
   const stateRef = useRef(state);
   stateRef.current = state;
   const generation = useRef(0);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const current = useRef({
+  const connection = {
     input,
+    inputEndpoint,
     authMode,
     ready,
     signature,
     protocol,
     target,
-    provider,
-  });
-  current.current = {
-    input,
-    authMode,
-    ready,
-    signature,
-    protocol,
-    target,
-    provider,
+    savedCatalog,
+    fallbackProtocol,
+    contextMode,
   };
+  const current = useRef(connection);
+  current.current = connection;
   const inFlight = useRef<{
     signature: string;
     request: number;
@@ -171,6 +232,7 @@ export function useConnectionDiscovery(
       stateRef.current.signature === params.signature &&
       stateRef.current.model &&
       stateRef.current.verified &&
+      (params.contextMode === "legacy" || stateRef.current.syncedAt !== null) &&
       !stateRef.current.failure
     )
       return Promise.resolve(stateRef.current);
@@ -190,73 +252,92 @@ export function useConnectionDiscovery(
           return null;
         if (!result.models.length)
           throw new Error("此密钥没有返回可用模型，请检查模型访问权限");
-        const resolved = result.protocol || fallbackProtocol;
-        const previousState =
-          stateRef.current.signature === params.signature
-            ? stateRef.current
-            : {
-                ...stateRef.current,
-                model: "",
-                models: [],
-                contexts: {} as Record<string, string>,
-                originalContexts: {} as Record<string, number | null>,
-                editedContextModelIds: [] as string[],
-              };
-        const previous = new Map(previousState.models.map((m) => [m.id, m]));
-        const usable = result.models.filter((m) => allows(m.id, resolved));
-        // A successful response is the current catalog. Keep choices and
-        // contexts only for IDs still present; newly discovered models start
-        // selected. Never append retired models from the previous snapshot.
-        const selected = usable.filter(
-          (m) => previous.get(m.id)?.enabled ?? true,
+        const resolved = result.protocol || params.fallbackProtocol;
+        const resolvedAuth =
+          result.authMode ||
+          (params.authMode === "auto"
+            ? params.savedCatalog?.authMode || "bearer"
+            : params.authMode);
+        const resolvedEndpoint = result.baseUrl || params.input.baseUrl;
+        const sameModelSource = (
+          baseUrl: string,
+          auth: Provider["authMode"],
+          protocol: Protocol,
+        ) =>
+          endpointIdentity(validEndpoint(baseUrl)) ===
+            endpointIdentity(validEndpoint(resolvedEndpoint)) &&
+          auth === resolvedAuth &&
+          protocol === resolved;
+        const sourceProvider = params.savedCatalog;
+        const catalogOwner =
+          sourceProvider &&
+          (params.contextMode === "legacy" ||
+            sameModelSource(
+              sourceProvider.baseUrl,
+              sourceProvider.authMode,
+              providerProtocol(sourceProvider),
+            ))
+            ? sourceProvider
+            : undefined;
+        const latest = stateRef.current;
+        const prior =
+          latest.signature === params.signature &&
+          (params.contextMode === "legacy" ||
+            (latest.syncedAt !== null
+              ? sameModelSource(
+                  latest.baseUrl,
+                  latest.authMode,
+                  latest.protocol,
+                )
+              : !!catalogOwner))
+            ? latest
+            : null;
+        const previous = new Map(prior?.models.map((m) => [m.id, m]));
+        const savedModels = new Map(
+          catalogOwner?.codexOptions?.models.map((m) => [m.id, m]),
         );
-        const sourceProvider = params.provider;
-        const savedDefault =
-          sourceProvider &&
-          params.input.providerId === sourceProvider.id &&
-          params.input.baseUrl.replace(/\/+$/, "") ===
-            sourceProvider.baseUrl.replace(/\/+$/, "") &&
-          sourceProvider.codexOptions?.models.find(
-            (m) => m.id === sourceProvider.model,
-          )?.enabled !== false
-            ? sourceProvider.model
-            : "";
-        const model =
-          selected.find((m) => m.id === previousState.model)?.id ||
-          selected.find((m) => m.id === savedDefault)?.id ||
-          selected.find((m) => previous.get(m.id)?.enabled)?.id ||
-          recommendedModel(selected, resolved);
-        const savedModels =
-          sourceProvider &&
-          params.input.providerId === sourceProvider.id &&
-          params.input.baseUrl.replace(/\/+$/, "") ===
-            sourceProvider.baseUrl.replace(/\/+$/, "")
-            ? new Map(sourceProvider.codexOptions?.models.map((m) => [m.id, m]))
-            : new Map<string, ProviderModel>();
+        const usable = result.models.filter((m) =>
+          modelAllowed(m.id, params.target, resolved),
+        );
+        const usableIds = new Set(usable.map((m) => m.id));
+        // Keep existing choices only for models still offered by the current endpoint.
         const models = result.models.map((m) => ({
           ...m,
-          contextWindow: previous.has(m.id)
-            ? previous.get(m.id)!.contextWindow
-            : savedModels.has(m.id)
-              ? savedModels.get(m.id)!.contextWindow
-              : target === "codex"
-                ? DEFAULT_MODEL_CONTEXT
-                : m.contextWindow,
+          contextWindow:
+            params.contextMode === "endpoint"
+              ? m.contextWindow
+              : previous.has(m.id)
+                ? previous.get(m.id)!.contextWindow
+                : savedModels.has(m.id)
+                  ? savedModels.get(m.id)!.contextWindow
+                  : params.target === "codex"
+                    ? DEFAULT_MODEL_CONTEXT
+                    : m.contextWindow,
           enabled:
-            allows(m.id, resolved) && (previous.get(m.id)?.enabled ?? true),
+            usableIds.has(m.id) &&
+            (previous.get(m.id)?.enabled ??
+              savedModels.get(m.id)?.enabled ??
+              true),
         }));
+        const selected = models.filter((m) => m.enabled);
+        const model =
+          selected.find((m) => m.id === prior?.model)?.id ||
+          selected.find((m) => m.id === catalogOwner?.model)?.id ||
+          recommendedModel(
+            selected.filter((m) => previous.get(m.id)?.enabled),
+            resolved,
+          ) ||
+          recommendedModel(selected, resolved);
+        const previousContexts = params.contextMode === "legacy" ? prior : null;
         const next = {
           signature: params.signature,
           providerId: params.input.providerId,
-          baseUrl: result.baseUrl || params.input.baseUrl,
+          inputEndpoint: params.inputEndpoint,
+          baseUrl: resolvedEndpoint,
           model,
           syncedAt: result.syncedAt,
           protocol: resolved,
-          authMode:
-            result.authMode ||
-            (params.authMode === "auto"
-              ? provider?.authMode || "bearer"
-              : params.authMode),
+          authMode: resolvedAuth,
           busy: false,
           verified: true,
           failureError: null,
@@ -266,22 +347,24 @@ export function useConnectionDiscovery(
           contexts: Object.fromEntries(
             models.map((m) => [
               m.id,
-              Object.hasOwn(previousState.contexts, m.id)
-                ? previousState.contexts[m.id]
+              previousContexts && Object.hasOwn(previousContexts.contexts, m.id)
+                ? previousContexts.contexts[m.id]
                 : String((m.contextWindow ?? DEFAULT_MODEL_CONTEXT) / 1000),
             ]),
           ),
           originalContexts: Object.fromEntries(
             models.map((m) => [
               m.id,
-              Object.hasOwn(previousState.originalContexts, m.id)
-                ? previousState.originalContexts[m.id]
+              previousContexts &&
+              Object.hasOwn(previousContexts.originalContexts, m.id)
+                ? previousContexts.originalContexts[m.id]
                 : m.contextWindow,
             ]),
           ),
-          editedContextModelIds: previousState.editedContextModelIds.filter(
-            (id) => models.some((m) => m.id === id && m.enabled),
-          ),
+          editedContextModelIds:
+            previousContexts?.editedContextModelIds.filter((id) =>
+              models.some((m) => m.id === id && m.enabled),
+            ) ?? [],
           models,
         };
         stateRef.current = next;
@@ -297,16 +380,17 @@ export function useConnectionDiscovery(
             busy: false,
             failure: errorMessage(error),
             failureError: error,
+            verified:
+              params.contextMode === "legacy" && stateRef.current.verified,
           };
           stateRef.current = next;
           setState(next);
           if (
+            params.contextMode === "legacy" &&
             next.model &&
             next.models.some((m) => m.enabled) &&
-            provider &&
-            !params.input.apiKey &&
-            params.input.baseUrl.replace(/\/+$/, "") ===
-              provider.baseUrl.replace(/\/+$/, "")
+            params.savedCatalog &&
+            !params.input.apiKey
           )
             return next;
         }
@@ -322,9 +406,9 @@ export function useConnectionDiscovery(
     generation.current++;
     if (stateRef.current.signature !== signature) {
       const keepChoices =
+        contextMode === "legacy" &&
         stateRef.current.providerId === input.providerId &&
-        stateRef.current.baseUrl.replace(/\/+$/, "") ===
-          input.baseUrl.replace(/\/+$/, "");
+        stateRef.current.inputEndpoint === inputEndpoint;
       const models = keepChoices
         ? stateRef.current.models.map((m) => ({
             ...m,
@@ -335,6 +419,7 @@ export function useConnectionDiscovery(
         ...stateRef.current,
         signature,
         providerId: input.providerId,
+        inputEndpoint,
         baseUrl: input.baseUrl,
         models,
         contexts: Object.fromEntries(
@@ -349,6 +434,11 @@ export function useConnectionDiscovery(
         editedContextModelIds: [],
         model: keepChoices ? stateRef.current.model : "",
         syncedAt: null,
+        protocol: fallbackProtocol,
+        authMode:
+          authMode === "auto"
+            ? endpointProvider?.authMode || "bearer"
+            : authMode,
         busy: false,
         failure: "",
         failureError: null,
@@ -375,8 +465,15 @@ export function useConnectionDiscovery(
           editedContextModelIds: [],
           model: "",
           syncedAt: null,
+          protocol: fallbackProtocol,
+          authMode:
+            authMode === "auto"
+              ? endpointProvider?.authMode || "bearer"
+              : authMode,
           busy: false,
           failure: "",
+          failureError: null,
+          verified: false,
         };
   const allowed = (id: string) => allows(id, visible.protocol);
   const toggle = (id: string, enabled: boolean) =>
@@ -410,7 +507,10 @@ export function useConnectionDiscovery(
           : s.editedContextModelIds.filter((modelId) => modelId !== id),
         model: models.some((m) => m.id === s.model && m.enabled)
           ? s.model
-          : models.find((m) => m.enabled)?.id || "",
+          : recommendedModel(
+              models.filter((m) => m.enabled),
+              s.protocol,
+            ),
       };
     });
   const selectDefault = (id: string) =>
@@ -472,6 +572,7 @@ export function useConnectionDiscovery(
   return {
     ...visible,
     ready,
+    needsEndpointKey,
     refresh,
     ensureReady: () => refresh(false),
     getFailure: () => stateRef.current.failureError,
@@ -482,11 +583,8 @@ export function useConnectionDiscovery(
     allowed,
     preview: !desktopRuntime,
     globalContextWindow:
-      provider?.id === input.providerId &&
-      provider.baseUrl.replace(/\/+$/, "") ===
-        input.baseUrl.replace(/\/+$/, "") &&
-      !provider.codexOptions?.perModelContext
-        ? (provider.codexOptions?.contextWindow ?? null)
+      savedCatalog && !savedCatalog.codexOptions?.perModelContext
+        ? (savedCatalog.codexOptions?.contextWindow ?? null)
         : null,
   };
 }

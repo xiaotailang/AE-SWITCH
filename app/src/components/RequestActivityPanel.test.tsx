@@ -96,6 +96,40 @@ describe("请求活动", () => {
     expect(await screen.findByText(/暂无请求/)).toBeInTheDocument();
     expect(screen.queryByText("selected-model")).not.toBeInTheDocument();
   });
+  it("区分配置和上游报告，并按实际报告的同批数据计算缓存命中", async () => {
+    const base = snapshot.records[0];
+    vi.mocked(agentApi.activity).mockResolvedValue({
+      capacity: 200,
+      records: [
+        {
+          ...base,
+          configuredModel: "configured-alias",
+          configuredEffort: "xhigh",
+          reportedModel: "vendor-version",
+          reportedEffort: "high",
+          usage: {
+            inputTokens: 100,
+            outputTokens: 7,
+            cachedTokens: 24,
+            cacheWriteTokens: 15,
+            reasoningTokens: 3,
+          },
+        },
+        {
+          ...base,
+          id: "no-cache-reported",
+          usage: { ...base.usage, inputTokens: 200 },
+        },
+      ],
+    });
+    setup();
+    await userEvent.click(screen.getByText("请求活动"));
+    expect(
+      await screen.findByText(/上游报告模型 vendor-version/),
+    ).toHaveTextContent("配置思考 xhigh");
+    expect(screen.getByText(/缓存命中 24\.0%/)).toHaveTextContent("输入 300");
+    expect(screen.getByText(/缓存写入 15/)).toBeVisible();
+  });
   it("读取失败明确报错，不伪造空活动或成功", async () => {
     vi.mocked(agentApi.activity).mockRejectedValue(new Error("本地网关未运行"));
     setup("zcode");

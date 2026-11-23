@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { desktopRuntime } from "./api";
+import type { AppliedContextPolicy } from "../types";
 
 export type AgentId =
   | "claude_code"
@@ -55,6 +56,7 @@ export interface AgentInfo {
   launcher: string | null;
   model: string | null;
   reasoningEffort?: string | null;
+  contextPolicy?: AppliedContextPolicy | null;
   providerId: string | null;
   mode?: "existing" | "private";
   profile?: ExistingProfile | null;
@@ -76,6 +78,10 @@ export interface RequestActivity {
   agentId: AgentId;
   startedAt: number;
   model: string | null;
+  configuredModel?: string | null;
+  configuredEffort?: string | null;
+  reportedModel?: string | null;
+  reportedEffort?: string | null;
   endpoint: string;
   upstreamProtocol: "openai" | "anthropic";
   streaming: boolean;
@@ -94,6 +100,7 @@ export interface RequestActivity {
     inputTokens: number | null;
     outputTokens: number | null;
     cachedTokens: number | null;
+    cacheWriteTokens?: number | null;
     reasoningTokens: number | null;
   };
 }

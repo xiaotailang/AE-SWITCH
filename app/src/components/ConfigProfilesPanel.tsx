@@ -313,6 +313,15 @@ export function ConfigProfilesPanel({
                 {entry.reasoningEffort
                   ? ` / ${entry.reasoningEffort}`
                   : " / 客户端默认"}
+                {entry.contextPolicy && (
+                  <>
+                    <br />
+                    {entry.contextPolicy.longContextEnabled
+                      ? "长上下文"
+                      : "标准上下文"}
+                    {` ${entry.contextPolicy.contextWindow.toLocaleString()} Token；${entry.agentId === "zcode" ? "压缩由原工具管理" : `压缩设置 ${entry.contextPolicy.compactPercent}%`}`}
+                  </>
+                )}
               </li>
             ))}
           </ul>

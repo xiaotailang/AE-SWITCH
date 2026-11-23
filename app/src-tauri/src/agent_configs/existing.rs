@@ -1132,7 +1132,7 @@ mod tests {
                 AgentId::Codex => "# user comment\nmodel = 'old'\nmodel_context_window = 765432\n[mcp_servers.keep]\ncommand = 'user'\n",
                 AgentId::Hermes => "# native comment\nmodel:\n  default: old\n  context_length: 765432\nauxiliary:\n  compression:\n    enabled: false\n    timeout: 73\n",
                 AgentId::OhMyPi => "# native comment\nproviders:\n  user:\n    baseUrl: https://user.invalid\n",
-                AgentId::OpenCode => r#"{"permission":{"bash":"deny"},"mcp":{"keep":{"command":["user"]}},"agent":{"custom":{"model":"other/custom"}}}"#,
+                AgentId::OpenCode => r#"{"permission":{"bash":"deny"},"mcp":{"keep":{"command":["user"]}},"agent":{"custom":{"model":"other/custom","mode":"primary"}}}"#,
                 AgentId::Zcode => r#"{"schemaVersion":1,"config":{"providerConfigRules":{"providerRules":[]},"modelConfigRules":{"providerModelRules":[],"manualProviderModelRules":[]},"defaultModelSelection":{"providerId":"old","modelId":"old","options":{"reasoningLevel":"disabled"}}}}"#,
                 AgentId::WorkBuddy => r#"{"models":[{"id":"user-model","url":"https://user.invalid","apiKey":"user-key"}],"preferences":{"theme":"user"}}"#,
                 AgentId::DeepSeekHarness => "# native comment\n- id: session-telemetry-otel\n  disabled: false\n  config:\n    user: keep\n- id: user-plugin\n  config:\n    context: 765432\n",

@@ -20,6 +20,141 @@ const MODEL: &str = "portable-model";
 const UPSTREAM_KEY: &str = "regression-upstream-private-key";
 const TOOL_ARGUMENTS: &str = "{\"path\":\"目录/数据.txt\"}";
 
+#[tokio::test]
+async fn context_switch_changes_native_limits_and_refuses_large_requests_before_upstream() {
+    use crate::{
+        agent_configs::AgentId,
+        context_policy::{ContextCapabilities, ContextPolicy},
+    };
+    let fixture = Fixture::new(UpstreamKind::Openai, CodexProtocol::Openai, "bearer", "/v1").await;
+    {
+        let mut store = fixture.store.lock().unwrap();
+        let summary = store.agent_provider(&fixture.id).unwrap().summary;
+        let mut input: ProviderInput =
+            serde_json::from_value(serde_json::to_value(summary).unwrap()).unwrap();
+        input.codex_options.models[0].context_capabilities = Some(ContextCapabilities {
+            standard_window: 32000,
+            long_window: 128000,
+            source: "endpoint".into(),
+            input_multiplier: Some(2.0),
+            output_multiplier: Some(1.5),
+            surcharge: Some(true),
+            endpoint: None,
+            credential_scope: None,
+        });
+        crate::context_policy::bind_endpoint(
+            &mut input.codex_options.models[0],
+            &input.base_url,
+            UPSTREAM_KEY,
+            &input.auth_mode,
+        );
+        input.codex_options.context_policy = Some(ContextPolicy {
+            model: MODEL.into(),
+            long_context_enabled: false,
+            compact_percent: 80,
+        });
+        store.save(input).unwrap();
+    }
+    configure_selected_agent(&fixture, AgentId::Codex, MODEL);
+    let config = fixture
+        .temporary
+        .path()
+        .join("data/agents/codex/home/.codex/config.toml");
+    let document = std::fs::read_to_string(&config)
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    assert_eq!(document["model_context_window"].as_integer(), Some(32000));
+    assert_eq!(
+        document["model_auto_compact_token_limit"].as_integer(),
+        Some(25600)
+    );
+    for resource in ["responses", "chat/completions", "responses/compact"] {
+        let body = if resource.starts_with("responses") {
+            json!({"model":MODEL,"input":"x".repeat(40000),"max_output_tokens":128})
+        } else {
+            json!({"model":MODEL,"messages":[{"role":"user","content":"x".repeat(40000)}],"max_tokens":128})
+        };
+        let response = selected_post(&fixture, "codex", resource, body).await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    assert!(fixture.recorded().is_empty());
+    {
+        let mut store = fixture.store.lock().unwrap();
+        let summary = store.agent_provider(&fixture.id).unwrap().summary;
+        let mut input: ProviderInput =
+            serde_json::from_value(serde_json::to_value(summary).unwrap()).unwrap();
+        input
+            .codex_options
+            .context_policy
+            .as_mut()
+            .unwrap()
+            .long_context_enabled = true;
+        store.save(input).unwrap();
+    }
+    // Editing the shared connection never retroactively enables a saved client.
+    assert_eq!(
+        selected_post(
+            &fixture,
+            "codex",
+            "responses",
+            json!({"model":MODEL,"input":"x".repeat(40000)})
+        )
+        .await
+        .status(),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    configure_selected_agent(&fixture, AgentId::Hermes, MODEL);
+    assert!(selected_post(&fixture,"hermes","chat/completions",json!({"model":MODEL,"messages":[{"role":"user","content":"x".repeat(40000)}],"max_tokens":128})).await.status().is_success());
+    assert_eq!(fixture.recorded().len(), 1);
+    configure_selected_agent(&fixture, AgentId::Codex, MODEL);
+    let document = std::fs::read_to_string(config)
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    assert_eq!(document["model_context_window"].as_integer(), Some(128000));
+    assert_eq!(
+        document["model_auto_compact_token_limit"].as_integer(),
+        Some(102400)
+    );
+    assert!(selected_post(
+        &fixture,
+        "codex",
+        "responses",
+        json!({"model":MODEL,"input":"x".repeat(40000),"max_output_tokens":128})
+    )
+    .await
+    .status()
+    .is_success());
+    assert_eq!(fixture.recorded().len(), 2);
+    {
+        let mut store = fixture.store.lock().unwrap();
+        let summary = store.agent_provider(&fixture.id).unwrap().summary;
+        let mut input: ProviderInput =
+            serde_json::from_value(serde_json::to_value(summary).unwrap()).unwrap();
+        input.api_key = Some("rotated-synthetic-key".into());
+        crate::context_policy::bind_endpoint(
+            &mut input.codex_options.models[0],
+            &input.base_url,
+            "rotated-synthetic-key",
+            &input.auth_mode,
+        );
+        store.save(input).unwrap();
+    }
+    // Even identical tiers from a newly queried credential cannot reuse old paid consent.
+    assert!(!selected_post(
+        &fixture,
+        "codex",
+        "responses",
+        json!({"model":MODEL,"input":"short","max_output_tokens":128})
+    )
+    .await
+    .status()
+    .is_success());
+    assert_eq!(fixture.recorded().len(), 2);
+    fixture.shutdown().await;
+}
+
 #[derive(Clone, Copy)]
 enum UpstreamKind {
     Openai,
@@ -71,10 +206,14 @@ async fn upstream(
             json!({"type":"response.output_text.delta","delta":"partial"}),
         ]);
     }
-    if uri.path() == "/v1/messages/count_tokens" {
+    let path = ["/gateway/v2", "/backend-api/codex", "/discovered"]
+        .iter()
+        .find_map(|prefix| uri.path().strip_prefix(*prefix))
+        .map_or_else(|| uri.path().to_owned(), |suffix| format!("/v1{suffix}"));
+    if path == "/v1/messages/count_tokens" {
         return Json(json!({"input_tokens":42})).into_response();
     }
-    if uri.path() == "/v1/responses" {
+    if path == "/v1/responses" {
         if matches!(state.kind, UpstreamKind::ChatOnly) {
             return (
                 StatusCode::NOT_FOUND,
@@ -84,13 +223,22 @@ async fn upstream(
         }
         return Json(json!({"id":"resp-native","object":"response","status":"completed","model":MODEL,"output":[{"type":"message","id":"msg-native","role":"assistant","status":"completed","content":[{"type":"output_text","text":"NATIVE_OK","annotations":[]}]}],"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}})).into_response();
     }
-    if uri.path() == "/v1/chat/completions" {
+    if path == "/v1/responses/compact" {
+        return Json(json!({
+            "id": "compact-native",
+            "object": "response.compaction",
+            "output": [],
+            "usage": {"input_tokens": 9, "output_tokens": 2, "total_tokens": 11}
+        }))
+        .into_response();
+    }
+    if path == "/v1/chat/completions" {
         if body["stream"] == true {
             return fragmented_sse(chat_events());
         }
         return Json(json!({"id":"chat-native","object":"chat.completion","model":MODEL,"choices":[{"index":0,"message":{"role":"assistant","content":"读取中国","tool_calls":[{"id":"call-read","type":"function","function":{"name":"read_file","arguments":TOOL_ARGUMENTS}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}})).into_response();
     }
-    if uri.path() == "/v1/messages" {
+    if path == "/v1/messages" {
         if body["stream"] == true {
             return fragmented_sse(anthropic_events());
         }
@@ -380,12 +528,14 @@ impl Fixture {
                         ProviderModel {
                             id: MODEL.into(),
                             context_window: Some(128000),
+                            context_capabilities: None,
                             reasoning_efforts: vec![],
                             enabled: true,
                         },
                         ProviderModel {
                             id: "disabled-model".into(),
                             context_window: None,
+                            context_capabilities: None,
                             reasoning_efforts: vec![],
                             enabled: false,
                         },
@@ -500,6 +650,7 @@ fn selected_provider_models(fixture: &Fixture, default: &str, enable_a: bool) {
     .map(|(id, enabled)| ProviderModel {
         id: id.into(),
         context_window: None,
+        context_capabilities: None,
         reasoning_efforts: vec![],
         enabled,
     })
@@ -551,6 +702,7 @@ fn set_provider_effort(fixture: &Fixture, model: &str, effort: Option<&str>, kno
         .map(|id| ProviderModel {
             id: id.into(),
             context_window: None,
+            context_capabilities: None,
             reasoning_efforts: if known {
                 ["none", "low", "high", "ultra"].map(str::to_owned).into()
             } else {
@@ -584,19 +736,23 @@ async fn selected_reasoning_is_snapshotted_and_reaches_all_openai_request_paths(
             let mut body = request_body(resource, false);
             if resource == "responses" {
                 body["reasoning"] = json!({"effort":"low", "summary":"auto"});
+                body["reasoning_effort"] = "minimal".into();
             } else if resource == "chat/completions" {
                 body["reasoning_effort"] = "high".into();
+                body["reasoning"] = json!({"effort":"minimal"});
             }
             let response = selected_post(&fixture, agent, resource, body).await;
             assert!(response.status().is_success(), "{agent}");
             let recorded = fixture.recorded().pop().unwrap();
             if recorded.path == "/v1/responses" {
                 assert_eq!(recorded.body["reasoning"]["effort"], effort, "{agent}");
+                assert!(recorded.body.get("reasoning_effort").is_none(), "{agent}");
                 if agent == "codex" {
                     assert_eq!(recorded.body["reasoning"]["summary"], "auto");
                 }
             } else {
                 assert_eq!(recorded.body["reasoning_effort"], effort, "{agent}");
+                assert!(recorded.body.get("reasoning").is_none(), "{agent}");
             }
         }
         fixture.assert_unactivated();
@@ -605,7 +761,7 @@ async fn selected_reasoning_is_snapshotted_and_reaches_all_openai_request_paths(
 }
 
 #[tokio::test]
-async fn selected_reasoning_defaults_preserve_clients_and_do_not_apply_to_other_models() {
+async fn selected_reasoning_defaults_preserve_client_choices_and_reject_other_models() {
     use crate::agent_configs::AgentId;
     let fixture = Fixture::new(UpstreamKind::Openai, CodexProtocol::Openai, "bearer", "/v1").await;
     set_provider_effort(&fixture, MODEL, Some("high"), true);
@@ -613,11 +769,17 @@ async fn selected_reasoning_defaults_preserve_clients_and_do_not_apply_to_other_
     configure_selected_agent(&fixture, AgentId::Codex, "selected-b");
     set_provider_effort(&fixture, MODEL, None, true);
     configure_selected_agent(&fixture, AgentId::WorkBuddy, MODEL);
-    for (agent, model) in [
-        ("zcode", "selected-b"),
-        ("codex", "selected-b"),
-        ("workbuddy", MODEL),
-    ] {
+    let requests_before = fixture.recorded().len();
+    let mut wrong_model = request_body("chat/completions", false);
+    wrong_model["model"] = "selected-b".into();
+    assert_eq!(
+        selected_post(&fixture, "zcode", "chat/completions", wrong_model)
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(fixture.recorded().len(), requests_before);
+    for (agent, model) in [("codex", "selected-b"), ("workbuddy", MODEL)] {
         let mut body = request_body("chat/completions", false);
         body["model"] = model.into();
         body["reasoning_effort"] = "low".into();
@@ -911,6 +1073,146 @@ async fn release_routing_selected_agent_models_are_isolated_from_shared_provider
             "selected-b"
         );
         fixture.assert_unactivated();
+        fixture.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn release_routing_pins_selected_model_across_all_resources() {
+    use crate::agent_configs::AgentId;
+    for (kind, protocol) in [
+        (UpstreamKind::Openai, CodexProtocol::Openai),
+        (UpstreamKind::Anthropic, CodexProtocol::Anthropic),
+    ] {
+        let fixture = Fixture::new(kind, protocol, "bearer", "/v1").await;
+        selected_provider_models(&fixture, MODEL, true);
+        configure_selected_agent(&fixture, AgentId::Codex, MODEL);
+        configure_selected_agent(&fixture, AgentId::ClaudeCode, MODEL);
+
+        for (agent, resource) in [
+            ("codex", "responses"),
+            ("codex", "chat/completions"),
+            ("codex", "responses/compact"),
+            ("claude_code", "messages"),
+            ("claude_code", "messages/count_tokens"),
+        ] {
+            let mut body = request_body("messages", false);
+            body["model"] = "selected-b".into();
+            assert_eq!(
+                selected_post(&fixture, agent, resource, body)
+                    .await
+                    .status(),
+                StatusCode::BAD_REQUEST,
+                "{agent} {resource}"
+            );
+        }
+        let mut alias = request_body("messages", false);
+        alias["model"] = crate::bridge::reverse::model_alias("selected-b").into();
+        assert_eq!(
+            selected_post(&fixture, "claude_code", "messages", alias)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        for path in [
+            "/v1/agent:selected:codex/responses",
+            "/v1/agent:selected:codex/responses/compact",
+            "/claude/agent/selected:claude_code/v1/messages",
+        ] {
+            let response = fixture
+                .client
+                .post(format!("http://127.0.0.1:{}{path}", fixture.route.port))
+                .bearer_auth(&fixture.route.token)
+                .json(&request_body("responses", false))
+                .send()
+                .await
+                .unwrap();
+            assert!(!response.status().is_success(), "{path}");
+        }
+        assert!(fixture.recorded().is_empty());
+
+        let url = format!(
+            "http://127.0.0.1:{}/agents/selected:codex/v1/models",
+            fixture.route.port
+        );
+        let listed: Value = fixture
+            .client
+            .get(url)
+            .bearer_auth(&fixture.route.token)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(listed["data"].as_array().unwrap().len(), 1);
+        assert_eq!(listed["data"][0]["id"], MODEL);
+        assert!(selected_post(
+            &fixture,
+            "codex",
+            "responses/compact",
+            request_body("responses", false)
+        )
+        .await
+        .status()
+        .is_success());
+        // Anthropic compaction uses Messages, but it still sends the exact
+        // model and completes without a different provider route.
+        let compact = fixture.recorded().pop().unwrap();
+        assert_eq!(compact.body["model"], MODEL);
+        assert_eq!(
+            compact.path,
+            if protocol == CodexProtocol::Openai {
+                "/v1/responses/compact"
+            } else {
+                "/v1/messages"
+            }
+        );
+        fixture.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn exact_api_prefix_reaches_primary_and_fallback_generation() {
+    use crate::agent_configs::AgentId;
+    for (prefix, discovered) in [
+        ("/gateway/v2", false),
+        ("/backend-api/codex", false),
+        ("/discovered", true),
+    ] {
+        let fixture = Fixture::new(
+            UpstreamKind::ChatOnly,
+            CodexProtocol::Openai,
+            "bearer",
+            prefix,
+        )
+        .await;
+        if discovered {
+            let mut store = fixture.store.lock().unwrap();
+            let summary = store.agent_provider(&fixture.id).unwrap().summary;
+            let mut input: ProviderInput =
+                serde_json::from_value(serde_json::to_value(summary).unwrap()).unwrap();
+            input.codex_options.protocol_detected_at = Some(1);
+            store.save(input).unwrap();
+        }
+        configure_selected_agent(&fixture, AgentId::Codex, MODEL);
+        let response = selected_post(
+            &fixture,
+            "codex",
+            "responses",
+            request_body("responses", false),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "{prefix}");
+        let requests = fixture.recorded();
+        assert_eq!(requests.len(), 2, "{prefix}");
+        assert_eq!(requests[0].path, format!("{prefix}/responses"));
+        assert_eq!(requests[1].path, format!("{prefix}/chat/completions"));
+        assert!(requests
+            .iter()
+            .all(|request| request.body["model"] == MODEL));
         fixture.shutdown().await;
     }
 }

@@ -31,14 +31,6 @@ fn authorize_claude(
             "本地转换服务认证失败，请重新应用配置",
         ));
     }
-    if target == "agent" {
-        let store = runtime
-            .store
-            .lock()
-            .map_err(|_| claude_error(StatusCode::SERVICE_UNAVAILABLE, "配置服务繁忙"))?;
-        return crate::agent_hub::gateway_provider(&store, id)
-            .map_err(|e| claude_error(StatusCode::NOT_FOUND, e.message));
-    }
     let target = match target {
         "claude_desktop" => Target::ClaudeDesktop,
         "claude_cli" => Target::ClaudeCli,
@@ -51,40 +43,26 @@ fn authorize_claude(
         .claude_bridge_provider(target, id)
         .map_err(|e| claude_error(StatusCode::CONFLICT, e.message))
 }
-fn openai_endpoint(base: &str, chat: bool) -> String {
-    let mut base = base.trim_end_matches('/');
-    for suffix in ["/chat/completions", "/responses"] {
-        if let Some(root) = base.strip_suffix(suffix) {
-            base = root;
-            break;
-        }
-    }
-    let resource = if chat {
-        "chat/completions"
-    } else {
-        "responses"
-    };
-    if base.ends_with("/v1") {
-        format!("{base}/{resource}")
-    } else {
-        format!("{base}/v1/{resource}")
-    }
-}
 pub(super) async fn send(
     runtime: &Runtime,
     provider: &StoredProvider,
     body: &Value,
     chat: bool,
 ) -> std::result::Result<reqwest::Response, HttpError> {
+    let resource = if chat {
+        "chat/completions"
+    } else {
+        "responses"
+    };
     let request = runtime
         .client
-        .post(openai_endpoint(&provider.summary.base_url, chat));
+        .post(provider_resource_url(provider, resource)?);
     let request = if provider.summary.auth_mode == "x-api-key" {
         request.header("x-api-key", &provider.api_key)
     } else {
         request.bearer_auth(&provider.api_key)
     };
-    tokio::time::timeout(Duration::from_secs(45), request.json(body).send())
+    tokio::time::timeout(UPSTREAM_HEADERS_WAIT, request.json(body).send())
         .await
         .map_err(|_| claude_error(StatusCode::GATEWAY_TIMEOUT, "等待 OpenAI 响应超时"))?
         .map_err(|_| {
@@ -118,6 +96,13 @@ pub(super) async fn count_tokens(
     Json(body): Json<Value>,
 ) -> std::result::Result<Response, HttpError> {
     let provider = authorize_claude(&runtime, &headers, &target, &id)?;
+    count_tokens_with_provider(provider, body)
+}
+
+pub(super) fn count_tokens_with_provider(
+    provider: StoredProvider,
+    body: Value,
+) -> std::result::Result<Response, HttpError> {
     let model = reverse::resolve_model(&provider, body["model"].as_str().unwrap_or(""))
         .map_err(|e| claude_error(StatusCode::BAD_REQUEST, e))?;
     let converted = reverse::request(&body, &model, false)
@@ -138,6 +123,15 @@ pub(super) async fn messages(
     Json(body): Json<Value>,
 ) -> std::result::Result<Response, HttpError> {
     let provider = authorize_claude(&runtime, &headers, &target, &id)?;
+    messages_with_provider(runtime, provider, body, false).await
+}
+
+pub(super) async fn messages_with_provider(
+    runtime: Runtime,
+    provider: StoredProvider,
+    body: Value,
+    selected_agent: bool,
+) -> std::result::Result<Response, HttpError> {
     let client_model = body["model"]
         .as_str()
         .ok_or_else(|| claude_error(StatusCode::BAD_REQUEST, "请求缺少 model"))?
@@ -167,7 +161,6 @@ pub(super) async fn messages(
     } else {
         converted.clone()
     };
-    let selected_agent = target == "agent" && id.starts_with("selected:");
     if selected_agent {
         agent_http::apply_selected_reasoning_effort(&provider, &mut initial, chat);
     }
@@ -224,7 +217,7 @@ pub(super) async fn messages(
         let mut chunks=response.bytes_stream();
         let mut failure=None;
         'read:loop {
-            match tokio::time::timeout(Duration::from_secs(90),chunks.next()).await {
+            match tokio::time::timeout(UPSTREAM_BODY_IDLE,chunks.next()).await {
                 Ok(Some(Ok(chunk)))=>match decoder.feed(&chunk) {
                     Ok(events)=>for event in events {
                         let result=if chat {translator.accept_chat(event)} else {translator.accept_responses(event)};
@@ -263,19 +256,35 @@ mod tests {
     #[test]
     fn normalizes_openai_endpoints() {
         assert_eq!(
-            openai_endpoint("https://example.test/v1/", false),
+            resource_url("https://example.test/v1/", "responses", false)
+                .unwrap()
+                .as_str(),
             "https://example.test/v1/responses"
         );
         assert_eq!(
-            openai_endpoint("https://example.test/openai", true),
+            resource_url("https://example.test/openai", "chat/completions", false)
+                .unwrap()
+                .as_str(),
             "https://example.test/openai/v1/chat/completions"
         );
         assert_eq!(
-            openai_endpoint("https://example.test/v1/responses", true),
+            resource_url(
+                "https://example.test/v1/responses",
+                "chat/completions",
+                false
+            )
+            .unwrap()
+            .as_str(),
             "https://example.test/v1/chat/completions"
         );
         assert_eq!(
-            openai_endpoint("https://example.test/v1/chat/completions", false),
+            resource_url(
+                "https://example.test/v1/chat/completions",
+                "responses",
+                false
+            )
+            .unwrap()
+            .as_str(),
             "https://example.test/v1/responses"
         );
     }

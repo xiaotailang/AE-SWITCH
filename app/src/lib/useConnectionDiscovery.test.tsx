@@ -334,7 +334,7 @@ describe("自动接入的模型默认选择", () => {
     const hook = renderHook(
       ({ providerId }) =>
         useConnectionDiscovery(
-          { providerId, baseUrl: provider.baseUrl, apiKey: null },
+          { providerId, baseUrl: provider.baseUrl, apiKey: "manual-key" },
           "auto",
           "codex",
           provider,
@@ -599,5 +599,260 @@ describe("自动接入的模型默认选择", () => {
     expect(
       hook.result.current.models.filter((m) => m.enabled).map((m) => m.id),
     ).toEqual(["new-model-a", "new-model-b"]);
+  });
+});
+
+describe("当前端点的模型发现", () => {
+  it("保存的目录不算本次发现，确认时查询一次并复用当次证据", async () => {
+    vi.useFakeTimers();
+    const provider = savedProvider("a", "gpt-a1", ["gpt-a1", "gpt-a2"]);
+    const connection = {
+      providerId: provider.id,
+      baseUrl: provider.baseUrl,
+      apiKey: null,
+    };
+    const query = vi
+      .spyOn(api, "discoverConnection")
+      .mockResolvedValue(response(["gpt-a1", "gpt-a2"]));
+    const hook = renderHook(() =>
+      useConnectionDiscovery(
+        connection,
+        "auto",
+        "codex",
+        provider,
+        "auto",
+        "endpoint",
+      ),
+    );
+
+    expect(hook.result.current.verified).toBe(false);
+    expect(hook.result.current.syncedAt).toBeNull();
+    expect(hook.result.current.models).toEqual([]);
+    expect(query).not.toHaveBeenCalled();
+    await act(async () => {
+      expect((await hook.result.current.ensureReady())?.model).toBe("gpt-a1");
+    });
+    expect(hook.result.current.verified).toBe(true);
+    await tick();
+    await act(async () => {
+      expect((await hook.result.current.ensureReady())?.syncedAt).toBe(123);
+    });
+    expect(query).toHaveBeenCalledExactlyOnceWith(connection, null, null);
+  });
+
+  it.each(["https://b.test/v1", "http://a.test/v1", "https://a.test:8443/v1"])(
+    "端点 %s 不能使用其他来源的已保存密钥",
+    async (baseUrl) => {
+      vi.useFakeTimers();
+      const provider = savedProvider("a", "gpt-a1", ["gpt-a1"]);
+      const query = vi
+        .spyOn(api, "discoverConnection")
+        .mockResolvedValue(response(["upstream/tenant-model"]));
+      const hook = renderHook(
+        ({ apiKey }) =>
+          useConnectionDiscovery(
+            { baseUrl, providerId: provider.id, apiKey },
+            "auto",
+            "codex",
+            provider,
+            "auto",
+            "endpoint",
+          ),
+        { initialProps: { apiKey: null as string | null } },
+      );
+
+      expect(hook.result.current.needsEndpointKey).toBe(true);
+      expect(hook.result.current.ready).toBe(false);
+      await tick();
+      await expect(hook.result.current.ensureReady()).resolves.toBeNull();
+      expect(query).not.toHaveBeenCalled();
+
+      hook.rerender({ apiKey: "new-endpoint-key" });
+      await tick();
+      expect(query).toHaveBeenCalledExactlyOnceWith(
+        { baseUrl, providerId: provider.id, apiKey: "new-endpoint-key" },
+        null,
+        null,
+      );
+      expect(hook.result.current.model).toBe("upstream/tenant-model");
+    },
+  );
+
+  it("同源新路径可以查询，但必须重新确认模型及能力", async () => {
+    vi.useFakeTimers();
+    const provider = savedProvider("a", "gpt-a1", ["gpt-a1", "gpt-a2"]);
+    const query = vi
+      .spyOn(api, "discoverConnection")
+      .mockResolvedValueOnce(response(["gpt-a1", "gpt-a2"]))
+      .mockResolvedValueOnce(response(["gpt-a1", "gpt-a2"]));
+    const hook = renderHook(
+      ({ baseUrl }) =>
+        useConnectionDiscovery(
+          { baseUrl, providerId: provider.id, apiKey: null },
+          "auto",
+          "codex",
+          provider,
+          "auto",
+          "endpoint",
+        ),
+      { initialProps: { baseUrl: provider.baseUrl } },
+    );
+    await tick();
+    expect(hook.result.current.model).toBe("gpt-a1");
+
+    const baseUrl = "https://A.test:443/other/v1";
+    hook.rerender({ baseUrl });
+    expect(hook.result.current.needsEndpointKey).toBe(false);
+    expect(hook.result.current.verified).toBe(false);
+    expect(hook.result.current.models).toEqual([]);
+    await tick();
+    expect(query).toHaveBeenLastCalledWith(
+      { baseUrl, providerId: provider.id, apiKey: null },
+      null,
+      null,
+    );
+    expect(hook.result.current.model).toBe("gpt-a2");
+    expect(hook.result.current.verified).toBe(true);
+  });
+
+  it("保存的密钥更新后丢弃同一 URL 的迟到发现", async () => {
+    vi.useFakeTimers();
+    const provider = savedProvider("a", "gpt-a1", ["gpt-a1"]);
+    let finishOld!: (result: ModelSyncResult) => void;
+    const query = vi
+      .spyOn(api, "discoverConnection")
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishOld = resolve;
+          }),
+      )
+      .mockResolvedValueOnce(response(["current-model"]));
+    const hook = renderHook(
+      ({ current }) =>
+        useConnectionDiscovery(
+          { baseUrl: current.baseUrl, providerId: current.id, apiKey: null },
+          "auto",
+          "codex",
+          current,
+          "auto",
+          "endpoint",
+        ),
+      { initialProps: { current: provider } },
+    );
+    await tick();
+    hook.rerender({
+      current: {
+        ...provider,
+        updatedAt: provider.updatedAt + 1,
+        keySuffix: "new!",
+      },
+    });
+    expect(hook.result.current.verified).toBe(false);
+    await tick();
+    await act(async () => {
+      finishOld(response(["old-credential-model"]));
+    });
+    expect(query).toHaveBeenCalledTimes(2);
+    expect(hook.result.current.model).toBe("current-model");
+    expect(hook.result.current.models.map((model) => model.id)).toEqual([
+      "current-model",
+    ]);
+  });
+
+  it("根据目录的显式能力推荐别名，刷新用新能力并保留当前选择", async () => {
+    vi.useFakeTimers();
+    const ids = ["gpt-5.4", "tenant/opaque-alias", "text-embedding-test"];
+    const catalog = response(ids);
+    const alias = catalog.models[1];
+    alias.contextWindow = 32000;
+    alias.reasoningEfforts = ["high"];
+    const refreshed = response([...ids].reverse());
+    const refreshedAlias = refreshed.models.find(
+      (model) => model.id === alias.id,
+    )!;
+    refreshedAlias.contextWindow = 64000;
+    refreshedAlias.reasoningEfforts = ["medium"];
+    vi.spyOn(api, "discoverConnection")
+      .mockResolvedValueOnce(catalog)
+      .mockResolvedValueOnce(refreshed);
+    const hook = renderHook(() =>
+      useConnectionDiscovery(
+        input,
+        "auto",
+        "codex",
+        undefined,
+        "auto",
+        "endpoint",
+      ),
+    );
+    await tick();
+
+    expect(hook.result.current.model).toBe(alias.id);
+    expect(hook.result.current.contexts[alias.id]).toBe("32");
+    expect(
+      hook.result.current.models.find((model) => model.id === ids[2])?.enabled,
+    ).toBe(false);
+    act(() => hook.result.current.selectDefault("gpt-5.4"));
+    await act(async () => {
+      await hook.result.current.refresh();
+    });
+
+    expect(hook.result.current.model).toBe("gpt-5.4");
+    expect(
+      hook.result.current.models.find((model) => model.id === alias.id),
+    ).toEqual(refreshedAlias);
+    expect(hook.result.current.contexts[alias.id]).toBe("64");
+    expect(hook.result.current.originalContexts[alias.id]).toBe(64000);
+  });
+
+  it("把与 JavaScript 原型名称相同的模型 ID 当作普通目录项", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(api, "discoverConnection").mockResolvedValue(
+      response(["__proto__", "constructor"]),
+    );
+    const hook = renderHook(function () {
+      return useConnectionDiscovery(input, "auto", "codex");
+    });
+    await tick();
+
+    expect(hook.result.current.models.map((model) => model.id)).toEqual([
+      "__proto__",
+      "constructor",
+    ]);
+    expect(hook.result.current.contexts["__proto__"]).toBe("256");
+    expect(hook.result.current.contexts["constructor"]).toBe("256");
+    expect(hook.result.current.invalidContexts).toEqual([]);
+  });
+
+  it("查询失败时不使用保存的旧目录确认连接，重试可恢复", async () => {
+    vi.useFakeTimers();
+    const provider = savedProvider("a", "gpt-a1", ["gpt-a1"]);
+    const connection = {
+      providerId: provider.id,
+      baseUrl: provider.baseUrl,
+      apiKey: null,
+    };
+    const query = vi
+      .spyOn(api, "discoverConnection")
+      .mockRejectedValueOnce(new Error("discovery failed"))
+      .mockResolvedValueOnce(response(["gpt-a2"]));
+    const hook = renderHook(() =>
+      useConnectionDiscovery(
+        connection,
+        "auto",
+        "codex",
+        provider,
+        "auto",
+        "endpoint",
+      ),
+    );
+    await tick();
+    expect(hook.result.current.verified).toBe(false);
+    expect(hook.result.current.failure).toBe("discovery failed");
+    await act(async () => {
+      expect((await hook.result.current.ensureReady())?.model).toBe("gpt-a2");
+    });
+    expect(query).toHaveBeenCalledTimes(2);
   });
 });

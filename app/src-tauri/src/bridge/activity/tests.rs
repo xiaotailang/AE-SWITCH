@@ -30,6 +30,43 @@ fn feed(wire: &[u8]) -> ResponseMetadata {
 }
 
 #[test]
+fn observes_reported_model_and_effort_without_treating_conversions_as_upstream() {
+    let metadata = feed(b"data: {\"type\":\"response.completed\",\"response\":{\"model\":\"vendor/responding-version\",\"reasoning\":{\"effort\":\"high\"},\"usage\":{\"input_tokens\":100,\"output_tokens\":7,\"input_tokens_details\":{\"cached_tokens\":24}}}}\n\n");
+    let log = ActivityLog::default();
+    let mut trace = begin(&log, AgentId::Codex);
+    trace.update_metadata(&metadata, false);
+    assert!(trace.record.reported_model.is_none());
+    assert_eq!(trace.record.usage.cached_tokens, Some(24));
+    trace.update_metadata(&metadata, true);
+    assert_eq!(
+        trace.record.reported_model.as_deref(),
+        Some("vendor/responding-version")
+    );
+    assert_eq!(trace.record.reported_effort.as_deref(), Some("high"));
+    let echoed = feed(b"data: {\"model\":\"never-record-upstream-key\"}\n\n");
+    trace.update_metadata(&echoed, true);
+    assert!(trace.record.reported_model.is_none());
+}
+
+#[test]
+fn distinguishes_cache_reads_and_writes_without_double_counting_openai_input() {
+    let mut usage = TokenUsage::default();
+    usage.read(
+        &json!({"prompt_tokens":100,"prompt_cache_hit_tokens":30,"cache_creation_input_tokens":10}),
+    );
+    assert_eq!(usage.input_tokens, Some(100));
+    assert_eq!(usage.cached_tokens, Some(30));
+    assert_eq!(usage.cache_write_tokens, Some(10));
+    let mut anthropic = TokenUsage::default();
+    anthropic.read(
+        &json!({"input_tokens":70,"cache_read_input_tokens":15,"cache_creation_input_tokens":5}),
+    );
+    assert_eq!(anthropic.input_tokens, Some(90));
+    assert_eq!(anthropic.cached_tokens, Some(15));
+    assert_eq!(anthropic.cache_write_tokens, Some(5));
+}
+
+#[test]
 fn fragmented_multiline_sse_and_utf8_keep_reported_usage() {
     let wire = "event: response.completed\r\ndata: {\"type\":\"response.completed\",\r\ndata: \"response\":{\"text\":\"中文\",\"usage\":{\"input_tokens\":17,\"output_tokens\":5,\"input_tokens_details\":{\"cached_tokens\":3},\"output_tokens_details\":{\"reasoning_tokens\":2}}}}\r\n\r\n";
     let metadata = feed(wire.as_bytes());

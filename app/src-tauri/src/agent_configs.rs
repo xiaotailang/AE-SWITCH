@@ -6,6 +6,7 @@ use crate::writer;
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
+mod context;
 mod existing;
 mod jsonc;
 mod launchers;
@@ -269,6 +270,7 @@ pub(crate) fn configure_existing_with_selection(
     recover_configuration(root)?;
     existing::validate_profile(agent, profile)?;
     let mut environment = serde_json::Map::new();
+    let context_policy = context::from_selection(Some(selection.1), agent)?;
     let (snapshots, writes) = plan_agent_configuration(
         root,
         Path::new(&profile.directory),
@@ -278,6 +280,7 @@ pub(crate) fn configure_existing_with_selection(
         model,
         &mut environment,
         Some(profile),
+        context_policy.as_ref(),
     )?;
     ownership::prepare(root, agent, Some(profile), &snapshots, &writes)?;
     existing::commit(root, agent, profile, &snapshots, writes, selection)?;
@@ -394,6 +397,19 @@ pub(crate) fn configure_with_selection(
         root.to_string_lossy().into_owned().into(),
     );
     add_bundled_tools(&directory, agent, &mut environment)?;
+    let context_policy = context::from_selection(selection.map(|(_, text, _)| text), agent)?;
+    if agent == AgentId::WorkBuddy {
+        if let Some(policy) = &context_policy {
+            environment.insert(
+                "CODEBUDDY_AUTO_COMPACT_WINDOW".into(),
+                policy.context_window.to_string().into(),
+            );
+            environment.insert(
+                "CODEBUDDY_AUTOCOMPACT_PCT_OVERRIDE".into(),
+                policy.compact_percent.to_string().into(),
+            );
+        }
+    }
     let (mut snapshots, mut writes) = plan_agent_configuration(
         root,
         &directory,
@@ -403,6 +419,7 @@ pub(crate) fn configure_with_selection(
         model,
         &mut environment,
         None,
+        context_policy.as_ref(),
     )?;
     writes.push((
         directory.join("configuration/environment.json"),
@@ -877,6 +894,7 @@ pub(crate) fn plan_profile_configuration(
     token: &str,
     model: &str,
     profile: Option<&ExistingProfile>,
+    context_policy: Option<&crate::context_policy::AppliedContextPolicy>,
 ) -> Result<Vec<(PathBuf, String)>> {
     validate_inputs(root, base_url, token, model)?;
     let directory = profile
@@ -897,6 +915,18 @@ pub(crate) fn plan_profile_configuration(
     if profile.is_none() {
         environment.insert("AE_GATEWAY_TOKEN".into(), token.into());
         environment.insert("AE_SWITCH_API_KEY".into(), token.into());
+        if agent == AgentId::WorkBuddy {
+            if let Some(policy) = context_policy {
+                environment.insert(
+                    "CODEBUDDY_AUTO_COMPACT_WINDOW".into(),
+                    policy.context_window.to_string().into(),
+                );
+                environment.insert(
+                    "CODEBUDDY_AUTOCOMPACT_PCT_OVERRIDE".into(),
+                    policy.compact_percent.to_string().into(),
+                );
+            }
+        }
     }
     let (_, mut writes) = plan_agent_configuration(
         root,
@@ -907,6 +937,7 @@ pub(crate) fn plan_profile_configuration(
         model,
         &mut environment,
         profile,
+        context_policy,
     )?;
     if profile.is_none() {
         writes.push((
@@ -927,6 +958,7 @@ fn plan_agent_configuration(
     model: &str,
     environment: &mut serde_json::Map<String, serde_json::Value>,
     profile: Option<&ExistingProfile>,
+    context_policy: Option<&crate::context_policy::AppliedContextPolicy>,
 ) -> Result<NativePlan> {
     // All native files are read, parsed and merged before the first native write.
     // A malformed secondary file therefore cannot clobber an earlier one.
@@ -1287,6 +1319,8 @@ fn plan_agent_configuration(
                 ("ANTHROPIC_BASE_URL", base_url),
                 ("ANTHROPIC_API_KEY", token),
                 ("ANTHROPIC_MODEL", model),
+                ("CLAUDE_CODE_SUBAGENT_MODEL", model),
+                ("CLAUDE_CODE_SUBAGENT_MODEL_FORCE", "1"),
             ] {
                 native_merge::set(native_env, name, value.into(), &path)?;
                 environment.insert(name.to_owned(), value.into());
@@ -1299,11 +1333,14 @@ fn plan_agent_configuration(
                 native_merge::set(native_env, name, model.into(), &path)?;
                 environment.insert(name.into(), model.into());
             }
-            for name in ["CLAUDE_CODE_SUBAGENT_MODEL", "ANTHROPIC_SMALL_FAST_MODEL"] {
-                if native_env.get(name).is_some() {
-                    native_merge::set(native_env, name, model.into(), &path)?;
-                    environment.insert(name.into(), model.into());
-                }
+            if native_env.get("ANTHROPIC_SMALL_FAST_MODEL").is_some() {
+                native_merge::set(
+                    native_env,
+                    "ANTHROPIC_SMALL_FAST_MODEL",
+                    model.into(),
+                    &path,
+                )?;
+                environment.insert("ANTHROPIC_SMALL_FAST_MODEL".into(), model.into());
             }
             if let Some(headers) = native_env.get("ANTHROPIC_CUSTOM_HEADERS") {
                 let headers = headers
@@ -1388,6 +1425,20 @@ fn plan_agent_configuration(
                 native_merge::toml_set(
                     document.as_table_mut(),
                     "review_model",
+                    toml_edit::value(model),
+                    &path,
+                )?;
+            }
+            // Newer clients support a native default for spawned agents. A
+            // pre-existing key confirms the profile already uses that field.
+            if let Some(agents) = document
+                .get_mut("agents")
+                .and_then(toml_edit::Item::as_table_like_mut)
+                .filter(|agents| agents.contains_key("default_subagent_model"))
+            {
+                native_merge::toml_set(
+                    agents,
+                    "default_subagent_model",
                     toml_edit::value(model),
                     &path,
                 )?;
@@ -1630,16 +1681,22 @@ fn plan_agent_configuration(
             if let Some(agents) = configuration.get_mut("agent") {
                 let agents = native_merge::object(agents, &path)?;
                 for (name, agent) in agents {
-                    if [
-                        "build",
-                        "plan",
-                        "general",
-                        "explore",
-                        "compaction",
-                        "title",
-                        "summary",
-                    ]
-                    .contains(&name.as_str())
+                    let can_spawn = agent.get("model").is_some()
+                        && match agent.get("mode") {
+                            None => true,
+                            Some(mode) => matches!(mode.as_str(), Some("subagent" | "all")),
+                        };
+                    if can_spawn
+                        || [
+                            "build",
+                            "plan",
+                            "general",
+                            "explore",
+                            "compaction",
+                            "title",
+                            "summary",
+                        ]
+                        .contains(&name.as_str())
                         || default_agent.as_deref() == Some(name.as_str())
                     {
                         native_merge::object(agent, &path)?;
@@ -1741,6 +1798,33 @@ fn plan_agent_configuration(
                     native_merge::set(selected, key, token.into(), &path)?;
                 }
             }
+            // Hermes merges the current fallback chain with its legacy convention.
+            // Suspend both while this profile is using the selected gateway route.
+            suspend_hermes_fallbacks(&mut settings, "fallback_providers", &path)?;
+            if let Some(legacy) = settings
+                .get("fallback_model")
+                .filter(|value| !value.is_null())
+            {
+                let empty = if legacy.is_object() {
+                    serde_json::json!({})
+                } else {
+                    serde_json::json!([])
+                };
+                native_merge::set(&mut settings, "fallback_model", empty, &path)?;
+            }
+            if let Some(delegation) = settings
+                .get_mut("delegation")
+                .filter(|value| !value.is_null())
+            {
+                native_merge::object(delegation, &path)?;
+                // Empty native routing fields inherit the parent's gateway.
+                for key in ["model", "provider", "base_url", "api_key", "api_mode"] {
+                    if delegation.get(key).is_some_and(|value| !value.is_null()) {
+                        native_merge::set(delegation, key, "".into(), &path)?;
+                    }
+                }
+                suspend_hermes_fallbacks(delegation, "fallback_providers", &path)?;
+            }
             let auxiliary = native_merge::child(&mut settings, "auxiliary", &path)?;
             // These tasks run automatically in the official default workflow.
             for task in [
@@ -1753,6 +1837,7 @@ fn plan_agent_configuration(
                     continue;
                 }
                 let selected = native_merge::child(auxiliary, task, &path)?;
+                suspend_hermes_fallbacks(selected, "fallback_chain", &path)?;
                 for (key, value) in [
                     ("provider", "custom"),
                     ("model", model),
@@ -2037,7 +2122,21 @@ fn plan_agent_configuration(
             }
         }
     }
+    if let Some(policy) = context_policy {
+        context::apply(agent, model, &mut writes, policy)?;
+    }
     Ok((snapshots, writes))
+}
+
+fn suspend_hermes_fallbacks(
+    configuration: &mut serde_json::Value,
+    key: &str,
+    path: &Path,
+) -> Result<()> {
+    if configuration.get(key).is_some_and(|value| !value.is_null()) {
+        native_merge::array(configuration, key, path)?.clear();
+    }
+    Ok(())
 }
 
 fn commit_native_configuration(
@@ -2427,7 +2526,7 @@ try {{
     if ($portableEnvironment.AE_AGENT_PORTABLE_RELATIVE_ROOT) {{
         $currentPortableRoot = [IO.Path]::GetFullPath((Join-Path $agentDirectory ([string]$portableEnvironment.AE_AGENT_PORTABLE_RELATIVE_ROOT)))
     }}
-    foreach ($variable in @('OPENAI_API_KEY','OPENAI_BASE_URL','ANTHROPIC_API_KEY','ANTHROPIC_AUTH_TOKEN','ANTHROPIC_BASE_URL','ANTHROPIC_MODEL','CLAUDE_CODE_SUBAGENT_MODEL','ANTHROPIC_SMALL_FAST_MODEL','ANTHROPIC_CUSTOM_HEADERS','CLAUDE_CODE_USE_BEDROCK','CLAUDE_CODE_USE_VERTEX','CLAUDE_CODE_USE_FOUNDRY','CLAUDE_CODE_USE_ANTHROPIC_AWS','CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD','CLAUDE_CODE_USE_MANTLE','CLAUDE_CODE_USE_GATEWAY','ANTHROPIC_UNIX_SOCKET','CLAUDE_CONFIG_DIR','CODEX_HOME','HERMES_HOME','PI_CODING_AGENT_DIR','OPENCODE_CONFIG','OPENCODE_CONFIG_DIR','OPENCODE_CONFIG_CONTENT','ZCODE_DATA_BASE_DIR','ZCODE_STORAGE_DIR','ZCODE_SESSION_DB_PATH','ZCODE_SESSION_DB','ZCODE_BUILTIN_PROVIDER_CONFIG_FILE','ZCODE_PERSONAL_PROVIDER_CONFIG_FILE','WORKBUDDY_CONFIG_DIR','CODEBUDDY_CONFIG_DIR','CODEBUDDY_HOST','CODEBUDDY_CODE_SUBAGENT_MODEL','CODEBUDDY_FORCE_LITE_WB_BUNDLE','CODEBUDDY_FORCE_HEADLESS_BUNDLE','ELECTRON_RUN_AS_NODE','AE_WORKBUDDY_RUNTIME','AE_WORKBUDDY_ENTRY','AE_WORKBUDDY_MODEL','AE_AGENT_BIN_PATH')) {{
+    foreach ($variable in @('OPENAI_API_KEY','OPENAI_BASE_URL','ANTHROPIC_API_KEY','ANTHROPIC_AUTH_TOKEN','ANTHROPIC_BASE_URL','ANTHROPIC_MODEL','CLAUDE_CODE_SUBAGENT_MODEL','CLAUDE_CODE_SUBAGENT_MODEL_FORCE','ANTHROPIC_SMALL_FAST_MODEL','ANTHROPIC_CUSTOM_HEADERS','CLAUDE_CODE_USE_BEDROCK','CLAUDE_CODE_USE_VERTEX','CLAUDE_CODE_USE_FOUNDRY','CLAUDE_CODE_USE_ANTHROPIC_AWS','CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD','CLAUDE_CODE_USE_MANTLE','CLAUDE_CODE_USE_GATEWAY','ANTHROPIC_UNIX_SOCKET','CLAUDE_CONFIG_DIR','CODEX_HOME','HERMES_HOME','PI_CODING_AGENT_DIR','OPENCODE_CONFIG','OPENCODE_CONFIG_DIR','OPENCODE_CONFIG_CONTENT','ZCODE_DATA_BASE_DIR','ZCODE_STORAGE_DIR','ZCODE_SESSION_DB_PATH','ZCODE_SESSION_DB','ZCODE_BUILTIN_PROVIDER_CONFIG_FILE','ZCODE_PERSONAL_PROVIDER_CONFIG_FILE','WORKBUDDY_CONFIG_DIR','CODEBUDDY_CONFIG_DIR','CODEBUDDY_HOST','CODEBUDDY_CODE_SUBAGENT_MODEL','CODEBUDDY_FORCE_LITE_WB_BUNDLE','CODEBUDDY_FORCE_HEADLESS_BUNDLE','ELECTRON_RUN_AS_NODE','AE_WORKBUDDY_RUNTIME','AE_WORKBUDDY_ENTRY','AE_WORKBUDDY_MODEL','AE_AGENT_BIN_PATH')) {{
         if (Test-Path -LiteralPath ('Env:' + $variable)) {{
             Remove-Item -LiteralPath ('Env:' + $variable) -ErrorAction Stop
         }}

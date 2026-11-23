@@ -1,10 +1,11 @@
 use crate::error::{AppError, Result};
 use crate::types::{
-    valid_effort, validate_balance, validate_url, BalanceQuery, ModelSyncResult, ProviderModel,
+    valid_effort, validate_balance, validate_url, BalanceQuery, CodexProtocol, ModelSyncResult,
+    ProviderModel,
 };
 use serde_json::Value;
 use std::collections::HashSet;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn now() -> u64 {
     SystemTime::now()
@@ -119,11 +120,126 @@ async fn read_json_with_auth(
         .map_err(|_| AppError::new("supplier_json", "供应商返回了无效 JSON，请检查接口路径"))
 }
 
-pub fn parse_models(value: &Value) -> Result<Vec<ProviderModel>> {
-    let items = value
+fn model_items(value: &Value) -> Option<&[Value]> {
+    // Keep the accepted envelopes deliberately small.  In particular, a bare
+    // JSON array is not a model catalogue because accepting arbitrary arrays
+    // makes an unrelated successful endpoint look like a model query.
+    let object = value.as_object()?;
+    if object.get("success").and_then(Value::as_bool) == Some(false)
+        || object.get("error").is_some_and(|value| !value.is_null())
+    {
+        return None;
+    }
+    object
         .get("data")
-        .or_else(|| value.get("models"))
         .and_then(Value::as_array)
+        .or_else(|| object.get("models").and_then(Value::as_array))
+        .or_else(|| {
+            object
+                .get("data")
+                .and_then(|data| data.get("models")?.as_array())
+        })
+        .or_else(|| {
+            object
+                .get("result")
+                .and_then(|result| result.get("models")?.as_array())
+        })
+        .map(Vec::as_slice)
+}
+
+fn model_metadata<'a>(
+    item: &'a Value,
+    keys: &'static [&'static str],
+) -> impl Iterator<Item = &'a Value> + 'a {
+    [Some(item), item.get("capabilities"), item.get("metadata")]
+        .into_iter()
+        .flatten()
+        .flat_map(|object| keys.iter().filter_map(move |key| object.get(key)))
+}
+
+fn reported_window(item: &Value) -> Option<i64> {
+    model_metadata(
+        item,
+        &[
+            "context_window",
+            "contextWindow",
+            "context_length",
+            "contextLength",
+            "max_context_length",
+            "maxContextLength",
+            "max_model_len",
+            "maxModelLen",
+            "max_context_tokens",
+            "input_token_limit",
+            "inputTokenLimit",
+        ],
+    )
+    .filter_map(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_str().and_then(|value| value.trim().parse().ok()))
+    })
+    .filter(|value| (1..=100_000_000).contains(value))
+    .min()
+}
+
+fn reasoning_efforts(item: &Value) -> Vec<String> {
+    model_metadata(
+        item,
+        &[
+            "supported_reasoning_levels",
+            "supported_reasoning_efforts",
+            "reasoning_efforts",
+            "reasoningEfforts",
+        ],
+    )
+    .find_map(Value::as_array)
+    .map(|values| {
+        let mut seen = HashSet::new();
+        values
+            .iter()
+            .filter_map(|value| {
+                value
+                    .as_str()
+                    .or_else(|| value.get("effort").and_then(Value::as_str))
+            })
+            .filter(|effort| valid_effort(effort) && seen.insert(*effort))
+            .map(str::to_owned)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn collect_model(models: &mut Vec<ProviderModel>, model: ProviderModel) -> Result<()> {
+    let Some(existing) = models.iter_mut().find(|existing| existing.id == model.id) else {
+        models.push(model);
+        return Ok(());
+    };
+    if let Some(capabilities) = model.context_capabilities {
+        if existing
+            .context_capabilities
+            .as_ref()
+            .is_some_and(|current| *current != capabilities)
+        {
+            return Err(AppError::new(
+                "model_response",
+                "供应商为同一模型返回了不一致的上下文和计费声明",
+            ));
+        }
+        existing.context_capabilities = Some(capabilities);
+    }
+    existing.context_window = [existing.context_window, model.context_window]
+        .into_iter()
+        .flatten()
+        .min();
+    if existing.reasoning_efforts.is_empty() {
+        existing.reasoning_efforts = model.reasoning_efforts;
+    }
+    Ok(())
+}
+
+pub fn parse_models(value: &Value) -> Result<Vec<ProviderModel>> {
+    let items = model_items(value)
         .ok_or_else(|| AppError::new("model_response", "模型接口需返回 data 或 models 数组"))?;
     if items.len() > 500 {
         return Err(AppError::new(
@@ -131,54 +247,31 @@ pub fn parse_models(value: &Value) -> Result<Vec<ProviderModel>> {
             "供应商返回了超过 500 个模型，请缩小模型列表",
         ));
     }
-    let mut seen = HashSet::new();
     let mut models = Vec::new();
     for item in items {
         let id = item
             .as_str()
-            .or_else(|| {
-                item.get("id")
-                    .or_else(|| item.get("slug"))
-                    .and_then(Value::as_str)
-            })
-            .unwrap_or("")
-            .trim();
-        if id.is_empty() || id.len() > 256 || id.chars().any(char::is_control) {
+            .or_else(|| item.get("id").and_then(Value::as_str))
+            .or_else(|| item.get("slug").and_then(Value::as_str))
+            .or_else(|| item.get("model_id").and_then(Value::as_str))
+            .unwrap_or_default();
+        let trimmed = id.trim();
+        if trimmed.is_empty() || trimmed.len() > 256 || id.chars().any(char::is_control) {
             return Err(AppError::new(
                 "model_response",
                 "模型接口返回了无效的模型 ID",
             ));
         }
-        if !seen.insert(id.to_owned()) {
-            continue;
-        }
-        let context_window = ["context_window", "context_length", "max_context_length"]
-            .iter()
-            .find_map(|key| item.get(key).and_then(Value::as_i64))
-            .filter(|v| (1..=100_000_000).contains(v));
-        let reasoning_efforts = item
-            .get("supported_reasoning_levels")
-            .or_else(|| item.get("supported_reasoning_efforts"))
-            .or_else(|| item.get("reasoning_efforts"))
-            .and_then(Value::as_array)
-            .map(|a| {
-                let mut seen_efforts = HashSet::new();
-                a.iter()
-                    .filter_map(|e| {
-                        e.as_str()
-                            .or_else(|| e.get("effort").and_then(Value::as_str))
-                    })
-                    .filter(|e| valid_effort(e) && seen_efforts.insert(*e))
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
-        models.push(ProviderModel {
-            id: id.to_owned(),
-            context_window,
-            reasoning_efforts,
-            enabled: true,
-        });
+        collect_model(
+            &mut models,
+            ProviderModel {
+                id: trimmed.to_owned(),
+                context_window: reported_window(item),
+                context_capabilities: crate::context_policy::endpoint_capabilities(item)?,
+                reasoning_efforts: reasoning_efforts(item),
+                enabled: true,
+            },
+        )?;
     }
     if models.is_empty() {
         return Err(AppError::new(
@@ -199,16 +292,17 @@ pub async fn sync_models_protocol(
     auth_mode: &str,
     anthropic: bool,
 ) -> Result<ModelSyncResult> {
+    let endpoint = ModelEndpoint::parse(base_url)?;
     sync_models_detect(
-        base_url,
+        &endpoint,
         key,
         auth_mode,
-        anthropic,
         Some(if anthropic {
-            crate::types::CodexProtocol::Anthropic
+            CodexProtocol::Anthropic
         } else {
-            crate::types::CodexProtocol::Openai
+            CodexProtocol::Openai
         }),
+        Instant::now() + Duration::from_secs(25),
     )
     .await
 }
@@ -216,27 +310,21 @@ pub async fn sync_models_protocol(
 pub async fn discover_connection(
     base_url: &str,
     key: &str,
-    protocol: Option<crate::types::CodexProtocol>,
+    protocol: Option<CodexProtocol>,
     auth: Option<&str>,
 ) -> Result<ModelSyncResult> {
+    let endpoint = ModelEndpoint::parse(base_url)?;
     let modes = if let Some(auth) = auth {
         vec![auth]
-    } else if base_url.contains("api.anthropic.com") {
+    } else if endpoint.native_host {
         vec!["x-api-key", "bearer"]
     } else {
         vec!["bearer", "x-api-key"]
     };
+    let deadline = Instant::now() + Duration::from_secs(25);
     let mut last = AppError::new("no_models", "未能自动匹配，请检查地址与密钥");
     for auth in modes {
-        match sync_models_detect(
-            base_url,
-            key,
-            auth,
-            protocol != Some(crate::types::CodexProtocol::Openai),
-            protocol,
-        )
-        .await
-        {
+        match sync_models_detect(&endpoint, key, auth, protocol, deadline).await {
             Ok(result) => return Ok(result),
             Err(e) if e.message.contains("HTTP 401") || e.message.contains("HTTP 403") => {
                 last = e;
@@ -247,28 +335,85 @@ pub async fn discover_connection(
     Err(last)
 }
 
+struct ModelEndpoint {
+    base: url::Url,
+    model_urls: Vec<url::Url>,
+    protocol_hint: Option<CodexProtocol>,
+    native_host: bool,
+}
+
+impl ModelEndpoint {
+    fn parse(value: &str) -> Result<Self> {
+        let mut base = validate_url(value.trim())?;
+        let path = base.path().trim_end_matches('/');
+        let (prefix, protocol_hint, explicit_route) =
+            if let Some(prefix) = path.strip_suffix("/models") {
+                (prefix, None, true)
+            } else if let Some(prefix) = path.strip_suffix("/messages") {
+                (prefix, Some(CodexProtocol::Anthropic), true)
+            } else if let Some(prefix) = path
+                .strip_suffix("/responses")
+                .or_else(|| path.strip_suffix("/chat/completions"))
+            {
+                (prefix, Some(CodexProtocol::Openai), true)
+            } else {
+                (path, None, false)
+            };
+        let mut models = base.clone();
+        models.set_path(&format!("{prefix}/models"));
+        let mut model_urls = vec![models];
+        let versioned = prefix.rsplit('/').next().is_some_and(|segment| {
+            segment.strip_prefix('v').is_some_and(|version| {
+                !version.is_empty() && version.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        });
+        if !explicit_route && !versioned && !prefix.ends_with("/backend-api/codex") {
+            let mut models = base.clone();
+            models.set_path(&format!("{prefix}/v1/models"));
+            model_urls.push(models);
+        }
+        let prefix = prefix.to_owned();
+        base.set_path(&prefix);
+        let native_host = base.scheme() == "https"
+            && base.host_str() == Some("api.anthropic.com")
+            && base.port_or_known_default() == Some(443);
+        Ok(Self {
+            base,
+            model_urls,
+            protocol_hint,
+            native_host,
+        })
+    }
+}
+
+fn contains_key(value: &str, key: &str) -> bool {
+    value == key || (key.len() >= 8 && value.contains(key))
+}
+
 async fn sync_models_detect(
-    base_url: &str,
+    endpoint: &ModelEndpoint,
     key: &str,
     auth_mode: &str,
-    anthropic: bool,
-    forced: Option<crate::types::CodexProtocol>,
+    forced: Option<CodexProtocol>,
+    deadline: Instant,
 ) -> Result<ModelSyncResult> {
     if !matches!(auth_mode, "bearer" | "x-api-key") {
         return Err(AppError::new("invalid_auth", "模型查询认证方式无效"));
     }
-    let base = base_url.trim_end_matches('/');
-    let mut urls = vec![validate_url(&format!("{base}/models"))?];
-    if !base.ends_with("/v1") && !base.ends_with("/backend-api/codex") {
-        urls.push(validate_url(&format!("{base}/v1/models"))?);
+    if key.trim().is_empty() || key.chars().any(char::is_control) {
+        return Err(AppError::new("invalid_key", "请填写有效的 API Key"));
     }
-    let client = supplier_client_headers(anthropic)?;
-    let deadline = std::time::Instant::now() + Duration::from_secs(25);
+    let client = supplier_client_headers(
+        forced.or(endpoint.protocol_hint) == Some(CodexProtocol::Anthropic)
+            || forced.is_none() && endpoint.native_host,
+    )?;
     let mut last_error = AppError::new("no_models", "未找到可用的模型接口");
-    for mut url in urls {
+    for mut url in endpoint.model_urls.iter().cloned() {
         let mut collected = Vec::new();
+        let mut cursors = HashSet::new();
+        let mut detected = None;
         for _ in 0..10 {
-            let timeout = deadline.saturating_duration_since(std::time::Instant::now());
+            let timeout = deadline.saturating_duration_since(Instant::now());
             if timeout.is_zero() {
                 return Err(AppError::new("network", "模型同步超时，请稍后重试"));
             }
@@ -302,9 +447,10 @@ async fn sync_models_detect(
                 Err(e) => return Err(e),
             };
             for model in models {
-                if !collected.iter().any(|m: &ProviderModel| m.id == model.id) {
-                    collected.push(model);
+                if contains_key(&model.id, key) {
+                    return Err(AppError::new("model_response", "供应商返回了无效的模型 ID"));
                 }
+                collect_model(&mut collected, model)?;
             }
             if collected.len() > 500 {
                 return Err(AppError::new(
@@ -312,30 +458,63 @@ async fn sync_models_detect(
                     "供应商返回了超过 500 个模型，请缩小模型列表",
                 ));
             }
+            if forced.is_none() {
+                if let Some(protocol) = model_protocol(&value) {
+                    if detected.is_some_and(|previous| previous != protocol) {
+                        return Err(AppError::new(
+                            "model_response",
+                            "供应商分页返回了不一致的接口协议",
+                        ));
+                    }
+                    detected = Some(protocol);
+                }
+            }
             if value.get("has_more").and_then(Value::as_bool) != Some(true) {
                 collected.sort_by(|a, b| a.id.cmp(&b.id));
-                let protocol = forced.unwrap_or_else(|| model_protocol(&value));
+                let protocol = forced.or(detected).or(endpoint.protocol_hint).unwrap_or(
+                    if endpoint.native_host {
+                        CodexProtocol::Anthropic
+                    } else {
+                        CodexProtocol::Openai
+                    },
+                );
                 let mut resolved = url.clone();
                 resolved.set_query(None);
-                let path = resolved.path().trim_end_matches("/models").to_owned();
+                let path = resolved
+                    .path()
+                    .strip_suffix("/models")
+                    .unwrap_or_default()
+                    .to_owned();
                 resolved.set_path(&path);
+                let resolved_base = if protocol == CodexProtocol::Openai {
+                    resolved.as_str()
+                } else {
+                    endpoint.base.as_str()
+                }
+                .trim_end_matches('/')
+                .to_owned();
+                for model in &mut collected {
+                    crate::context_policy::bind_discovered(model, &resolved_base, key, auth_mode)?;
+                }
                 return Ok(ModelSyncResult {
                     models: collected,
                     synced_at: now(),
                     protocol,
                     auth_mode: auth_mode.into(),
-                    base_url: if protocol == crate::types::CodexProtocol::Openai {
-                        resolved.as_str().trim_end_matches('/').into()
-                    } else {
-                        base.into()
-                    },
+                    base_url: resolved_base,
                 });
             }
             let last = value
                 .get("last_id")
                 .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| AppError::new("model_response", "模型分页缺少下一页标识"))?;
+                .filter(|s| {
+                    !s.is_empty()
+                        && s.len() <= 512
+                        && !s.chars().any(char::is_control)
+                        && !contains_key(s, key)
+                })
+                .filter(|s| cursors.insert((*s).to_owned()))
+                .ok_or_else(|| AppError::new("model_response", "模型分页返回了无效的下一页标识"))?;
             url.set_query(None);
             url.query_pairs_mut().append_pair("after_id", last);
         }
@@ -349,9 +528,8 @@ async fn sync_models_detect(
     Err(last_error)
 }
 
-fn model_protocol(value: &Value) -> crate::types::CodexProtocol {
-    use crate::types::CodexProtocol;
-    let items = value.get("data").and_then(Value::as_array);
+fn model_protocol(value: &Value) -> Option<CodexProtocol> {
+    let items = model_items(value);
     // OpenAI gateways also paginate. Explicit schema markers take precedence.
     if value.get("object").and_then(Value::as_str) == Some("list")
         || items.is_some_and(|items| {
@@ -360,23 +538,15 @@ fn model_protocol(value: &Value) -> crate::types::CodexProtocol {
                 .any(|m| m.get("object").and_then(Value::as_str) == Some("model"))
         })
     {
-        CodexProtocol::Openai
+        Some(CodexProtocol::Openai)
     } else if items.is_some_and(|items| {
         items
             .iter()
             .any(|m| m.get("type").and_then(Value::as_str) == Some("model"))
-    }) || (value.get("has_more").is_some()
-        && items.is_some_and(|items| {
-            items.iter().all(|m| {
-                m.get("id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|id| id.starts_with("claude-"))
-            })
-        }))
-    {
-        CodexProtocol::Anthropic
+    }) {
+        Some(CodexProtocol::Anthropic)
     } else {
-        CodexProtocol::Openai
+        None
     }
 }
 
@@ -432,21 +602,21 @@ mod tests {
             model_protocol(
                 &json!({"object":"list","has_more":false,"data":[{"id":"claude-sonnet-4-6","object":"model"}]})
             ),
-            Openai
+            Some(Openai)
         );
         assert_eq!(
             model_protocol(&json!({"has_more":false,"data":[{"id":"gpt-5.4"}]})),
-            Openai
+            None
         );
         assert_eq!(
             model_protocol(
                 &json!({"has_more":false,"data":[{"id":"claude-sonnet-4-6","type":"model"}]})
             ),
-            Anthropic
+            Some(Anthropic)
         );
         assert_eq!(
-            model_protocol(&json!({"data":[{"id":"claude-sonnet-4-6"}]})),
-            Openai
+            model_protocol(&json!({"has_more":true,"data":[{"id":"claude-sonnet-4-6"}]})),
+            None
         );
     }
     #[tokio::test]
@@ -645,6 +815,37 @@ mod tests {
         assert_eq!(models[1].reasoning_efforts, ["none", "low", "xhigh"]);
         assert!(models[2].reasoning_efforts.is_empty());
     }
+
+    #[test]
+    fn discovery_reads_reported_windows_without_inventing_a_tariff() {
+        let models = parse_models(&json!({"success":true,"data":{"models":[
+            {"id":"existing"},
+            {"id":"existing","max_model_len": 8192},
+            {"slug":"gateway/alias","context_length":"1000000","capabilities":{"contextWindow":272000,"reasoningEfforts":["high"]}},
+            {"model_id":"invalid-window","contextWindow":"-10","max_context_length":100000001},
+            {"id":"unpriced","metadata":{"inputTokenLimit":"1000000","max_output_tokens":100000}},
+            {"id":"generic-pricing","pricing":{"prompt":"0.005"},"context_length":1000000}
+        ]}})).unwrap();
+        assert_eq!(models[0].context_window, Some(8192));
+        assert_eq!(models[1].context_window, Some(272000));
+        assert_eq!(models[1].reasoning_efforts, ["high"]);
+        assert_eq!(models[2].context_window, Some(1000000));
+        assert_eq!(models[3].context_window, None);
+        assert_eq!(models[4].context_window, Some(1000000));
+        assert!(models
+            .iter()
+            .all(|model| model.context_capabilities.is_none()));
+        for rejected in [
+            json!([{"id":"unrelated"}]),
+            json!({"success":false,"data":[{"id":"unauthorized"}]}),
+            json!({"error":{"message":"unauthorized"},"data":[{"id":"unrelated"}]}),
+            json!({"models":[{"name":"display only"}]}),
+            json!({"models":["bad\n"]}),
+            json!({"models":[{"id":"conflict","context_policy":{"standard_context_window":272000,"long_context_window":1000000,"surcharge":true}},{"id":"conflict","context_policy":{"standard_context_window":272000,"long_context_window":1000000,"surcharge":false}}]}),
+        ] {
+            assert!(parse_models(&rejected).is_err());
+        }
+    }
     #[test]
     fn balance_supports_numeric_strings_zero_and_explicit_conversion() {
         let mut q = query();
@@ -729,6 +930,103 @@ mod tests {
             .to_lowercase()
             .contains("authorization: bearer isolated-test-key"));
         assert_eq!(result.models[0].id, "test-model");
+    }
+
+    #[tokio::test]
+    async fn complete_endpoint_paths_use_the_same_origin_and_preserve_the_prefix() {
+        for suffix in ["models", "responses", "chat/completions"] {
+            let (url, worker) = server(
+                r#"{"object":"list","data":[{"id":"test-model"}]}"#,
+                "200 OK",
+            );
+            let input = format!("{url}/gateway%20path/v1/{suffix}/");
+            let result = discover_connection(&input, "isolated-test-key", None, None)
+                .await
+                .unwrap();
+            assert_eq!(result.base_url, format!("{url}/gateway%20path/v1"));
+            assert_eq!(result.protocol, CodexProtocol::Openai);
+            assert!(worker
+                .join()
+                .unwrap()
+                .starts_with("GET /gateway%20path/v1/models "));
+        }
+        let (url, worker) = server(r#"{"models":[{"slug":"native-model"}]}"#, "200 OK");
+        let result = discover_connection(
+            &format!("{url}/gateway/v1/messages"),
+            "isolated-test-key",
+            None,
+            Some("x-api-key"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.base_url, format!("{url}/gateway/v1"));
+        assert_eq!(result.protocol, CodexProtocol::Anthropic);
+        assert!(worker
+            .join()
+            .unwrap()
+            .starts_with("GET /gateway/v1/models "));
+        assert!(
+            !ModelEndpoint::parse("https://api.anthropic.com.other.test/v1")
+                .unwrap()
+                .native_host
+        );
+        assert!(
+            ModelEndpoint::parse("https://api.anthropic.com/v1/models")
+                .unwrap()
+                .native_host
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_retains_explicit_protocol_and_capabilities_across_pages() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/gateway/v1", listener.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for body in [
+                r#"{"data":[{"type":"model","id":"native-model"}],"has_more":true,"last_id":"p/2"}"#,
+                r#"{"data":[{"id":"native-model","contextWindow":1000000,"context_policy":{"standard_context_window":272000,"long_context_window":1000000,"surcharge":true}}],"has_more":false}"#,
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut buf = [0; 8192];
+                let n = stream.read(&mut buf).unwrap();
+                requests.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+            }
+            requests
+        });
+        let result = discover_connection(&base, "native-test-key", None, None)
+            .await
+            .unwrap();
+        let requests = worker.join().unwrap();
+        assert!(requests[0].starts_with("GET /gateway/v1/models "));
+        assert!(requests[1].starts_with("GET /gateway/v1/models?after_id=p%2F2 "));
+        assert_eq!(result.protocol, CodexProtocol::Anthropic);
+        let model = &result.models[0];
+        assert_eq!(model.context_window, Some(1000000));
+        let capability = model.context_capabilities.as_ref().unwrap();
+        assert_eq!(capability.endpoint.as_deref(), Some(base.as_str()));
+        assert_eq!(capability.surcharge, Some(true));
+        assert!(capability.credential_scope.is_some());
+    }
+
+    #[tokio::test]
+    async fn discovery_does_not_echo_a_reflected_key() {
+        for body in [
+            r#"{"data":[{"id":"id:isolated-test-key"}]}"#,
+            r#"{"data":[{"id":"test-model"}],"has_more":true,"last_id":"isolated-test-key"}"#,
+        ] {
+            let (url, worker) = server(body, "200 OK");
+            let error = discover_connection(&format!("{url}/v1"), "isolated-test-key", None, None)
+                .await
+                .unwrap_err();
+            worker.join().unwrap();
+            assert_eq!(error.code, "model_response");
+            assert!(!error.message.contains("isolated-test-key"));
+        }
     }
     #[tokio::test]
     async fn model_query_supports_anthropic_key_authentication() {

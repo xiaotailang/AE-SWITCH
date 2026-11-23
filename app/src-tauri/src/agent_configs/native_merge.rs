@@ -868,16 +868,20 @@ fn changes(
         return Ok(());
     }
     if node.block {
-        if value.as_object().is_some_and(|map| map.is_empty()) {
-            edits.push((
-                node.start,
-                node.end,
-                if node.start > node.entry_start {
-                    " {}".into()
-                } else {
-                    "{}".into()
-                },
-            ));
+        let empty_collection = if value.as_object().is_some_and(|map| map.is_empty()) {
+            Some("{}")
+        } else if node.sequence && value.as_array().is_some_and(|rows| rows.is_empty()) {
+            Some("[]")
+        } else {
+            None
+        };
+        if let Some(empty) = empty_collection {
+            let replacement = if node.start > node.entry_start {
+                format!(" {empty}")
+            } else {
+                empty.into()
+            };
+            edits.push((node.start, node.end, replacement));
             return Ok(());
         }
         let mut additions = String::new();

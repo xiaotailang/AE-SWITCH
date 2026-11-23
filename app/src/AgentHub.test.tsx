@@ -207,7 +207,7 @@ async function mount(expandDetails = true) {
     }
   }
 }
-async function enterConnection() {
+async function enterConnection(expectedModel = "gpt-test") {
   await userEvent.clear(screen.getByLabelText(/API 端点/));
   await userEvent.type(screen.getByLabelText(/API 端点/), provider.baseUrl);
   await userEvent.type(
@@ -217,7 +217,7 @@ async function enterConnection() {
   await waitFor(
     () =>
       expect(screen.getByRole("combobox", { name: "默认模型" })).toHaveValue(
-        "gpt-test",
+        expectedModel,
       ),
     { timeout: 3000 },
   );
@@ -344,6 +344,162 @@ describe("Agent Hub 真实状态与配置流程", () => {
       screen.getByText("查看验证原因", { selector: "summary" }),
     );
     expect(screen.getByText(/provider_rejected/)).toBeVisible();
+  });
+
+  it("长上下文默认关闭并保存80%阈值，主动开启后保留端点上限", async () => {
+    vi.mocked(agentApi.discover).mockResolvedValue({
+      clients: [],
+      scannedAt: "now",
+      limited: false,
+      notes: [],
+    });
+    const model = {
+      id: "gpt-6.1-sol",
+      contextWindow: 1050000,
+      enabled: true,
+      reasoningEfforts: ["xhigh"],
+      contextCapabilities: {
+        standardWindow: 272000,
+        longWindow: 1050000,
+        source: "endpoint" as const,
+        inputMultiplier: 2,
+        outputMultiplier: 1.5,
+        endpoint: provider.baseUrl,
+        credentialScope: "a".repeat(64),
+      },
+    };
+    let current = provider;
+    vi.mocked(api.save).mockImplementation(async (input) => {
+      current = { ...provider, ...input, id: provider.id };
+      return current;
+    });
+    vi.mocked(api.overview).mockImplementation(async () => ({
+      providers: [current],
+      targets: [],
+      dataDirectory: "./data",
+    }));
+    vi.mocked(api.discoverConnection).mockResolvedValue({
+      models: [model],
+      protocol: "openai",
+      authMode: "bearer",
+      syncedAt: 2,
+      baseUrl: provider.baseUrl,
+    });
+    await mount();
+    await enterConnection(model.id);
+    const toggle = await screen.findByRole("switch", { name: "长上下文" });
+    expect(toggle).not.toBeChecked();
+    expect(
+      screen.getByRole("spinbutton", { name: "自动压缩阈值（%）" }),
+    ).toHaveValue(80);
+    await userEvent.click(screen.getByRole("button", { name: "仅保存" }));
+    await waitFor(() =>
+      expect(api.save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          codexOptions: expect.objectContaining({
+            contextPolicy: {
+              model: model.id,
+              longContextEnabled: false,
+              compactPercent: 80,
+            },
+            models: [model],
+          }),
+        }),
+      ),
+    );
+    await userEvent.click(
+      await screen.findByRole("switch", { name: "长上下文" }),
+    );
+    await userEvent.click(screen.getByRole("radio", { name: "更高（xhigh）" }));
+    await userEvent.click(screen.getByRole("button", { name: "仅保存" }));
+    await waitFor(() =>
+      expect(api.save).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          reasoningEffort: "xhigh",
+          codexOptions: expect.objectContaining({
+            contextPolicy: {
+              model: model.id,
+              longContextEnabled: true,
+              compactPercent: 80,
+            },
+          }),
+        }),
+      ),
+    );
+    vi.mocked(api.discoverConnection).mockResolvedValue({
+      models: [
+        {
+          ...model,
+          contextCapabilities: {
+            ...model.contextCapabilities,
+            inputMultiplier: 3,
+            credentialScope: "b".repeat(64),
+          },
+        },
+      ],
+      protocol: "openai",
+      authMode: "bearer",
+      syncedAt: 3,
+      baseUrl: provider.baseUrl,
+    });
+    await userEvent.click(screen.getByRole("button", { name: "同步模型" }));
+    await waitFor(() =>
+      expect(
+        screen.getByRole("switch", { name: "长上下文" }),
+      ).not.toBeChecked(),
+    );
+  });
+
+  it("按端点声明为原生 Anthropic 模型保存默认预算", async () => {
+    vi.mocked(agentApi.discover).mockResolvedValue({
+      clients: [],
+      scannedAt: "now",
+      limited: false,
+      notes: [],
+    });
+    const model = {
+      id: "claude-sonnet-example",
+      contextWindow: 400000,
+      enabled: true,
+      reasoningEfforts: [],
+      contextCapabilities: {
+        standardWindow: 64000,
+        longWindow: 400000,
+        source: "endpoint" as const,
+        inputMultiplier: 2,
+        outputMultiplier: null,
+        endpoint: provider.baseUrl,
+        credentialScope: "a".repeat(64),
+      },
+    };
+    vi.mocked(api.discoverConnection).mockResolvedValue({
+      models: [model],
+      protocol: "anthropic",
+      authMode: "x-api-key",
+      syncedAt: 2,
+      baseUrl: provider.baseUrl,
+    });
+    await mount();
+    await enterConnection(model.id);
+    expect(screen.getByText(/Anthropic · x-api-key/)).toBeVisible();
+    expect(screen.getByRole("switch", { name: "长上下文" })).not.toBeChecked();
+    expect(screen.getByText(/压缩阈值 51,200 Token（80%）/)).toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: "仅保存" }));
+    await waitFor(() =>
+      expect(api.save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          family: "claude",
+          authMode: "x-api-key",
+          codexOptions: expect.objectContaining({
+            contextPolicy: {
+              model: model.id,
+              longContextEnabled: false,
+              compactPercent: 80,
+            },
+          }),
+        }),
+      ),
+    );
   });
 
   it("根据真实模型能力显示思考选项并将选择保存到连接", async () => {
