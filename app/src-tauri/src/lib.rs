@@ -8,6 +8,7 @@ pub mod agent_verification;
 #[cfg(feature = "desktop")]
 pub mod background;
 pub mod bridge;
+pub(crate) mod codex_switching;
 pub mod config_profiles;
 pub mod context_policy;
 pub mod desktop_platform;

@@ -6,6 +6,7 @@ use crate::writer;
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
+mod codex_catalog;
 mod context;
 mod existing;
 mod jsonc;
@@ -271,6 +272,11 @@ pub(crate) fn configure_existing_with_selection(
     existing::validate_profile(agent, profile)?;
     let mut environment = serde_json::Map::new();
     let context_policy = context::from_selection(Some(selection.1), agent)?;
+    let native_model_catalog = if agent == AgentId::Codex {
+        codex_catalog::from_selection(Some(selection.1))?
+    } else {
+        None
+    };
     let (snapshots, writes) = plan_agent_configuration(
         root,
         Path::new(&profile.directory),
@@ -281,6 +287,7 @@ pub(crate) fn configure_existing_with_selection(
         &mut environment,
         Some(profile),
         context_policy.as_ref(),
+        native_model_catalog.as_ref(),
     )?;
     ownership::prepare(root, agent, Some(profile), &snapshots, &writes)?;
     existing::commit(root, agent, profile, &snapshots, writes, selection)?;
@@ -398,6 +405,11 @@ pub(crate) fn configure_with_selection(
     );
     add_bundled_tools(&directory, agent, &mut environment)?;
     let context_policy = context::from_selection(selection.map(|(_, text, _)| text), agent)?;
+    let native_model_catalog = if agent == AgentId::Codex {
+        codex_catalog::from_selection(selection.map(|(_, text, _)| text))?
+    } else {
+        None
+    };
     if agent == AgentId::WorkBuddy {
         if let Some(policy) = &context_policy {
             environment.insert(
@@ -420,6 +432,7 @@ pub(crate) fn configure_with_selection(
         &mut environment,
         None,
         context_policy.as_ref(),
+        native_model_catalog.as_ref(),
     )?;
     writes.push((
         directory.join("configuration/environment.json"),
@@ -887,6 +900,7 @@ type NativePlan = (Vec<native_merge::Snapshot>, Vec<(PathBuf, String)>);
 /// Plan an update of an already configured client without changing its target.
 /// Private launcher/runtime files are preserved; only the existing portable
 /// environment's model/connection fields and native configuration are updated.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_profile_configuration(
     root: &Path,
     agent: AgentId,
@@ -895,6 +909,7 @@ pub(crate) fn plan_profile_configuration(
     model: &str,
     profile: Option<&ExistingProfile>,
     context_policy: Option<&crate::context_policy::AppliedContextPolicy>,
+    native_model_catalog: Option<&crate::codex_switching::Catalog>,
 ) -> Result<Vec<(PathBuf, String)>> {
     validate_inputs(root, base_url, token, model)?;
     let directory = profile
@@ -938,6 +953,7 @@ pub(crate) fn plan_profile_configuration(
         &mut environment,
         profile,
         context_policy,
+        native_model_catalog,
     )?;
     if profile.is_none() {
         writes.push((
@@ -959,6 +975,7 @@ fn plan_agent_configuration(
     environment: &mut serde_json::Map<String, serde_json::Value>,
     profile: Option<&ExistingProfile>,
     context_policy: Option<&crate::context_policy::AppliedContextPolicy>,
+    native_model_catalog: Option<&crate::codex_switching::Catalog>,
 ) -> Result<NativePlan> {
     // All native files are read, parsed and merged before the first native write.
     // A malformed secondary file therefore cannot clobber an earlier one.
@@ -1409,6 +1426,19 @@ fn plan_agent_configuration(
                 .unwrap_or("")
                 .parse::<toml_edit::DocumentMut>()
                 .map_err(|_| native_merge::invalid(&path))?;
+            let catalog_path = path_for(
+                codex_catalog::SLOT,
+                "home/.codex/ae-switch-approved-models.json",
+            );
+            if let Some(current) = existing
+                .as_deref()
+                .filter(|_| native_model_catalog.is_none())
+            {
+                if codex_catalog::points_to(&document, &path, &catalog_path)? {
+                    let before = ownership::codex_catalog_origin(root, profile, &path, current)?;
+                    codex_catalog::revert(&mut document, before.as_deref(), &path, &catalog_path)?;
+                }
+            }
             native_merge::toml_set(
                 document.as_table_mut(),
                 "model",
@@ -1434,7 +1464,9 @@ fn plan_agent_configuration(
             if let Some(agents) = document
                 .get_mut("agents")
                 .and_then(toml_edit::Item::as_table_like_mut)
-                .filter(|agents| agents.contains_key("default_subagent_model"))
+                .filter(|agents| {
+                    native_model_catalog.is_none() && agents.contains_key("default_subagent_model")
+                })
             {
                 native_merge::toml_set(
                     agents,
@@ -1512,6 +1544,17 @@ fn plan_agent_configuration(
             )?;
             if !provider.contains_key("supports_websockets") {
                 provider.insert("supports_websockets", toml_edit::value(false));
+            }
+            if let Some(catalog) = native_model_catalog {
+                let current = snapshot(&catalog_path, &mut snapshots)?;
+                ownership::require_owned_codex_catalog(
+                    root,
+                    profile,
+                    &catalog_path,
+                    current.as_deref(),
+                )?;
+                writes.push((catalog_path.clone(), codex_catalog::json(model, catalog)?));
+                codex_catalog::configure(&mut document, &path, &catalog_path)?;
             }
             writes.push((path, document.to_string()));
         }
@@ -2122,7 +2165,9 @@ fn plan_agent_configuration(
             }
         }
     }
-    if let Some(policy) = context_policy {
+    if let Some(policy) =
+        context_policy.filter(|_| agent != AgentId::Codex || native_model_catalog.is_none())
+    {
         context::apply(agent, model, &mut writes, policy)?;
     }
     Ok((snapshots, writes))

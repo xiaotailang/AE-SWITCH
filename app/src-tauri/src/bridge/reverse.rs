@@ -51,6 +51,32 @@ fn reasoning_model(model: &str) -> bool {
         || model.starts_with("gpt-6")
         || ["o1", "o3", "o4"].iter().any(|p| model.starts_with(p))
 }
+pub(super) fn translated_reasoning_effort(body: &Value, model: &str) -> Option<&'static str> {
+    if !reasoning_model(model)
+        || !matches!(
+            body["thinking"]["type"].as_str(),
+            Some("enabled" | "adaptive")
+        )
+    {
+        return None;
+    }
+    Some(
+        match body
+            .pointer("/output_config/effort")
+            .and_then(Value::as_str)
+        {
+            Some("low") => "low",
+            Some("medium") => "medium",
+            Some(_) => "high",
+            None => match body["thinking"]["budget_tokens"].as_u64().unwrap_or(4096) {
+                0..=1024 => "low",
+                1025..=3072 => "medium",
+                _ => "high",
+            },
+        },
+    )
+}
+
 fn text_blocks(value: &Value, assistant: bool) -> ConversionResult<Vec<Value>> {
     if let Some(s) = value.as_str() {
         return Ok(vec![
@@ -190,25 +216,7 @@ pub fn request(body: &Value, model: &str, streaming: bool) -> ConversionResult<V
         };
         result["parallel_tool_calls"] = json!(choice["disable_parallel_tool_use"] != true);
     }
-    let thinking = matches!(
-        body["thinking"]["type"].as_str(),
-        Some("enabled" | "adaptive")
-    );
-    if thinking && reasoning_model(model) {
-        let effort = body
-            .pointer("/output_config/effort")
-            .and_then(Value::as_str)
-            .unwrap_or_else(
-                || match body["thinking"]["budget_tokens"].as_u64().unwrap_or(4096) {
-                    0..=1024 => "low",
-                    1025..=3072 => "medium",
-                    _ => "high",
-                },
-            );
-        let effort = match effort {
-            "low" | "medium" => effort,
-            _ => "high",
-        };
+    if let Some(effort) = translated_reasoning_effort(body, model) {
         result["reasoning"] = json!({"effort":effort,"summary":"auto"});
         result["include"] = json!(["reasoning.encrypted_content"]);
     }

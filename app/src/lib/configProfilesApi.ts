@@ -9,6 +9,7 @@ export interface ConfigProfileEntry {
   model: string;
   reasoningEffort: string | null;
   contextPolicy?: AppliedContextPolicy | null;
+  allowNativeModelSwitching?: boolean;
 }
 export interface ConfigProfile {
   id: string;
@@ -29,6 +30,7 @@ export interface ConfigProfilePreviewEntry extends ConfigProfileEntry {
   previousModel: string;
   previousReasoningEffort: string | null;
   previousContextPolicy?: AppliedContextPolicy | null;
+  previousAllowNativeModelSwitching?: boolean;
   targetMode: "existing" | "private";
   changed: boolean;
 }

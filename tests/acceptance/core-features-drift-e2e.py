@@ -10,13 +10,11 @@ import argparse
 import hashlib
 import importlib.util
 import json
-import os
 from pathlib import Path
 import re
-import stat
-import subprocess
 import sys
 import time
+from uuid import uuid4
 
 sys.dont_write_bytecode = True
 WORKSPACE = Path(__file__).resolve().parents[2]
@@ -35,115 +33,24 @@ def sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def ordinary_tree(root, marker_before, require):
-    require(root.drive.lower() == "g:" and root.name.isalnum() and len(root.name) == 32,
-            "cleanup_exact_g_uuid_owner_required")
-    require(root.parent == WORKSPACE / ".cache/core-features-cli-e2e",
-            "cleanup_owner_parent_mismatch")
-    marker = root / "owner.json"
-    require(marker.read_bytes() == marker_before, "cleanup_owner_marker_changed")
-    owner = json.loads(marker_before)
-    require(owner.get("schema") == "ae-switch-core-features-cli-e2e-v1"
-            and owner.get("ownerId") == root.name
-            and owner.get("purpose") == "local-synthetic-cli-fixtures",
-            "cleanup_owner_marker_identity_mismatch")
-    for ancestor in (root, *root.parents):
-        metadata = ancestor.lstat()
-        require(not stat.S_ISLNK(metadata.st_mode)
-                and not getattr(metadata, "st_file_attributes", 0) & 0x400,
-                "cleanup_redirected_ancestor_rejected")
-    files, directories, pending = [], [], [root]
-    while pending:
-        directory = pending.pop()
-        directories.append(directory)
-        for entry in directory.iterdir():
-            metadata = entry.lstat()
-            require(not stat.S_ISLNK(metadata.st_mode)
-                    and not getattr(metadata, "st_file_attributes", 0) & 0x400,
-                    "cleanup_redirected_entry_rejected")
-            require(entry.is_relative_to(root), "cleanup_entry_outside_owner")
-            if stat.S_ISDIR(metadata.st_mode):
-                pending.append(entry)
-            else:
-                require(stat.S_ISREG(metadata.st_mode), "cleanup_nonordinary_entry_rejected")
-                if entry != marker:
-                    files.append(entry)
-    return files, sorted(directories, key=lambda path: len(path.parts), reverse=True)
-
-
-def prove_no_owner_processes(harness, require):
-    environment = harness.environment.copy()
-    environment["AE_DRIFT_CLEANUP_ROOT"] = str(harness.owner)
-    environment["PSModuleAnalysisCachePath"] = str(harness.owner / "process-cache/module-analysis")
-    program = WORKSPACE / ".tools/pwsh/pwsh.exe"
-    require(program.is_file(), "cleanup_workspace_powershell_required")
-    # Query only. Raw command lines remain inside PowerShell and never enter
-    # child output, retained evidence, or a termination API.
-    script = r"""
-$ErrorActionPreference='Stop'
-$scope=[IO.Path]::GetFullPath($env:AE_DRIFT_CLEANUP_ROOT).TrimEnd('\','/')
-$matches=@(Get-CimInstance Win32_Process | Where-Object {
-  ($_.ExecutablePath -and ($_.ExecutablePath -ieq $scope -or $_.ExecutablePath.StartsWith($scope+'\',[StringComparison]::OrdinalIgnoreCase))) -or
-  ($_.CommandLine -and $_.CommandLine.IndexOf($scope,[StringComparison]::OrdinalIgnoreCase) -ge 0)
-})
-@{processesReferencingOwner=$matches.Count;processesStopped=0}|ConvertTo-Json -Compress
-"""
-    result = subprocess.run([str(program), "-NoProfile", "-NonInteractive", "-Command", script],
-                            env=environment, cwd=WORKSPACE, capture_output=True, text=True,
-                            encoding="utf-8", errors="replace", timeout=60,
-                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), check=False)
-    require(result.returncode == 0, "cleanup_process_query_failed")
-    try:
-        proof = json.loads(result.stdout)
-    except ValueError:
-        raise RuntimeError("cleanup_process_proof_invalid") from None
-    require(proof.get("processesReferencingOwner") == 0 and proof.get("processesStopped") == 0,
-            "cleanup_live_owner_reference_refused")
-    return proof
-
-
-def cleanup(harness, marker_before, require):
-    ordinary_tree(harness.owner, marker_before, require)
-    proof = prove_no_owner_processes(harness, require)
-    # Recheck after the process scan; deletion never follows a link and uses
-    # explicit children, with the owner marker retained until everything else.
-    # PowerShell may create its own module cache inside the owned root. Its
-    # subprocess has exited; enumerate the complete final ordinary tree now.
-    files, directories = ordinary_tree(harness.owner, marker_before, require)
-    for file in files:
-        metadata = file.lstat()
-        require(stat.S_ISREG(metadata.st_mode)
-                and not getattr(metadata, "st_file_attributes", 0) & 0x400,
-                "cleanup_file_changed_before_delete")
-        file.unlink()
-    for directory in directories:
-        if directory != harness.owner:
-            directory.rmdir()
-    marker = harness.owner / "owner.json"
-    require(marker.read_bytes() == marker_before, "cleanup_marker_changed_before_delete")
-    require(set(harness.owner.iterdir()) == {marker}, "cleanup_unexpected_root_entry")
-    marker.unlink()
-    harness.owner.rmdir()
-    return {"passed": not harness.owner.exists(), "removed": not harness.owner.exists(),
-            "ownerMarkerVerified": True, "ordinaryTreeVerified": True,
-            "processesReferencingOwner": proof["processesReferencingOwner"],
-            "processesStopped": 0, "removedFiles": len(files) + 1,
-            "removedDirectories": len(directories)}
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path,
                         default=WORKSPACE / ".cache/release-audit-ui-64ccdd27024145f1af6c9b745bb0f97c/AE-Switch-core.exe")
     parser.add_argument("--expected-sha256", default=None)
+    parser.add_argument("--report", type=Path)
     options = parser.parse_args()
     fixture = load_fixture_harness()
     require = fixture.require
+    try:
+        receipt = fixture.receipt_path(options.report)
+    except fixture.CheckFailure as error:
+        print(json.dumps({"passed": False, "failure": str(error)}))
+        return 1
     harness = None
-    marker = None
     failure = None
     checks = []
-    cleanup_result = {"passed": False, "removed": False}
+    setup_cleanup = None
     started = time.monotonic()
     try:
         binary = fixture.g_path(options.binary)
@@ -155,7 +62,6 @@ def main():
         else:
             require(core_sha256 == EXPECTED_CORE_SHA256, "compiled_core_expected_hash_mismatch")
         harness = fixture.Harness(binary, WORKSPACE)
-        marker = (harness.owner / "owner.json").read_bytes()
         harness.fixture("codex")
         config = harness.main_paths["codex"]
         original = config.read_bytes()
@@ -230,41 +136,39 @@ def main():
                 "disconnect_original_history_changed")
         checks.append("cas_fixture_restore_returns_healthy_and_normal_disconnect_restores_original_bytes")
         require(sha256(config) == original_hash, "original_configuration_hash_mismatch")
+    except fixture.FixtureSetupFailure as error:
+        harness, setup_cleanup, failure = error.harness, error.harness.cleanup, str(error)
     except fixture.CheckFailure as error:
         failure = str(error)
     except Exception:
         failure = "drift_fixture_operation_failed_raw_details_suppressed"
-    finally:
-        if harness is not None and marker is not None:
-            try:
-                cleanup_result = cleanup(harness, marker, require)
-            except fixture.CheckFailure as error:
-                cleanup_result = {"passed": False, "removed": False, "failure": str(error)}
-                failure = failure or "owned_cleanup_not_proved"
-            except Exception:
-                cleanup_result = {"passed": False, "removed": False,
-                                  "failure": "owned_cleanup_refused_or_failed_raw_details_suppressed"}
-                failure = failure or "owned_cleanup_not_proved"
     report = {
         "schema": "ae-switch-compiled-core-drift-e2e-v1",
         "ownerId": harness.owner_id if harness else None,
         "binarySha256": harness.binary_sha256 if harness else None,
         "scriptSha256": sha256(Path(__file__)),
         "fixtureHelperSha256": sha256(Path(__file__).with_name("core-features-cli-e2e.py")),
-        "passed": failure is None and cleanup_result["passed"], "failure": failure,
+        "passed": failure is None, "failure": failure,
         "checks": [{"name": name, "passed": True} for name in checks],
         "checkCount": len(checks), "cliCommands": harness.command_count if harness else 0,
-        "elapsedSeconds": round(time.monotonic() - started, 3), "cleanup": cleanup_result,
+        "elapsedSeconds": round(time.monotonic() - started, 3),
         "scope": "synthetic local compiled-core Codex configuration drift and safe disconnect",
         "officialClientsExecuted": False, "upstreamRequestsMade": 0,
         "modelInferenceCalls": 0, "realClientE2EPassed": False,
         "sensitiveStateIncluded": False, "allMutableDataOnG": True,
     }
-    if harness is not None:
-        receipt = WORKSPACE / ".cache/core-features-drift-e2e" / (harness.owner_id + ".json")
-        receipt.parent.mkdir(parents=True, exist_ok=True)
-        with receipt.open("x", encoding="utf-8") as stream:
-            stream.write(json.dumps(report, indent=2) + "\n")
+    cleanup = setup_cleanup if setup_cleanup is not None else fixture.finish_owned_fixture(harness)
+    report["cleanup"] = cleanup
+    if not cleanup["passed"]:
+        report["passed"] = False
+        report["failure"] = failure or "owned_cleanup_not_proved"
+    owner_id = harness.owner_id if harness and harness.owner_id else uuid4().hex
+    receipt = receipt or WORKSPACE / "artifacts/acceptance/core-features-drift-e2e" / f"{owner_id}.json"
+    try:
+        fixture.write_receipt(receipt, report)
+    except Exception:
+        report["passed"] = False
+        report["receiptFailure"] = "acceptance_receipt_not_written"
     print(json.dumps(report))
     return 0 if report["passed"] else 1
 

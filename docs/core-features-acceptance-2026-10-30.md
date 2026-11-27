@@ -11,7 +11,7 @@
 | 存储隔离 | `tests/acceptance/verify-g-only-environment.ps1` | 32 项环境路径位于当前 G: 项目，祖先无 reparse；真实 Node/Python/PowerShell 子进程逐值继承，实际 sentinel 写入 G: TEMP |
 | 前端 | TypeScript、Vitest 全量、Vite 生产构建 | 本轮源码对应的检查通过；模型收藏/搜索、具名配置、漂移状态/恢复入口和请求活动的状态与错误路径都覆盖 |
 | 后端 | Rust 全量、desktop 三测试 harness、rustfmt、Clippy | 使用本轮最终源码；忽略项逐项保留，不升级为已通过 |
-| 原生核心 | `isolated-core-agents.mjs` | 生产 core 与构建/源码指纹相同，真实发现模型后以显式模型/强度保存，八客户端 `configure-profile` / `probe-profile` 的 tool 写读与清理证据全部通过 |
+| 原生核心 | `run-isolated-core-agents.ps1` | 生产 core 与构建和源码指纹相同，真实发现模型后以显式模型和强度保存，记录八客户端的工具写读及本轮测试目录清理 |
 | 生产桌面 | 既有 `verify-production-ui-eight.ps1` 与 UI/system/tray 模块 | 生产 EXE、真实 IPC/发现/保存/配置/启动/工具写读、新功能 GUI 操作均由当前构建证明 |
 | 包与隐私 | `final-package-audit.mjs`、`audit-private-artifacts.py` | 源码与二进制对应，排除私有输入/数据库/profile/研究目录；已知 key/端点/开发路径与编码变体在目录、EXE/DLL 和 ZIP 解压成员中零命中 |
 
@@ -34,13 +34,15 @@ $coreOwnerId = [Guid]::NewGuid().ToString('N')
   -OwnerId $coreOwnerId -AuditDirectory $currentBuildAudit -PackageDirectory $currentPackage `
   -CredentialsFile (Join-Path $env:AE_WORKSPACE '端点测试用.txt') `
   -InstallationsManifest (Join-Path $env:AE_WORKSPACE '.cache/tmp/review-official-installations-20261017.json') `
-  -UseNativeCodexEntry
-& .\.tools\node\node.exe .\tests\acceptance\isolated-core-agents.mjs `
-  --setup (Join-Path $env:AE_WORKSPACE ".cache/native-e2e-sandbox/$coreOwnerId/setup.json") `
-  --model gpt-6.1-sol --reasoning-effort xhigh
+  -UseNativeCodexEntry -IsolatedCoreAutoCleanup
+& .\.tools\pwsh\pwsh.exe -NoProfile -File .\tests\acceptance\run-isolated-core-agents.ps1 `
+  -SetupFile (Join-Path $env:AE_WORKSPACE ".cache/native-e2e-sandbox/$coreOwnerId/setup.json") `
+  -Model gpt-6.1-sol -ReasoningEffort xhigh
 ```
 
-该 runner 不启动桌面、不接入旧 AE、不删除数据、不用产品 QA/discovery hook。真实上游错误保留到先脱敏后落盘的收据。保留的 sandbox 包含实际私有输入和新 profile，只能按同一 owner id、进程退出与普通路径证明单独清理；不能打包或上传。超时时只终止自己持有的 core 进程对象，保留 sandbox 供独立检查客户端后代，不使用全树终止或按进程名停止。
+验收使用独立的 G 盘 profile。核心测试结束且 Windows Job 中的进程退出后，监督器核对本轮 owner 和路径并删除该测试目录。`artifacts/acceptance` 保留脱敏结果和清理收据。进程仍在运行、路径检查失败或删除失败时，清理收据记录具体状态，验收退出失败。测试目录里可能有私有凭据，发布包仅取经过检查的交付文件。
+
+编译核心的本地网关、配置、上下文和漂移验收也会在退出后清理各自创建的 G 盘目录。成功和失败均保留简短 JSON 结果。每次使用新收据路径。已有收据、编译缓存和发布产品可以继续复用。
 
 生产桌面有当前 Windows 会话共享的固定 single-instance 标识；不同 UUID 目录不会隔离该 mutex。旧 AE 正在运行时不能把新进程唤醒旧窗口算作新版通过，不能静默停止旧进程。完整桌面验收需要用户从托盘正常退出旧 AE 后，用另一个全新 owner id 重新准备并运行生产 GUI supervisor。
 

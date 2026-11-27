@@ -57,6 +57,7 @@ export interface AgentInfo {
   model: string | null;
   reasoningEffort?: string | null;
   contextPolicy?: AppliedContextPolicy | null;
+  allowNativeModelSwitching?: boolean;
   providerId: string | null;
   mode?: "existing" | "private";
   profile?: ExistingProfile | null;
@@ -113,6 +114,7 @@ export interface AgentConfiguration {
   providerId: string;
   model?: string;
   profile?: ExistingProfile;
+  allowNativeModelSwitching?: boolean;
 }
 export interface AgentProbe {
   ok: boolean;

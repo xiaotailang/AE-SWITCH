@@ -1,16 +1,16 @@
 """Current compiled CLI, eight owned profiles, no inference or external clients."""
 import argparse
 from datetime import datetime, timezone
-import hashlib
 import importlib.util
 import json
-import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import sys
 from threading import Thread
 import time
 import tomllib
 
+sys.dont_write_bytecode = True
 w = Path(__file__).resolve().parents[2]
 parser = argparse.ArgumentParser()
 parser.add_argument('--binary', type=Path, required=True)
@@ -20,10 +20,15 @@ spec = importlib.util.spec_from_file_location('ae_cli_context_fixture', Path(__f
 fixtures = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fixtures)
 require = fixtures.require
-report_file = fixtures.g_path(args.report)
-require(report_file.is_relative_to(w / 'artifacts/acceptance') and not report_file.exists(), 'fresh_owned_report_required')
+try:
+    report_file = fixtures.receipt_path(args.report)
+except fixtures.CheckFailure as error:
+    print(json.dumps({'passed': False, 'failure': str(error)}))
+    raise SystemExit(1) from None
 harness = None
 server = None
+server_thread = None
+setup_cleanup = None
 requests = []
 models = [{'id': fixtures.MODEL, 'enabled': True, 'context_window': 1050000,
            'supported_reasoning_levels': ['xhigh'], 'context_policy': {
@@ -51,6 +56,10 @@ def verify_snapshot(value, long=False):
     require(value == expected, 'native_applied_context_snapshot_mismatch')
 
 
+class ModelServer(ThreadingHTTPServer):
+    daemon_threads = False
+
+
 class ModelEndpoint(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
@@ -70,8 +79,9 @@ try:
     result.update(ownerId=harness.owner_id, binarySha256=harness.binary_sha256)
     for agent in fixtures.AGENTS:
         harness.fixture(agent)
-    server = ThreadingHTTPServer(('127.0.0.1', 0), ModelEndpoint)
-    Thread(target=server.serve_forever, daemon=True).start()
+    server = ModelServer(('127.0.0.1', 0), ModelEndpoint)
+    server_thread = Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
     endpoint = f'http://127.0.0.1:{server.server_port}/v1'
     credentials = harness.portable / 'synthetic-model-query.txt'
     credentials.write_text('端点：' + endpoint + '\napi-key: ' + 'ae-context-synthetic-' + harness.owner_id, encoding='utf-8')
@@ -160,6 +170,9 @@ try:
         require((path.read_bytes() if path.exists() else None) == before, 'flat_rate_disconnect_did_not_restore_original_bytes')
     result['checks'].append('confirmed_flat_rate_endpoint_uses_its_real_window_without_paid_opt_in')
     result['passed'] = True
+except fixtures.FixtureSetupFailure as error:
+    harness, setup_cleanup = error.harness, error.harness.cleanup
+    result['failure'] = str(error)
 except fixtures.CheckFailure as error:
     result['failure'] = str(error)
 except Exception as error:
@@ -171,13 +184,31 @@ except Exception as error:
             result['failureLines'].append(trace.tb_lineno)
         trace = trace.tb_next
 finally:
-    if server:
-        server.shutdown()
-        server.server_close()
+    try:
+        if server:
+            if server_thread and server_thread.ident is not None:
+                server.shutdown()
+                server_thread.join()
+            server.server_close()
+    except Exception:
+        result['passed'] = False
+        result['failure'] = result.get('failure') or 'fixture_model_server_stop_failed'
+        setup_cleanup = {'passed': False, 'removed': False, 'created': harness is not None,
+                         'failure': 'fixture_model_server_stop_failed'}
     result['elapsedSeconds'] = round(time.monotonic() - started, 3)
     if harness:
-        result['cliCommands'] = harness.command_count
-        result['ownedRootRetainedForGuardedCleanup'] = True
-    report_file.write_text(json.dumps(result, indent=2), encoding='utf-8')
+        result.update(ownerId=harness.owner_id, binarySha256=harness.binary_sha256,
+                      cliCommands=harness.command_count)
+    cleanup = setup_cleanup if setup_cleanup is not None else fixtures.finish_owned_fixture(harness)
+    result['cleanup'] = cleanup
+    result['ownedRootRetainedForGuardedCleanup'] = cleanup['created'] and not cleanup['removed']
+    if not cleanup['passed']:
+        result['passed'] = False
+        result['failure'] = result.get('failure') or 'owned_cleanup_not_proved'
+    try:
+        fixtures.write_receipt(report_file, result)
+    except Exception:
+        result['passed'] = False
+        result['receiptFailure'] = 'acceptance_receipt_not_written'
     print(json.dumps(result), flush=True)
 raise SystemExit(0 if result['passed'] else 1)

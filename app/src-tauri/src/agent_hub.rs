@@ -23,6 +23,8 @@ const CONNECTION_PROBE_MAX_OUTPUT_TOKENS: u32 = 512;
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Selection {
     pub(crate) provider_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) native_model_catalog: Option<crate::codex_switching::Catalog>,
     pub(crate) model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) reasoning_effort: Option<String>,
@@ -40,6 +42,8 @@ pub(crate) struct Selection {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentInput {
     pub agent_id: AgentId,
+    #[serde(default)]
+    pub allow_native_model_switching: bool,
     pub provider_id: String,
     pub model: Option<String>,
     pub profile: Option<ExistingProfile>,
@@ -323,7 +327,7 @@ pub fn overview(store: &Store) -> Result<Value> {
         let (warnings,variables)=profile_warnings(definition.id,profile);
         let directory = profile.map(|profile| PathBuf::from(&profile.directory)).unwrap_or(private_directory.clone());
         let launcher = if configured { Some(profile.map(|profile| PathBuf::from(&profile.executable_path)).unwrap_or_else(|| private_directory.join(agent_configs::launcher_file_name()))) } else { None };
-        json!({"id":definition.id,"name":definition.name,"description":definition.description,"protocol":definition.protocol,"configured":configured,"directory":directory,"launcher":launcher,"model":selection.map(|s| &s.model),"reasoningEffort":selection.and_then(|s| s.reasoning_effort.as_ref()),"contextPolicy":selection.and_then(|s| s.context_policy.as_ref()),"providerId":selection.map(|s| &s.provider_id),"profile":profile,"mode":if profile.is_some(){"existing"}else{"private"},"needsRestart":configured,"configurationRevision":selection.map_or(0,|selection|selection.configuration_revision),"appliedAtMs":selection.map_or(0,|selection|selection.applied_at_ms),"canLaunch":configured&&launch_reason.is_none(),"reason":validation.err().map(|error|error.message),"launchReason":launch_reason,"warnings":warnings,"overrideEnvironmentVariables":variables})
+        json!({"id":definition.id,"name":definition.name,"description":definition.description,"protocol":definition.protocol,"configured":configured,"directory":directory,"launcher":launcher,"model":selection.map(|s| &s.model),"reasoningEffort":selection.and_then(|s| s.reasoning_effort.as_ref()),"contextPolicy":selection.and_then(|s| s.context_policy.as_ref()),"allowNativeModelSwitching":selection.is_some_and(|s| s.native_model_catalog.is_some()),"providerId":selection.map(|s| &s.provider_id),"profile":profile,"mode":if profile.is_some(){"existing"}else{"private"},"needsRestart":configured,"configurationRevision":selection.map_or(0,|selection|selection.configuration_revision),"appliedAtMs":selection.map_or(0,|selection|selection.applied_at_ms),"canLaunch":configured&&launch_reason.is_none(),"reason":validation.err().map(|error|error.message),"launchReason":launch_reason,"warnings":warnings,"overrideEnvironmentVariables":variables})
     }).collect();
     Ok(json!({"agents":agents,"dataDirectory":store.data_directory,"bridgeHealthy":false}))
 }
@@ -395,9 +399,19 @@ fn gateway_id(agent: AgentId) -> String {
     format!("selected:{}", agent.as_str())
 }
 
-pub(crate) fn gateway_provider(store: &Store, id: &str) -> Result<StoredProvider> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CodexGatewaySelection {
+    pub(crate) configuration_revision: u64,
+    pub(crate) applied_at_ms: u64,
+    pub(crate) allow_native_model_switching: bool,
+}
+
+pub(crate) fn gateway_provider_with_policy(
+    store: &Store,
+    id: &str,
+) -> Result<(StoredProvider, Option<CodexGatewaySelection>)> {
     let Some(agent) = id.strip_prefix("selected:") else {
-        return store.agent_provider(id);
+        return Ok((store.agent_provider(id)?, None));
     };
     let agent: AgentId = serde_json::from_value(Value::String(agent.into()))
         .map_err(|_| AppError::new("invalid_agent", "此 Agent 不受支持"))?;
@@ -405,6 +419,32 @@ pub(crate) fn gateway_provider(store: &Store, id: &str) -> Result<StoredProvider
         .remove(agent.as_str())
         .ok_or_else(|| AppError::new("not_configured", "请先配置此 Agent"))?;
     let mut provider = store.agent_provider(&saved.provider_id)?;
+    if let Some(catalog) = &saved.native_model_catalog {
+        if agent != AgentId::Codex {
+            return Err(AppError::new(
+                "invalid_state",
+                "工具内模型切换只适用于 Codex",
+            ));
+        }
+        catalog.restrict(&mut provider)?;
+        if !provider
+            .summary
+            .codex_options
+            .models
+            .iter()
+            .any(|row| row.id == saved.model)
+        {
+            return Err(AppError::new(
+                "invalid_model",
+                "默认模型已从可用模型清单移除，请同步并确认连接",
+            ));
+        }
+    }
+    let codex = (agent == AgentId::Codex).then_some(CodexGatewaySelection {
+        configuration_revision: saved.configuration_revision,
+        applied_at_ms: saved.applied_at_ms,
+        allow_native_model_switching: saved.native_model_catalog.is_some(),
+    });
     if !model_is_available(&provider, &saved.model) {
         return Err(AppError::new(
             "invalid_model",
@@ -422,18 +462,33 @@ pub(crate) fn gateway_provider(store: &Store, id: &str) -> Result<StoredProvider
         } else {
             crate::context_policy::resolve(&provider.summary, &provider.summary.model, None)?
         };
-    Ok(provider)
+    Ok((provider, codex))
 }
 
 pub fn configure(store: &Store, input: AgentInput) -> Result<Value> {
     crate::config_profiles::recover(&store.data_directory)?;
     let model = selected_model(store, &input)?;
-    let reasoning_effort =
-        selected_reasoning_effort(&store.agent_provider(&input.provider_id)?, &model)?;
-    let context_policy = crate::context_policy::selected(
-        &store.agent_provider(&input.provider_id)?.summary,
-        &model,
-    )?;
+    let mut provider = store.agent_provider(&input.provider_id)?;
+    let reasoning_effort = selected_reasoning_effort(&provider, &model)?;
+    let mut context_policy = crate::context_policy::selected(&provider.summary, &model)?;
+    let native_model_catalog = if input.allow_native_model_switching {
+        if input.agent_id != AgentId::Codex {
+            return Err(AppError::new(
+                "invalid_agent",
+                "工具内模型切换只适用于 Codex",
+            ));
+        }
+        let catalog = crate::codex_switching::Catalog::approve(
+            &mut provider,
+            &model,
+            reasoning_effort.as_deref(),
+            context_policy.as_ref(),
+        )?;
+        context_policy = crate::context_policy::selected(&provider.summary, &model)?;
+        Some(catalog)
+    } else {
+        None
+    };
     let profile = input
         .profile
         .as_ref()
@@ -467,6 +522,7 @@ pub fn configure(store: &Store, input: AgentInput) -> Result<Value> {
         input.agent_id.as_str().into(),
         Selection {
             provider_id: input.provider_id.clone(),
+            native_model_catalog,
             model: model.clone(),
             reasoning_effort: reasoning_effort.clone(),
             context_policy: context_policy.clone(),
@@ -503,6 +559,7 @@ pub fn configure(store: &Store, input: AgentInput) -> Result<Value> {
     result["providerId"] = json!(input.provider_id);
     result["reasoningEffort"] = json!(reasoning_effort);
     result["contextPolicy"] = json!(context_policy);
+    result["allowNativeModelSwitching"] = json!(input.allow_native_model_switching);
     result["profile"] = json!(profile);
     result["mode"] = json!(if result["profile"].is_null() {
         "private"
@@ -533,8 +590,15 @@ pub struct ProbeContext {
 
 pub fn probe_context(store: &Store, input: &AgentInput) -> Result<ProbeContext> {
     let route = store.agent_route()?;
-    let provider = store.agent_provider(&input.provider_id)?;
+    let mut provider = store.agent_provider(&input.provider_id)?;
     let model = selected_model(store, input)?;
+    let saved = selections(&store.data_directory)?;
+    if let Some(catalog) = saved
+        .get(input.agent_id.as_str())
+        .and_then(|selection| selection.native_model_catalog.as_ref())
+    {
+        catalog.restrict(&mut provider)?;
+    }
     let reasoning_effort = selected_reasoning_effort(&provider, &model)?;
     let context_policy = crate::context_policy::selected(&provider.summary, &model)?;
     let profile = input
@@ -542,12 +606,12 @@ pub fn probe_context(store: &Store, input: &AgentInput) -> Result<ProbeContext> 
         .as_ref()
         .map(|profile| agent_configs::prepare_existing_profile(input.agent_id, profile))
         .transpose()?;
-    let saved = selections(&store.data_directory)?;
     if !saved.get(input.agent_id.as_str()).is_some_and(|selection| {
         selection.provider_id == input.provider_id
             && selection.model == model
             && selection.reasoning_effort == reasoning_effort
             && selection.context_policy == context_policy
+            && selection.native_model_catalog.is_some() == input.allow_native_model_switching
             && selection.profile == profile
     }) {
         return Err(AppError::new(
@@ -843,15 +907,21 @@ pub fn launch(store: &Store, agent: AgentId) -> Result<()> {
         // Reopening must not mutate selection/revision or cancel pending restarts.
         return launch_existing(root, agent, &profile);
     }
-    configure(
-        store,
-        AgentInput {
-            agent_id: agent,
-            provider_id: saved.provider_id,
-            model: Some(saved.model),
-            profile: None,
-        },
-    )?;
+    if saved.native_model_catalog.is_some() {
+        // Launching a previously confirmed catalog must not approve newly discovered models.
+        gateway_provider_with_policy(store, &gateway_id(agent))?;
+    } else {
+        configure(
+            store,
+            AgentInput {
+                allow_native_model_switching: false,
+                agent_id: agent,
+                provider_id: saved.provider_id,
+                model: Some(saved.model),
+                profile: None,
+            },
+        )?;
+    }
     let script = agent_configs::validate_launch(root, agent)?;
     #[cfg(windows)]
     {
@@ -1132,6 +1202,7 @@ mod tests {
             let error = configure(
                 &store,
                 AgentInput {
+                    allow_native_model_switching: false,
                     agent_id: AgentId::Codex,
                     provider_id: provider.id.clone(),
                     model,
@@ -1206,6 +1277,7 @@ mod tests {
             let error = configure(
                 &store,
                 AgentInput {
+                    allow_native_model_switching: false,
                     agent_id: AgentId::Codex,
                     provider_id: provider.id,
                     model: None,
@@ -1266,6 +1338,7 @@ mod tests {
                 profile: None,
             },
             AgentInput {
+                allow_native_model_switching: false,
                 agent_id: AgentId::Codex,
                 provider_id: "provider".into(),
                 model: None,
@@ -1366,6 +1439,7 @@ mod tests {
                     token: "synthetic-local-token".into(),
                 },
                 &AgentInput {
+                    allow_native_model_switching: false,
                     agent_id: agent,
                     provider_id: "provider".into(),
                     model: None,
@@ -1432,6 +1506,7 @@ mod tests {
                     token: "synthetic-local-token".into(),
                 },
                 &AgentInput {
+                    allow_native_model_switching: false,
                     agent_id: AgentId::WorkBuddy,
                     provider_id: "provider".into(),
                     model: None,
@@ -1489,6 +1564,7 @@ mod tests {
                 profile: None,
             },
             AgentInput {
+                allow_native_model_switching: false,
                 agent_id: AgentId::Zcode,
                 provider_id: "provider".into(),
                 model: None,

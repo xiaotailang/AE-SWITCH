@@ -608,6 +608,7 @@
 .hub-profile-settings,
 .hub-advanced-paths,
 .hub-extra-settings,
+.hub-model-settings,
 .hub-client-actions {
   margin-top: 16px;
   border-top: 1px solid var(--hub-line);
@@ -617,6 +618,7 @@
 .hub-profile-settings summary,
 .hub-advanced-paths summary,
 .hub-extra-settings summary,
+.hub-model-settings summary,
 .hub-client-actions summary {
   width: fit-content;
   max-width: 100%;
@@ -628,12 +630,14 @@
 .hub-profile-settings[open] > summary,
 .hub-advanced-paths[open] > summary,
 .hub-extra-settings[open] > summary,
+.hub-model-settings[open] > summary,
 .hub-client-actions[open] > summary {
   margin-bottom: 16px;
   color: var(--hub-text);
 }
 
-.hub-extra-settings summary > span {
+.hub-extra-settings summary > span,
+.hub-model-settings summary > span {
   margin-left: 6px;
   color: var(--hub-soft);
   font-size: 12px;

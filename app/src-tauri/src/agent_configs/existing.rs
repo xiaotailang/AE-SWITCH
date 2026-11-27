@@ -405,7 +405,14 @@ pub(super) fn configuration_paths(
     let mut paths = BTreeMap::new();
     let main = match agent {
         AgentId::ClaudeCode => config("settings.json")?,
-        AgentId::Codex => config("config.toml")?,
+        AgentId::Codex => {
+            let main = config("config.toml")?;
+            let parent = main
+                .parent()
+                .ok_or_else(|| invalid_profile("Codex 配置文件没有有效的目录"))?;
+            paths.insert(codex_catalog::SLOT, parent.join(codex_catalog::FILE_NAME));
+            main
+        }
         AgentId::Hermes => config("config.yaml")?,
         AgentId::OhMyPi => {
             paths.insert("secondary", secondary(directory.join("config.yml"))?);

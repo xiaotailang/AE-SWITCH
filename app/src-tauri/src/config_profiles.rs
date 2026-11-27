@@ -24,6 +24,8 @@ const MAX_SIZE: usize = 64 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProfileEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) native_model_catalog: Option<crate::codex_switching::Catalog>,
     pub agent_id: AgentId,
     pub provider_id: String,
     pub model: String,
@@ -65,6 +67,8 @@ pub struct ApplyProfileInput {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreviewEntry {
+    pub allow_native_model_switching: bool,
+    pub previous_allow_native_model_switching: bool,
     pub agent_id: AgentId,
     pub provider_id: String,
     pub provider_name: String,
@@ -213,7 +217,7 @@ fn validate_profiles(profiles: &[ConfigProfile]) -> Result<()> {
 }
 
 pub fn list(root: &Path) -> Result<Vec<ConfigProfile>> {
-    let Some(text) = read_owned(root, FILE, 1024 * 1024)? else {
+    let Some(text) = read_owned(root, FILE, MAX_SIZE)? else {
         return Ok(vec![]);
     };
     let profiles: Vec<ConfigProfile> = serde_json::from_str(&text).map_err(|_| invalid())?;
@@ -224,6 +228,9 @@ pub fn list(root: &Path) -> Result<Vec<ConfigProfile>> {
 fn save_list(root: &Path, profiles: &[ConfigProfile]) -> Result<()> {
     validate_profiles(profiles)?;
     let text = serde_json::to_string_pretty(profiles).map_err(|_| invalid())?;
+    if text.len() > MAX_SIZE {
+        return Err(invalid());
+    }
     write_owned(root, FILE, Some(&text))
 }
 
@@ -282,6 +289,7 @@ pub fn save(store: &Store, input: SaveProfileInput) -> Result<ConfigProfile> {
         )?;
         entries.push(ProfileEntry {
             agent_id: definition.id,
+            native_model_catalog: selection.native_model_catalog.clone(),
             provider_id: selection.provider_id.clone(),
             model: selection.model.clone(),
             reasoning_effort: selection.reasoning_effort.clone(),
@@ -401,7 +409,23 @@ fn plan(store: &Store, profile: ConfigProfile) -> Result<Plan> {
             &entry.model,
             entry.reasoning_effort.as_deref(),
         )?;
-        let provider = store.agent_provider(&entry.provider_id)?;
+        let mut provider = store.agent_provider(&entry.provider_id)?;
+        if let Some(catalog) = &entry.native_model_catalog {
+            if entry.agent_id != AgentId::Codex {
+                return Err(invalid());
+            }
+            catalog.restrict(&mut provider)?;
+            // Restoring a named configuration must not silently approve a different catalogue.
+            let current = crate::codex_switching::Catalog::approve(
+                &mut provider,
+                &entry.model,
+                entry.reasoning_effort.as_deref(),
+                entry.context_policy.as_ref(),
+            )?;
+            if &current != catalog {
+                return Err(changed());
+            }
+        }
         let context_policy = if let Some(policy) = &entry.context_policy {
             crate::context_policy::validate_applied(&provider.summary, policy)?;
             if policy.model != entry.model {
@@ -436,6 +460,7 @@ fn plan(store: &Store, profile: ConfigProfile) -> Result<Plan> {
             &entry.model,
             previous.profile.as_ref(),
             context_policy.as_ref(),
+            entry.native_model_catalog.as_ref(),
         )?;
         let checked_snapshots = agent_configs::configuration_snapshots(
             root,
@@ -493,8 +518,11 @@ fn plan(store: &Store, profile: ConfigProfile) -> Result<Plan> {
         let changed = previous.provider_id != entry.provider_id
             || previous.model != entry.model
             || previous.reasoning_effort != entry.reasoning_effort
-            || previous.context_policy != context_policy;
+            || previous.context_policy != context_policy
+            || previous.native_model_catalog != entry.native_model_catalog;
         entries.push(PreviewEntry {
+            allow_native_model_switching: entry.native_model_catalog.is_some(),
+            previous_allow_native_model_switching: previous.native_model_catalog.is_some(),
             agent_id: entry.agent_id,
             provider_id: entry.provider_id.clone(),
             provider_name: provider.summary.name,
@@ -515,6 +543,7 @@ fn plan(store: &Store, profile: ConfigProfile) -> Result<Plan> {
         saved.insert(
             entry.agent_id.as_str().into(),
             Selection {
+                native_model_catalog: entry.native_model_catalog.clone(),
                 provider_id: entry.provider_id.clone(),
                 model: entry.model.clone(),
                 reasoning_effort: entry.reasoning_effort.clone(),

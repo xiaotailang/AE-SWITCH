@@ -91,3 +91,101 @@ fn malformed_tools_return_errors_without_panicking() {
         assert!(chat_to_responses(&json!({"model":"test","messages":[],"tools":[tool]})).is_err());
     }
 }
+
+#[test]
+fn codex_turn_bindings_preserve_live_roots_under_capacity_pressure() {
+    let mut turns = CodexTurns::default();
+    let scope = |root_turn, thread, parent| {
+        CodexMetadata::Identified(CodexRequestScope {
+            root_turn,
+            thread,
+            parent,
+        })
+    };
+    let identity = |revision| CodexGatewaySelection {
+        configuration_revision: revision,
+        applied_at_ms: 100 + revision,
+        allow_native_model_switching: true,
+    };
+    let first_root = Uuid::new_v4();
+    let first_thread = Uuid::new_v4();
+    let mut configured = Some("high".to_owned());
+    turns
+        .authorize(
+            identity(1),
+            scope(first_root, first_thread, None),
+            "model-a",
+            &mut configured,
+            true,
+        )
+        .unwrap();
+    let second_root = Uuid::new_v4();
+    turns
+        .authorize(
+            identity(1),
+            scope(second_root, Uuid::new_v4(), None),
+            "model-b",
+            &mut None,
+            true,
+        )
+        .unwrap();
+    for _ in 2..MAX_CODEX_TURNS {
+        turns
+            .authorize(
+                identity(1),
+                scope(Uuid::new_v4(), Uuid::new_v4(), None),
+                "model-b",
+                &mut None,
+                true,
+            )
+            .unwrap();
+    }
+    let overflow = turns
+        .authorize(
+            identity(1),
+            scope(Uuid::new_v4(), Uuid::new_v4(), None),
+            "model-b",
+            &mut None,
+            true,
+        )
+        .unwrap_err();
+    assert_eq!(overflow.0, StatusCode::SERVICE_UNAVAILABLE);
+    turns.bindings.get_mut(&second_root).unwrap().touched = Instant::now() - CODEX_TURN_IDLE;
+    let new_root = Uuid::new_v4();
+    turns
+        .authorize(
+            identity(2),
+            scope(new_root, Uuid::new_v4(), None),
+            "model-b",
+            &mut None,
+            true,
+        )
+        .unwrap();
+    assert!(!turns.bindings.contains_key(&second_root));
+    for (thread, parent) in [(Uuid::new_v4(), Some(first_thread)), (first_thread, None)] {
+        assert_eq!(
+            turns
+                .authorize(
+                    identity(2),
+                    scope(first_root, thread, parent),
+                    "model-a",
+                    &mut None,
+                    true
+                )
+                .unwrap_err()
+                .0,
+            StatusCode::CONFLICT
+        );
+    }
+    let mut inherited = None;
+    turns
+        .authorize(
+            identity(1),
+            scope(first_root, Uuid::new_v4(), Some(first_thread)),
+            "model-a",
+            &mut inherited,
+            true,
+        )
+        .unwrap();
+    assert_eq!(inherited.as_deref(), Some("high"));
+}

@@ -313,6 +313,18 @@ export function ConfigProfilesPanel({
                 {entry.reasoningEffort
                   ? ` / ${entry.reasoningEffort}`
                   : " / 客户端默认"}
+                {entry.agentId === "codex" &&
+                  Boolean(entry.previousAllowNativeModelSwitching) !==
+                    Boolean(entry.allowNativeModelSwitching) && (
+                    <>
+                      <br />
+                      <span>
+                        {entry.allowNativeModelSwitching
+                          ? "开启 Codex 内切换模型"
+                          : "使用固定模型"}
+                      </span>
+                    </>
+                  )}
                 {entry.contextPolicy && (
                   <>
                     <br />

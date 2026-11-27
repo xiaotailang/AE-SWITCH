@@ -1,5 +1,5 @@
 //! Field ownership and conservative disconnect. Snapshots never cross the IPC boundary.
-use super::{existing, jsonc, native_merge, AgentId, ExistingProfile};
+use super::{codex_catalog, existing, jsonc, native_merge, AgentId, ExistingProfile};
 use crate::{
     error::{AppError, Result},
     writer,
@@ -102,6 +102,12 @@ fn paths(
         .iter()
         .map(|(slot, path)| ((*slot).into(), directory.join(path)))
         .collect();
+    if agent == AgentId::Codex {
+        known.insert(
+            codex_catalog::SLOT.into(),
+            directory.join("home/.codex").join(codex_catalog::FILE_NAME),
+        );
+    }
     known.insert(
         "environment".into(),
         directory.join("configuration/environment.json"),
@@ -131,6 +137,67 @@ fn load(root: &Path, agent: AgentId, pending: bool) -> Result<Option<Ownership>>
                 .map_err(|_| AppError::new("invalid_state", "配置所有权记录损坏，未修改客户端配置"))
         })
         .transpose()
+}
+
+pub(super) fn codex_catalog_origin(
+    root: &Path,
+    profile: Option<&ExistingProfile>,
+    config: &Path,
+    current: &str,
+) -> Result<Option<String>> {
+    let agent = AgentId::Codex;
+    let known = paths(root, agent, profile)?;
+    let previous = load(root, agent, false)?.ok_or_else(conflict)?;
+    validate(&previous, agent, profile, &known)?;
+    let catalog = previous
+        .files
+        .iter()
+        .find(|file| file.slot == codex_catalog::SLOT)
+        .ok_or_else(conflict)?;
+    if known.get("config").map(PathBuf::as_path) != Some(config)
+        || read_file(root, &known[codex_catalog::SLOT], &known, profile.is_some())?.as_deref()
+            != Some(catalog.after.as_str())
+    {
+        return Err(conflict());
+    }
+    let record = previous
+        .files
+        .iter()
+        .find(|file| file.slot == "config")
+        .ok_or_else(conflict)?;
+    let (original, _, conflicts) = restore_file(record, config, Some(current))?;
+    if conflicts != 0 {
+        return Err(conflict());
+    }
+    Ok(original)
+}
+
+pub(super) fn require_owned_codex_catalog(
+    root: &Path,
+    profile: Option<&ExistingProfile>,
+    catalog: &Path,
+    current: Option<&str>,
+) -> Result<()> {
+    let agent = AgentId::Codex;
+    let known = paths(root, agent, profile)?;
+    let previous = load(root, agent, false)?;
+    if let Some(previous) = &previous {
+        validate(previous, agent, profile, &known)?;
+    }
+    let expected = previous
+        .as_ref()
+        .and_then(|record| {
+            record
+                .files
+                .iter()
+                .find(|file| file.slot == codex_catalog::SLOT)
+        })
+        .map(|file| file.after.as_str());
+    if known.get(codex_catalog::SLOT).map(PathBuf::as_path) != Some(catalog) || expected != current
+    {
+        return Err(conflict());
+    }
+    Ok(())
 }
 
 fn record_purpose(agent: AgentId, pending: bool) -> String {
@@ -484,6 +551,15 @@ fn restore_file(
     path: &Path,
     current: Option<&str>,
 ) -> Result<(Option<String>, usize, usize)> {
+    if file.slot == codex_catalog::SLOT {
+        // The generated catalogue is one owned file. Never merge or delete a
+        // user replacement even when its parsed model IDs look equivalent.
+        return Ok(if current == Some(file.after.as_str()) {
+            (file.before.clone(), 1, 0)
+        } else {
+            (None, 1, 1)
+        });
+    }
     let changes = fields(file, path)?;
     let mut value = document(path, current)?;
     let conflicts = changes

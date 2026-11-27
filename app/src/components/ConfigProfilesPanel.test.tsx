@@ -46,6 +46,8 @@ const preview: ConfigProfilePreview = {
     previousProviderName: "旧连接",
     previousModel: "old-model",
     previousReasoningEffort: null,
+    allowNativeModelSwitching: entry.agentId === "codex",
+    previousAllowNativeModelSwitching: false,
     targetMode: "existing",
     changed: true,
   })),
@@ -109,6 +111,7 @@ it("applies the exact preview under the global busy lock and keeps preview acros
     await screen.findByRole("button", { name: "预览方案 工作" }),
   );
   expect(await screen.findByLabelText("方案预览 工作")).toBeInTheDocument();
+  expect(screen.getByText("开启 Codex 内切换模型")).toBeVisible();
   view.rerender(
     <ConfigProfilesPanel
       agents={agents.map((agent) => ({ ...agent }))}

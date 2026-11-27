@@ -676,6 +676,9 @@ try {
         process.env.AE_PRODUCTION_UI_EFFORT,
         "The current-session reasoning effort must be explicitly supplied",
       );
+      const modelSettings = page.locator(".hub-model-settings");
+      if ((await modelSettings.getAttribute("open")) === null)
+        await modelSettings.locator("summary").click();
       await page
         .locator(
           `input[name="hub-reasoning"][value="${process.env.AE_PRODUCTION_UI_EFFORT}"]`,

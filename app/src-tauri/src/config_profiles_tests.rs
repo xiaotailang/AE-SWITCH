@@ -71,6 +71,7 @@ fn fixture_mode(native: bool) -> (tempfile::TempDir, Store, String, String) {
         agent_hub::configure(
             &store,
             AgentInput {
+                allow_native_model_switching: false,
                 agent_id: agent,
                 provider_id: ids[0].clone(),
                 model: None,
@@ -101,6 +102,7 @@ fn switch(store: &Store, provider: &str) {
         agent_hub::configure(
             store,
             AgentInput {
+                allow_native_model_switching: false,
                 agent_id: agent,
                 provider_id: provider.into(),
                 model: None,
@@ -157,6 +159,68 @@ fn named_profiles_capture_no_secrets_or_paths_and_prevent_referenced_provider_de
     assert_eq!(store.delete(&first).unwrap_err().code, "in_use");
     delete(&store.data_directory, &profile.id, profile.revision).unwrap();
     store.delete(&first).unwrap();
+}
+
+#[test]
+fn named_profile_restores_only_confirmed_codex_models_and_refuses_a_rotated_key() {
+    let (_directory, mut store, first, _) = fixture_mode(true);
+    let existing = store.agent_provider(&first).unwrap().summary;
+    let mut provider = ProviderInput {
+        id: Some(first.clone()),
+        family: existing.family,
+        name: existing.name,
+        base_url: existing.base_url,
+        api_key: None,
+        balance_access_token: None,
+        model: existing.model.clone(),
+        auth_mode: existing.auth_mode,
+        reasoning_effort: existing.reasoning_effort,
+        codex_options: existing.codex_options,
+        edited_context_model_ids: vec![],
+    };
+    let mut alternative = provider.codex_options.models[0].clone();
+    alternative.id = "model-alternate".into();
+    provider.codex_options.models.push(alternative);
+    provider.codex_options.models_synced_at = Some(1);
+    store.save(provider.clone()).unwrap();
+    let options = |enabled| AgentInput {
+        agent_id: AgentId::Codex,
+        provider_id: first.clone(),
+        model: Some(existing.model.clone()),
+        profile: agent_hub::selections(&store.data_directory).unwrap()["codex"]
+            .profile
+            .clone(),
+        allow_native_model_switching: enabled,
+    };
+    agent_hub::configure(&store, options(true)).unwrap();
+    let multi = capture(&store, "可切换");
+    agent_hub::configure(&store, options(false)).unwrap();
+    let plan = preview(&store, &multi.id).unwrap();
+    let codex = plan
+        .entries
+        .iter()
+        .find(|row| row.agent_id == AgentId::Codex)
+        .unwrap();
+    assert!(
+        codex.changed
+            && codex.allow_native_model_switching
+            && !codex.previous_allow_native_model_switching
+    );
+    apply(
+        &store,
+        ApplyProfileInput {
+            id: multi.id.clone(),
+            revision: multi.revision,
+            fingerprint: plan.fingerprint,
+        },
+    )
+    .unwrap();
+    let (routed, _) = agent_hub::gateway_provider_with_policy(&store, "selected:codex").unwrap();
+    assert_eq!(routed.summary.codex_options.models.len(), 2);
+    provider.api_key = Some("synthetic-replacement-key".into());
+    store.save(provider).unwrap();
+    assert!(agent_hub::gateway_provider_with_policy(&store, "selected:codex").is_err());
+    assert!(preview(&store, &multi.id).is_err());
 }
 
 #[test]
@@ -369,6 +433,7 @@ fn forged_journal_cannot_change_unlisted_agents_or_regress_selection_revisions()
     agent_hub::configure(
         &store,
         AgentInput {
+            allow_native_model_switching: false,
             agent_id: AgentId::ClaudeCode,
             provider_id: first,
             model: None,
@@ -489,6 +554,7 @@ fn unresolved_batch_blocks_configure_safety_and_disconnect_without_changes() {
     assert!(agent_hub::configure(
         &store,
         AgentInput {
+            allow_native_model_switching: false,
             agent_id: AgentId::Codex,
             provider_id: first,
             model: None,

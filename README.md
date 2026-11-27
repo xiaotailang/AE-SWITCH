@@ -4,7 +4,7 @@
 
 支持配置 Claude Code、Codex、Hermes Agent、oh-my-pi、OpenCode、Z Code、WorkBuddy 和 DeepSeek Harness。八个官方客户端由用户自行安装；AE 包只包含自身和必要运行依赖，不修改客户端程序文件。
 
-已公开发布 [reasoning-compatibility 预发布](https://github.com/xiaotailang/AE-SWITCH/releases/tag/v0.1.0-reasoning-compatibility.1)，完整正式验收仍未完成。2026-10-30 本地开发新增“请求活动”：查看当前客户端经过 AE 的请求状态、耗时和响应报告的 token 用量，记录仅在内存中保留。见[本轮开发记录](docs/development-2026-10-30.md)与[当前验证记录](docs/current-validation.md)；旧构建的七工具及历史恢复成功不自动继承到新程序。
+已公开发布 [adaptive.1 预发布](https://github.com/xiaotailang/AE-SWITCH/releases/tag/v0.1.0-adaptive.1)。本地开发版进一步支持 Codex 原生模型切换。「请求活动」展示当前客户端经过 AE 的请求、耗时和响应报告的 Token 用量。[验证记录](docs/current-validation.md)
 
 当前续作进一步提供模型搜索、收藏与最近使用、具名多客户端配置方案，以及字段级配置漂移检测和安全断开。详见[核心功能与本轮验证](docs/core-features-development-2026-10-30.md)。方案仅引用已保存连接；恢复记录属于私有数据，不能公开分享使用后的 `data/`。
 
@@ -20,6 +20,8 @@
 4. **确认连接**：依次保存连接、更新所选客户端的受管配置并验证。查看各阶段结果，让已打开的客户端重新加载配置。
 
 自动发现根据当前端点和 Key 返回的模型列表选择初始模型。修改已保存连接的协议、主机或端口时，需要输入新端点的 Key。同一站点的路径变化会重新查询模型和能力。
+
+本地开发版对首次接入的 Codex 自动准备模型菜单。确认时有至少两个已启用的编码模型且端点被识别为 OpenAI 兼容时，重新加载 Codex 后可以用 `/model` 切换。新会话默认值仍由 AE 保存。备用模型按自己的思考等级和标准上下文执行。原先固定模型的配置保留原选择，可在「模型设置」中开启切换。多个客户端位置需要用户选定实际使用的目录。
 
 上下文配置以所选模型的已知窗口和计费声明为依据。已确认加价的长上下文默认关闭，默认压缩阈值为有效窗口的 **80%**。明确无加价时使用端点声明的容量。只有窗口上限、计费未知时按该上限与 128K 中较小的值配置。Z Code 的压缩比例由客户端管理。
 

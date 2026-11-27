@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const MAX: i64 = 100_000_000;
-const CONSERVATIVE_CONTEXT_WINDOW: i64 = 128_000;
+pub(crate) const CONSERVATIVE_CONTEXT_WINDOW: i64 = 128_000;
 pub const DEFAULT_COMPACT_PERCENT: u8 = 80;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

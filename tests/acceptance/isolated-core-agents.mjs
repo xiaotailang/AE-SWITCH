@@ -1,12 +1,12 @@
 // Current production Rust core + unmodified official client programs. No GUI.
-// Preparation is deliberately shared with production-ui-eight; this runner
-// retains its owned sandbox for a separately guarded cleanup. It never deletes
-// files or selects a fallback model/effort.
+// Fresh cleanup-enabled preparations run under the Windows job supervisor.
+// This worker does not delete files or select a fallback model or effort.
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
 import { spawn } from "node:child_process";
+import { setTimeout as pause } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { registerPrivateValue } from "./acceptance-private-values.mjs";
 
@@ -65,6 +65,34 @@ const owner = JSON.parse(await fs.readFile(await guard(path.join(ownedRoot, ".ae
 assert.equal(owner.ownerId, setup.ownerId);
 assert.equal(owner.sourceDigest, setup.sourceDigest);
 assert.equal(owner.buildAuditId, setup.buildAuditId);
+const supervisedCleanup = owner.autoCleanup?.mode === "isolated-core-job";
+if (supervisedCleanup) {
+  assert.equal(owner.autoCleanup.schemaVersion, 1);
+  assert.equal(setup.autoCleanup?.schemaVersion, 1);
+  assert.equal(setup.autoCleanup?.mode, owner.autoCleanup.mode);
+  assert.match(owner.autoCleanup.nonce, /^[a-f0-9]{64}$/u);
+  assert.ok(
+    setup.autoCleanup.nonce === owner.autoCleanup.nonce
+      && process.env.AE_ISOLATED_CORE_JOB_NONCE === owner.autoCleanup.nonce,
+    "Use run-isolated-core-agents.ps1 for the prepared cleanup-enabled fixture",
+  );
+  delete process.env.AE_ISOLATED_CORE_JOB_NONCE;
+  const gate = path.join(ownedRoot, ".ae-isolated-core-start");
+  const deadline = performance.now() + 15000;
+  for (;;) {
+    try {
+      const marker = await fs.readFile(await guard(gate), "utf8");
+      if (marker.length) {
+        assert.ok(marker === owner.autoCleanup.nonce, "Production core launch gate did not match this owner");
+        break;
+      }
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    assert.ok(performance.now() < deadline, "Production core supervisor did not confirm ownership");
+    await pause(50);
+  }
+}
 const portableRoot = await guard(path.join(ownedRoot, "portable"));
 assert.ok(samePath(portableRoot, setup.portableRoot));
 const executable = await guard(path.join(portableRoot, "AE-Switch-core.exe"));
@@ -117,7 +145,7 @@ const report = {
   desktopStarted: false, externalProcessStopped: false, fallbackModelUsed: false,
   qaHooksUsed: false, discoveryContextInjected: false, steps: [], agents: [],
   upstreamDiscoveryPassed: false, allOfficialToolsPassed: false, passed: false,
-  cleanup: { performed: false, ownedRootRetained: true, ownerId: setup.ownerId, reason: "Separate exact-owner process and path guards are required before cleanup" },
+  cleanup: { performed: false, ownedRootRetained: true, ownerId: setup.ownerId, delegatedToSupervisor: supervisedCleanup },
   fullAcceptancePassed: false, realInferenceVerified: false, publicReady: false,
 };
 const writeReport = async () => fs.writeFile(reportFile, safeJson(report));
@@ -239,6 +267,6 @@ try {
 } finally {
   await registerGatewayToken();
   await writeReport();
-  console.log(JSON.stringify({ ownerId: setup.ownerId, passed: report.passed, upstreamDiscoveryPassed: report.upstreamDiscoveryPassed, officialPassed: report.agents.filter((agent) => agent.passed).length, expected: expectedAttempts, allEightClientsInScope: report.allEightClientsInScope, sandboxRetained: true }));
+  console.log(JSON.stringify({ ownerId: setup.ownerId, passed: report.passed, upstreamDiscoveryPassed: report.upstreamDiscoveryPassed, officialPassed: report.agents.filter((agent) => agent.passed).length, expected: expectedAttempts, allEightClientsInScope: report.allEightClientsInScope, sandboxRetained: true, cleanupDelegated: supervisedCleanup }));
   process.exitCode = report.passed ? 0 : 1;
 }

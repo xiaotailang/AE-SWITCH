@@ -294,6 +294,7 @@ async fn run(directory: std::path::PathBuf) -> Result<()> {
             print(agent_hub::configure(
                 &store,
                 AgentInput {
+                    allow_native_model_switching: false,
                     agent_id: id,
                     provider_id: argument(&arguments, 2, "provider-id")?,
                     model: arguments.get(3).cloned(),
@@ -326,6 +327,7 @@ async fn run(directory: std::path::PathBuf) -> Result<()> {
                 results.push(agent_hub::configure(
                     &store,
                     AgentInput {
+                        allow_native_model_switching: false,
                         agent_id: id,
                         provider_id: provider_id.clone(),
                         model: arguments.get(2).cloned(),
@@ -349,6 +351,7 @@ async fn run(directory: std::path::PathBuf) -> Result<()> {
             } else {
                 let id = agent(&argument(&arguments, 1, "agent-id")?)?;
                 AgentInput {
+                    allow_native_model_switching: false,
                     agent_id: id,
                     provider_id: argument(&arguments, 2, "provider-id")?,
                     model: arguments.get(3).cloned(),

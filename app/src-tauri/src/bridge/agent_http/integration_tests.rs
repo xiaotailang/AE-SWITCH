@@ -21,7 +21,7 @@ const UPSTREAM_KEY: &str = "regression-upstream-private-key";
 const TOOL_ARGUMENTS: &str = "{\"path\":\"目录/数据.txt\"}";
 
 #[tokio::test]
-async fn context_switch_changes_native_limits_and_refuses_large_requests_before_upstream() {
+async fn context_switch_changes_native_limits_and_refuses_large_requests_before_generation() {
     use crate::{
         agent_configs::AgentId,
         context_policy::{ContextCapabilities, ContextPolicy},
@@ -78,7 +78,9 @@ async fn context_switch_changes_native_limits_and_refuses_large_requests_before_
         let response = selected_post(&fixture, "codex", resource, body).await;
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
-    assert!(fixture.recorded().is_empty());
+    let sent = fixture.recorded();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].path, "/v1/responses/input_tokens");
     {
         let mut store = fixture.store.lock().unwrap();
         let summary = store.agent_provider(&fixture.id).unwrap().summary;
@@ -106,7 +108,7 @@ async fn context_switch_changes_native_limits_and_refuses_large_requests_before_
     );
     configure_selected_agent(&fixture, AgentId::Hermes, MODEL);
     assert!(selected_post(&fixture,"hermes","chat/completions",json!({"model":MODEL,"messages":[{"role":"user","content":"x".repeat(40000)}],"max_tokens":128})).await.status().is_success());
-    assert_eq!(fixture.recorded().len(), 1);
+    assert_eq!(fixture.recorded().len(), 3);
     configure_selected_agent(&fixture, AgentId::Codex, MODEL);
     let document = std::fs::read_to_string(config)
         .unwrap()
@@ -126,7 +128,7 @@ async fn context_switch_changes_native_limits_and_refuses_large_requests_before_
     .await
     .status()
     .is_success());
-    assert_eq!(fixture.recorded().len(), 2);
+    assert_eq!(fixture.recorded().len(), 4);
     {
         let mut store = fixture.store.lock().unwrap();
         let summary = store.agent_provider(&fixture.id).unwrap().summary;
@@ -151,8 +153,102 @@ async fn context_switch_changes_native_limits_and_refuses_large_requests_before_
     .await
     .status()
     .is_success());
-    assert_eq!(fixture.recorded().len(), 2);
+    assert_eq!(fixture.recorded().len(), 4);
     fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn large_text_responses_require_count_and_never_fall_back_to_chat_after_count() {
+    for (kind, status, expected_calls) in [
+        (UpstreamKind::ResponsesCount(12_200), StatusCode::OK, 2),
+        (
+            UpstreamKind::ResponsesCount(119_809),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            1,
+        ),
+        (
+            UpstreamKind::ResponsesCountChatOnly,
+            StatusCode::NOT_FOUND,
+            2,
+        ),
+        (
+            UpstreamKind::InvalidResponsesCount,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            1,
+        ),
+        (
+            UpstreamKind::RedirectResponsesCount,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            1,
+        ),
+    ] {
+        let fixture = Fixture::new(kind, CodexProtocol::Openai, "bearer", "/gateway/v2").await;
+        set_provider_effort(&fixture, MODEL, Some("high"), true);
+        {
+            let mut store = fixture.store.lock().unwrap();
+            let summary = store.agent_provider(&fixture.id).unwrap().summary;
+            let mut input: ProviderInput =
+                serde_json::from_value(serde_json::to_value(summary).unwrap()).unwrap();
+            input.codex_options.models[0].context_window = Some(128_000);
+            store.save(input).unwrap();
+        }
+        configure_selected_agent(&fixture, crate::agent_configs::AgentId::Codex, MODEL);
+        let body = json!({
+            "model":MODEL,
+            "instructions":"x".repeat(120_000),
+            "input":[{"role":"user","content":[{"type":"input_text","text":"fixture"}]}],
+            "reasoning":{"effort":"low"},
+            "stream":false,
+            "tools":[{"type":"function","name":"local_probe","parameters":{"type":"object"}}],
+            "client_metadata":{"kept_for_generation":"fixture"}
+        });
+        for (key, unsupported) in [
+            ("previous_response_id", json!("resp_hidden")),
+            (
+                "input",
+                json!([{"type":"item_reference","id":"item_hidden"}]),
+            ),
+            ("tools", json!([{"type":"web_search"}])),
+        ] {
+            let mut request = body.clone();
+            request[key] = unsupported;
+            assert_eq!(
+                selected_post(&fixture, "codex", "responses", request)
+                    .await
+                    .status(),
+                StatusCode::PAYLOAD_TOO_LARGE
+            );
+        }
+        assert!(fixture.recorded().is_empty());
+        let response = selected_post(&fixture, "codex", "responses", body.clone()).await;
+        assert_eq!(response.status(), status);
+        let received: Value = response.json().await.unwrap();
+        assert!(!received.to_string().contains(UPSTREAM_KEY));
+        if status == StatusCode::PAYLOAD_TOO_LARGE {
+            assert_eq!(received["error"]["code"], "context_policy_limit");
+        }
+        let sent = fixture.recorded();
+        assert_eq!(sent.len(), expected_calls);
+        assert_eq!(sent[0].path, "/gateway/v2/responses/input_tokens");
+        assert_eq!(
+            sent[0].headers["authorization"],
+            format!("Bearer {UPSTREAM_KEY}")
+        );
+        assert_eq!(sent[0].body["reasoning"]["effort"], "high");
+        assert_eq!(sent[0].body["instructions"], body["instructions"]);
+        assert_eq!(sent[0].body["tools"], body["tools"]);
+        assert_eq!(sent[0].body["truncation"], "disabled");
+        assert!(sent[0].body.get("client_metadata").is_none());
+        assert!(sent[0].body.get("stream").is_none());
+        if expected_calls == 2 {
+            assert_eq!(sent[1].path, "/gateway/v2/responses");
+            assert_eq!(sent[1].body["reasoning"], sent[0].body["reasoning"]);
+            assert_eq!(sent[1].body["truncation"], sent[0].body["truncation"]);
+            assert_eq!(sent[1].body["max_output_tokens"], 8192);
+            assert_eq!(sent[1].body["client_metadata"], body["client_metadata"]);
+        }
+        fixture.shutdown().await;
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -163,6 +259,10 @@ enum UpstreamKind {
     AuthenticationFailure,
     InBandError,
     Interrupted,
+    ResponsesCount(u64),
+    ResponsesCountChatOnly,
+    InvalidResponsesCount,
+    RedirectResponsesCount,
 }
 
 #[derive(Clone)]
@@ -213,8 +313,32 @@ async fn upstream(
     if path == "/v1/messages/count_tokens" {
         return Json(json!({"input_tokens":42})).into_response();
     }
+    if path == "/v1/responses/input_tokens" {
+        return match state.kind {
+            UpstreamKind::ResponsesCount(tokens) => {
+                Json(json!({"object":"response.input_tokens","input_tokens":tokens}))
+                    .into_response()
+            }
+            UpstreamKind::ResponsesCountChatOnly => {
+                Json(json!({"object":"response.input_tokens","input_tokens":12000})).into_response()
+            }
+            UpstreamKind::InvalidResponsesCount => {
+                Json(json!({"object":"other","input_tokens":12000,"detail":UPSTREAM_KEY}))
+                    .into_response()
+            }
+            UpstreamKind::RedirectResponsesCount => (
+                StatusCode::TEMPORARY_REDIRECT,
+                [("location", "/v1/responses")],
+            )
+                .into_response(),
+            _ => StatusCode::NOT_FOUND.into_response(),
+        };
+    }
     if path == "/v1/responses" {
-        if matches!(state.kind, UpstreamKind::ChatOnly) {
+        if matches!(
+            state.kind,
+            UpstreamKind::ChatOnly | UpstreamKind::ResponsesCountChatOnly
+        ) {
             return (
                 StatusCode::NOT_FOUND,
                 Json(json!({"error":{"message":"This endpoint only implements chat completions"}})),
@@ -662,6 +786,7 @@ fn configure_selected_agent(fixture: &Fixture, agent: crate::agent_configs::Agen
     crate::agent_hub::configure(
         &fixture.store.lock().unwrap(),
         crate::agent_hub::AgentInput {
+            allow_native_model_switching: false,
             agent_id: agent,
             provider_id: fixture.id.clone(),
             model: Some(model.into()),
@@ -916,6 +1041,7 @@ async fn selected_reasoning_rejects_unsupported_protocol_or_declared_capabilitie
         let error = crate::agent_hub::configure(
             &fixture.store.lock().unwrap(),
             crate::agent_hub::AgentInput {
+                allow_native_model_switching: false,
                 agent_id: AgentId::Zcode,
                 provider_id: fixture.id.clone(),
                 model: None,
@@ -1172,6 +1298,473 @@ async fn release_routing_pins_selected_model_across_all_resources() {
         );
         fixture.shutdown().await;
     }
+}
+
+fn configure_switching(fixture: &Fixture) -> Value {
+    crate::agent_hub::configure(
+        &fixture.store.lock().unwrap(),
+        crate::agent_hub::AgentInput {
+            agent_id: crate::agent_configs::AgentId::Codex,
+            provider_id: fixture.id.clone(),
+            model: Some(MODEL.into()),
+            profile: None,
+            allow_native_model_switching: true,
+        },
+    )
+    .unwrap()
+}
+
+fn save_switching_catalog(fixture: &Fixture, allow_alt: bool, new_model: bool) {
+    use crate::context_policy::{bind_endpoint, ContextCapabilities, ContextPolicy};
+
+    let mut store = fixture.store.lock().unwrap();
+    let summary = store.agent_provider(&fixture.id).unwrap().summary;
+    let mut input: ProviderInput =
+        serde_json::from_value(serde_json::to_value(summary).unwrap()).unwrap();
+    input.reasoning_effort = Some("high".into());
+    input.codex_options.models_synced_at = Some(1);
+    input.codex_options.protocol_detected_at = Some(1);
+    input.codex_options.context_policy = Some(ContextPolicy {
+        model: MODEL.into(),
+        long_context_enabled: true,
+        compact_percent: 72,
+    });
+    let mut catalog = vec![(MODEL, true, "high"), ("gpt-6.2-sol", allow_alt, "low")];
+    if new_model {
+        catalog.push(("rogue-newly-enabled", true, "low"));
+    }
+    input.codex_options.models = catalog
+        .into_iter()
+        .map(|(id, enabled, effort)| {
+            let mut model = ProviderModel {
+                id: id.into(),
+                context_window: Some(128000),
+                context_capabilities: Some(ContextCapabilities {
+                    standard_window: if id == MODEL { 64000 } else { 32000 },
+                    long_window: 128000,
+                    source: "endpoint".into(),
+                    input_multiplier: Some(2.0),
+                    output_multiplier: Some(1.5),
+                    surcharge: Some(true),
+                    endpoint: None,
+                    credential_scope: None,
+                }),
+                reasoning_efforts: if id == MODEL {
+                    vec![effort.into()]
+                } else {
+                    vec![effort.into(), "medium".into()]
+                },
+                enabled,
+            };
+            bind_endpoint(&mut model, &input.base_url, UPSTREAM_KEY, &input.auth_mode);
+            model
+        })
+        .collect();
+    store.save(input).unwrap();
+}
+
+#[tokio::test]
+async fn opt_in_codex_model_switching_checks_each_requested_model_and_price_before_forwarding() {
+    let fixture = Fixture::new(UpstreamKind::Openai, CodexProtocol::Openai, "bearer", "/v1").await;
+    save_switching_catalog(&fixture, true, false);
+    let configured = configure_switching(&fixture);
+    assert_eq!(configured["contextPolicy"]["longContextEnabled"], true);
+
+    let get_models = || {
+        fixture
+            .client
+            .get(format!(
+                "http://127.0.0.1:{}/agents/selected:codex/v1/models",
+                fixture.route.port,
+            ))
+            .bearer_auth(&fixture.route.token)
+            .send()
+    };
+    let listed: Value = get_models()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed["data"][0]["id"], MODEL);
+    assert_eq!(listed["data"][1]["id"], "gpt-6.2-sol");
+    assert_eq!(listed["data"].as_array().unwrap().len(), 2);
+
+    let mut alternate = request_body("responses", false);
+    alternate["model"] = "gpt-6.2-sol".into();
+    alternate["reasoning"] = json!({"effort":"low","summary":"auto"});
+    assert_eq!(
+        selected_post(&fixture, "codex", "responses", alternate.clone())
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let mut no_effort = request_body("responses", false);
+    no_effort["model"] = "gpt-6.2-sol".into();
+    assert_eq!(
+        selected_post(&fixture, "codex", "responses", no_effort)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let sent = fixture.recorded();
+    assert_eq!(sent[0].body["model"], "gpt-6.2-sol");
+    assert_eq!(sent[0].body["reasoning"]["effort"], "low");
+    assert_eq!(sent[0].body["reasoning"]["summary"], "auto");
+    assert!(sent[1].body.get("reasoning").is_none());
+    for (resource, body_type) in [
+        ("chat/completions", "chat/completions"),
+        ("responses/compact", "responses"),
+        ("messages", "messages"),
+        ("messages/count_tokens", "messages"),
+    ] {
+        let mut body = request_body(body_type, false);
+        body["model"] = "gpt-6.2-sol".into();
+        if resource == "messages" {
+            body["thinking"] = json!({"type":"adaptive"});
+            body["output_config"] = json!({"effort":"low"});
+        }
+        assert_eq!(
+            selected_post(&fixture, "codex", resource, body)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+    let sent = fixture.recorded();
+    assert_eq!(sent.len(), 5);
+    assert!(sent
+        .iter()
+        .all(|request| request.body["model"] == "gpt-6.2-sol"));
+    assert!(sent[2].body.get("reasoning_effort").is_none());
+    assert_eq!(sent[4].body["reasoning"]["effort"], "low");
+
+    let mut over_limit = alternate.clone();
+    over_limit["input"] = "x".repeat(40000).into();
+    assert_eq!(
+        selected_post(&fixture, "codex", "responses", over_limit.clone())
+            .await
+            .status(),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    assert_eq!(
+        selected_post(&fixture, "codex", "responses/compact", over_limit.clone())
+            .await
+            .status(),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    let mut wrong_effort = alternate.clone();
+    wrong_effort["reasoning"]["effort"] = "high".into();
+    assert_eq!(
+        selected_post(&fixture, "codex", "responses", wrong_effort)
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let sent = fixture.recorded();
+    assert_eq!(sent.len(), 6);
+    assert_eq!(sent.last().unwrap().path, "/v1/responses/input_tokens");
+
+    over_limit["model"] = MODEL.into();
+    assert_eq!(
+        selected_post(&fixture, "codex", "responses", over_limit)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        fixture.recorded().last().unwrap().body["reasoning"]["effort"],
+        "high"
+    );
+
+    save_switching_catalog(&fixture, false, true);
+    let listed: Value = get_models()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed["data"].as_array().unwrap().len(), 1);
+    for model in ["gpt-6.2-sol", "rogue-newly-enabled", "unknown"] {
+        let mut request = alternate.clone();
+        request["model"] = model.into();
+        assert_eq!(
+            selected_post(&fixture, "codex", "responses", request)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    assert_eq!(fixture.recorded().len(), 7);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn opt_in_codex_subagents_never_switch_away_from_their_own_root_turn() {
+    use uuid::Uuid;
+
+    let fixture = Fixture::new(UpstreamKind::Openai, CodexProtocol::Openai, "bearer", "/v1").await;
+    save_switching_catalog(&fixture, true, false);
+    configure_switching(&fixture);
+
+    let root_a = Uuid::new_v4();
+    let thread_a = Uuid::new_v4();
+    let root_b = Uuid::new_v4();
+    let thread_b = Uuid::new_v4();
+    let request =
+        |model: &str, effort: Option<&str>, root: Uuid, thread: Uuid, parent: Option<Uuid>| {
+            let mut body = request_body("responses", false);
+            body["model"] = model.into();
+            if let Some(effort) = effort {
+                body["reasoning"] = json!({"effort":effort});
+            }
+            body["client_metadata"] =
+                json!({"root_turn_id":root.to_string(),"thread_id":thread.to_string()});
+            if let Some(parent) = parent {
+                body["client_metadata"]["x-openai-subagent"] = "true".into();
+                body["client_metadata"]["x-codex-parent-thread-id"] = json!(parent.to_string());
+            }
+            body
+        };
+    let cases = [
+        (
+            request("gpt-6.2-sol", Some("low"), root_a, thread_a, None),
+            StatusCode::OK,
+        ),
+        (request(MODEL, None, root_b, thread_b, None), StatusCode::OK),
+        (
+            request(MODEL, None, root_a, Uuid::new_v4(), Some(thread_a)),
+            StatusCode::CONFLICT,
+        ),
+        (
+            request(
+                "gpt-6.2-sol",
+                Some("medium"),
+                root_a,
+                Uuid::new_v4(),
+                Some(thread_a),
+            ),
+            StatusCode::CONFLICT,
+        ),
+        (
+            request("gpt-6.2-sol", None, root_b, Uuid::new_v4(), Some(thread_b)),
+            StatusCode::CONFLICT,
+        ),
+        (
+            request("gpt-6.2-sol", None, root_a, Uuid::new_v4(), Some(thread_b)),
+            StatusCode::CONFLICT,
+        ),
+        (
+            request(
+                "gpt-6.2-sol",
+                None,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Some(thread_a),
+            ),
+            StatusCode::CONFLICT,
+        ),
+        (
+            request("gpt-6.2-sol", None, root_a, Uuid::new_v4(), Some(thread_a)),
+            StatusCode::OK,
+        ),
+        (
+            request(MODEL, None, root_b, Uuid::new_v4(), Some(thread_b)),
+            StatusCode::OK,
+        ),
+        (
+            request("gpt-6.2-sol", None, root_a, thread_a, None),
+            StatusCode::OK,
+        ),
+    ];
+    for (body, expected) in cases {
+        assert_eq!(
+            selected_post(&fixture, "codex", "responses", body)
+                .await
+                .status(),
+            expected
+        );
+    }
+    let mut malformed = request(
+        "gpt-6.2-sol",
+        Some("low"),
+        root_a,
+        Uuid::new_v4(),
+        Some(thread_a),
+    );
+    malformed["client_metadata"]
+        .as_object_mut()
+        .unwrap()
+        .remove("x-codex-parent-thread-id");
+    assert_eq!(
+        selected_post(&fixture, "codex", "responses", malformed)
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    let sent = fixture.recorded();
+    assert_eq!(
+        sent.iter()
+            .map(|row| row.body["model"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["gpt-6.2-sol", MODEL, "gpt-6.2-sol", MODEL, "gpt-6.2-sol"]
+    );
+    assert_eq!(
+        sent.iter()
+            .map(|row| row.body["reasoning"]["effort"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["low", "high", "low", "high", "low"]
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn known_codex_root_cannot_change_model_or_effort_after_reconfiguration_or_mode_change() {
+    use crate::agent_configs::AgentId;
+    use uuid::Uuid;
+
+    let fixture = Fixture::new(UpstreamKind::Openai, CodexProtocol::Openai, "bearer", "/v1").await;
+    save_switching_catalog(&fixture, true, false);
+    configure_selected_agent(&fixture, AgentId::Codex, MODEL);
+
+    let thread = Uuid::new_v4().to_string();
+    let body = |model: &str, root: &str, parent: Option<&str>| {
+        let mut request = request_body("responses", false);
+        request["model"] = model.into();
+        request["client_metadata"] = json!({
+            "root_turn_id":root,
+            "thread_id":if parent.is_some() {Uuid::new_v4().to_string()} else {thread.clone()},
+        });
+        if let Some(parent) = parent {
+            request["client_metadata"]["x-openai-subagent"] = "true".into();
+            request["client_metadata"]["x-codex-parent-thread-id"] = parent.into();
+        }
+        request
+    };
+
+    let strict_root = Uuid::new_v4().to_string();
+    assert_eq!(
+        selected_post(
+            &fixture,
+            "codex",
+            "responses",
+            body(MODEL, &strict_root, None)
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    configure_switching(&fixture);
+    assert_eq!(
+        selected_post(
+            &fixture,
+            "codex",
+            "responses",
+            body("gpt-6.2-sol", &strict_root, None)
+        )
+        .await
+        .status(),
+        StatusCode::CONFLICT
+    );
+
+    let switched_root = Uuid::new_v4().to_string();
+    assert_eq!(
+        selected_post(
+            &fixture,
+            "codex",
+            "responses",
+            body("gpt-6.2-sol", &switched_root, None)
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    configure_switching(&fixture);
+    assert_eq!(
+        selected_post(
+            &fixture,
+            "codex",
+            "responses",
+            body(MODEL, &switched_root, None)
+        )
+        .await
+        .status(),
+        StatusCode::CONFLICT
+    );
+    let current_root = Uuid::new_v4().to_string();
+    assert_eq!(
+        selected_post(
+            &fixture,
+            "codex",
+            "responses",
+            body(MODEL, &current_root, None)
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+
+    configure_selected_agent(&fixture, AgentId::Codex, MODEL);
+    for parent in [None, Some(thread.as_str())] {
+        assert_eq!(
+            selected_post(
+                &fixture,
+                "codex",
+                "responses",
+                body(MODEL, &current_root, parent)
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+    }
+    let mut malformed = body(MODEL, &current_root, Some(thread.as_str()));
+    malformed["client_metadata"]
+        .as_object_mut()
+        .unwrap()
+        .remove("x-codex-parent-thread-id");
+    assert_eq!(
+        selected_post(&fixture, "codex", "responses", malformed)
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(fixture.recorded().len(), 3);
+
+    // A pinned connection may receive a legacy child after gateway restart.
+    // The model remains strictly enforced even when the root has no stored entry.
+    let unobserved_root = Uuid::new_v4().to_string();
+    assert_eq!(
+        selected_post(
+            &fixture,
+            "codex",
+            "responses",
+            body(MODEL, &unobserved_root, Some(thread.as_str()))
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    for model in ["gpt-6.2-sol", "sonnet", "gpt-6.2-sol-latest"] {
+        assert_eq!(
+            selected_post(
+                &fixture,
+                "codex",
+                "responses",
+                body(model, &unobserved_root, Some(thread.as_str()))
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    assert_eq!(fixture.recorded().len(), 4);
+    fixture.shutdown().await;
 }
 
 #[tokio::test]

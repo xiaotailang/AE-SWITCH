@@ -2868,6 +2868,7 @@ fn deepseek_windows_pwsh_patch_is_relative_to_workspace_and_survives_move() {
             &mut environment,
             None,
             None,
+            None,
         )
         .unwrap();
         commit_native_configuration(&package, &snapshots, writes).unwrap();

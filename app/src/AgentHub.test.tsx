@@ -197,6 +197,7 @@ async function mount(expandDetails = true) {
   );
   if (expandDetails) {
     for (const selector of [
+      ".hub-model-settings",
       ".hub-extra-settings",
       ".hub-profile-settings",
       ".hub-client-actions",
@@ -257,6 +258,176 @@ async function specifyInstallation(directory: string) {
     target: { value: directory },
   });
 }
+describe("Codex 原生切换模型", () => {
+  const switchLabel = "允许在 Codex 内切换模型";
+  const alternateModel = {
+    ...provider.codexOptions!.models[0],
+    id: "gpt-alternate",
+    reasoningEfforts: ["high"],
+  };
+  const modelCatalog = [...provider.codexOptions!.models, alternateModel];
+  const selectCodex = () =>
+    userEvent.click(screen.getByRole("button", { name: /Codex 官方图标/ }));
+
+  async function prepareCatalog() {
+    vi.mocked(api.discoverConnection).mockResolvedValue({
+      models: modelCatalog,
+      protocol: "openai",
+      authMode: "bearer",
+      syncedAt: 3,
+      baseUrl: provider.baseUrl,
+    });
+    vi.mocked(api.save).mockImplementation(async (input) => ({
+      ...provider,
+      ...input,
+      id: provider.id,
+    }));
+    await mount();
+    expect(
+      screen.queryByRole("checkbox", { name: switchLabel }),
+    ).not.toBeInTheDocument();
+    await selectCodex();
+    await enterConnection(alternateModel.id);
+  }
+
+  it("主流程可折叠模型设置，保留连接草稿并直接按默认策略确认", async () => {
+    vi.mocked(api.discoverConnection).mockResolvedValue({
+      models: modelCatalog,
+      protocol: "openai",
+      authMode: "bearer",
+      syncedAt: 3,
+      baseUrl: provider.baseUrl,
+    });
+    vi.mocked(api.save).mockImplementation(async (input) => ({
+      ...provider,
+      ...input,
+      id: provider.id,
+    }));
+    await mount(false);
+    await selectCodex();
+    await enterConnection(alternateModel.id);
+    const disclosure = screen.getByText("模型设置", { selector: "summary" });
+    expect(disclosure).toHaveTextContent("Codex 内可切换");
+    expect(
+      screen.queryByRole("checkbox", { name: switchLabel }),
+    ).not.toBeInTheDocument();
+    await userEvent.click(disclosure);
+    expect(screen.getByRole("checkbox", { name: switchLabel })).toBeChecked();
+    await userEvent.click(disclosure);
+    expect(
+      screen.queryByRole("checkbox", { name: switchLabel }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "默认模型" })).toHaveValue(
+      alternateModel.id,
+    );
+    await userEvent.click(screen.getByRole("button", { name: "确认连接" }));
+    await waitFor(() =>
+      expect(agentApi.configure).toHaveBeenCalledWith(
+        expect.objectContaining({
+          agentId: "codex",
+          allowNativeModelSwitching: true,
+        }),
+      ),
+    );
+  });
+
+  it("新 Codex 连接有多个真实模型时，默认在确认后开放原生切换", async () => {
+    vi.mocked(agentApi.overview).mockResolvedValue({
+      agents: agentCatalog.map((entry) =>
+        entry.id === "codex"
+          ? { ...entry, allowNativeModelSwitching: false }
+          : entry,
+      ),
+      dataDirectory: "./data",
+      bridgeHealthy: false,
+    });
+    await prepareCatalog();
+    const toggle = screen.getByRole("checkbox", { name: switchLabel });
+    expect(toggle).toBeEnabled();
+    expect(toggle).toBeChecked();
+    expect(toggle).toHaveAccessibleDescription(/这 2 个模型/);
+    expect(toggle).toHaveAccessibleDescription(/加价授权仅用于默认模型/);
+    expect(agentApi.configure).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("button", { name: "确认连接" }));
+    await waitFor(() =>
+      expect(agentApi.probe).toHaveBeenCalledWith(
+        expect.objectContaining({
+          agentId: "codex",
+          model: alternateModel.id,
+          allowNativeModelSwitching: true,
+        }),
+      ),
+    );
+    expect(agentApi.configure).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentId: "codex",
+        allowNativeModelSwitching: true,
+      }),
+    );
+    expect(api.save).toHaveBeenCalledWith(
+      expect.objectContaining({
+        codexOptions: expect.objectContaining({ models: modelCatalog }),
+      }),
+    );
+  });
+
+  it("已配置的 Codex 保留锁定模式，手动展开模型目录需确认", async () => {
+    configured = true;
+    configuredAgent = "codex";
+    await prepareCatalog();
+    const toggle = screen.getByRole("checkbox", { name: switchLabel });
+    expect(toggle).not.toBeChecked();
+    await userEvent.click(toggle);
+    expect(toggle).toBeChecked();
+    expect(agentApi.configure).not.toHaveBeenCalled();
+    await userEvent.click(toggle);
+    await userEvent.click(screen.getByRole("button", { name: "确认连接" }));
+    await waitFor(() =>
+      expect(agentApi.configure).toHaveBeenCalledWith(
+        expect.objectContaining({
+          agentId: "codex",
+          allowNativeModelSwitching: false,
+        }),
+      ),
+    );
+  });
+
+  it("Anthropic 转换连接仍固定使用确认的模型", async () => {
+    vi.mocked(api.discoverConnection).mockResolvedValue({
+      models: modelCatalog,
+      protocol: "anthropic",
+      authMode: "x-api-key",
+      syncedAt: 3,
+      baseUrl: provider.baseUrl,
+    });
+    await mount();
+    await selectCodex();
+    await enterConnection(alternateModel.id);
+    const toggle = screen.getByRole("checkbox", { name: switchLabel });
+    expect(toggle).toBeDisabled();
+    expect(toggle).not.toBeChecked();
+    expect(toggle).toHaveAccessibleDescription(/Anthropic 协议/);
+  });
+
+  it("只有一个发现结果时保留单模型并禁止开启切换", async () => {
+    await mount();
+    await selectCodex();
+    await enterConnection();
+    const toggle = screen.getByRole("checkbox", { name: switchLabel });
+    expect(toggle).toBeDisabled();
+    expect(toggle).not.toBeChecked();
+    await userEvent.click(screen.getByRole("button", { name: "确认连接" }));
+    await waitFor(() =>
+      expect(agentApi.configure).toHaveBeenCalledWith(
+        expect.objectContaining({
+          agentId: "codex",
+          allowNativeModelSwitching: false,
+        }),
+      ),
+    );
+  });
+});
+
 describe("Agent Hub 真实状态与配置流程", () => {
   it("保存新连接及延迟同步模型后保留选定等级和验证结果", async () => {
     const models = [
@@ -1442,6 +1613,7 @@ describe("Agent Hub 真实状态与配置流程", () => {
         providerId: provider.id,
         model: provider.model,
         profile,
+        ...(id === "codex" ? { allowNativeModelSwitching: false } : {}),
       };
       expect(agentApi.configure).toHaveBeenCalledWith(input);
       expect(agentApi.probe).toHaveBeenCalledWith(input);

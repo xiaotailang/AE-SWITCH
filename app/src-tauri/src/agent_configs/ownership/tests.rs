@@ -203,6 +203,178 @@ fn repeated_configuration_preserves_first_original_native_contents() {
 }
 
 #[test]
+fn codex_native_catalog_and_overrides_are_transactional_across_modes() {
+    let (_temporary, data, profile) = fixture(AgentId::Codex);
+    let known = paths(&data, AgentId::Codex, Some(&profile)).unwrap();
+    let config = &known["config"];
+    let catalog = &known[codex_catalog::SLOT];
+    let original = r#"# retain this comment
+model = "original"
+profile = "daily"
+model_catalog_json = "foreign-root.json"
+model_context_window = 64000
+model_auto_compact_token_limit = 50000
+model_reasoning_effort = "medium"
+
+[agents]
+default_subagent_model = "original-child"
+default_subagent_reasoning_effort = "low"
+max_threads = 4
+
+[profiles.daily]
+model = "original-daily"
+model_catalog_json = "foreign-daily.json"
+model_reasoning_effort = "minimal"
+
+[profiles.other]
+model_catalog_json = "foreign-other.json"
+model_reasoning_effort = "high"
+"#;
+    std::fs::write(config, original).unwrap();
+    let select = |approved: bool| {
+        let path = data.join("agent-selection.json");
+        let before = std::fs::read_to_string(&path).ok();
+        let mut state = json!({"codex":{"providerId":"fixture","model":"first","profile":profile}});
+        if approved {
+            state["codex"]["nativeModelCatalog"] = json!({
+                "scope":"fixture-only",
+                "models":[
+                    {"id":"first","contextWindow":64000,"reasoningEfforts":["low","high"],"reasoningEffort":"high"},
+                    {"id":"second","contextWindow":32000,"reasoningEfforts":["low"]}
+                ]
+            });
+        }
+        super::super::configure_existing_with_selection(
+            &data,
+            AgentId::Codex,
+            "http://127.0.0.1:18762/v1",
+            "fixture-token",
+            "first",
+            &profile,
+            (&path, &state.to_string(), before.as_deref()),
+        )
+    };
+    std::fs::write(catalog, "foreign catalog bytes").unwrap();
+    assert_eq!(
+        select(true).unwrap_err().code,
+        "agent_configuration_changed"
+    );
+    assert_eq!(std::fs::read_to_string(config).unwrap(), original);
+    assert_eq!(
+        std::fs::read_to_string(catalog).unwrap(),
+        "foreign catalog bytes"
+    );
+    std::fs::remove_file(catalog).unwrap();
+    select(true).unwrap();
+    let configured = std::fs::read_to_string(config)
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    assert_eq!(
+        configured["model_catalog_json"].as_str().map(Path::new),
+        Some(catalog.as_path())
+    );
+    assert_eq!(
+        configured["profiles"]["daily"]["model_catalog_json"]
+            .as_str()
+            .map(Path::new),
+        Some(catalog.as_path())
+    );
+    assert_eq!(
+        configured["profiles"]["other"]["model_catalog_json"].as_str(),
+        Some("foreign-other.json")
+    );
+    assert!(configured.get("model_context_window").is_none());
+    assert!(configured.get("model_auto_compact_token_limit").is_none());
+    assert!(configured.get("model_reasoning_effort").is_none());
+    let children = configured["agents"].as_table_like().unwrap();
+    assert!(!children.contains_key("default_subagent_model"));
+    assert!(!children.contains_key("default_subagent_reasoning_effort"));
+    assert_eq!(
+        children
+            .get("max_threads")
+            .and_then(toml_edit::Item::as_integer),
+        Some(4)
+    );
+    let catalog_text = std::fs::read_to_string(catalog).unwrap();
+    let rendered: Value = serde_json::from_str(&catalog_text).unwrap();
+    assert_eq!(rendered["models"][0]["slug"], "first");
+    assert_eq!(rendered["models"][0]["default_reasoning_level"], "high");
+    assert_eq!(rendered["models"][0]["context_window"], 64000);
+    assert_eq!(rendered["models"][0]["auto_compact_token_limit"], 51200);
+    assert_eq!(rendered["models"][1]["slug"], "second");
+    assert_eq!(rendered["models"][1]["context_window"], 32000);
+    assert_eq!(rendered["models"][1]["auto_compact_token_limit"], 25600);
+
+    let approved_config = std::fs::read_to_string(config).unwrap();
+    std::fs::write(catalog, format!("{catalog_text}\n")).unwrap();
+    assert_eq!(
+        select(true).unwrap_err().code,
+        "agent_configuration_changed"
+    );
+    assert_eq!(
+        select(false).unwrap_err().code,
+        "agent_configuration_changed"
+    );
+    assert_eq!(std::fs::read_to_string(config).unwrap(), approved_config);
+    assert_eq!(
+        std::fs::read_to_string(catalog).unwrap(),
+        format!("{catalog_text}\n")
+    );
+    assert_eq!(
+        inspect(&data, AgentId::Codex, Some(&profile))
+            .unwrap()
+            .status,
+        "drifted"
+    );
+    std::fs::write(catalog, catalog_text).unwrap();
+    select(false).unwrap();
+    let pinned = std::fs::read_to_string(config)
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    assert_eq!(
+        pinned["model_catalog_json"].as_str(),
+        Some("foreign-root.json")
+    );
+    assert_eq!(
+        pinned["profiles"]["daily"]["model_catalog_json"].as_str(),
+        Some("foreign-daily.json")
+    );
+    assert_eq!(pinned["model_context_window"].as_integer(), Some(64000));
+    assert_eq!(
+        pinned["model_auto_compact_token_limit"].as_integer(),
+        Some(50000)
+    );
+    assert_eq!(pinned["model_reasoning_effort"].as_str(), Some("medium"));
+    assert_eq!(
+        pinned["agents"]["default_subagent_model"].as_str(),
+        Some("first")
+    );
+    assert_eq!(
+        pinned["agents"]["default_subagent_reasoning_effort"].as_str(),
+        Some("low")
+    );
+    assert_eq!(
+        pinned["profiles"]["daily"]["model_reasoning_effort"].as_str(),
+        Some("minimal")
+    );
+    let safety = inspect(&data, AgentId::Codex, Some(&profile)).unwrap();
+    let selection = std::fs::read_to_string(data.join("agent-selection.json")).unwrap();
+    disconnect(
+        &data,
+        AgentId::Codex,
+        Some(&profile),
+        safety.preview_token.as_deref().unwrap(),
+        &selection,
+        "{}",
+    )
+    .unwrap();
+    assert_eq!(std::fs::read_to_string(config).unwrap(), original);
+    assert!(!catalog.exists());
+}
+
+#[test]
 fn selected_native_subagent_models_roundtrip_exact_original_bytes() {
     for (agent, original) in [
         (

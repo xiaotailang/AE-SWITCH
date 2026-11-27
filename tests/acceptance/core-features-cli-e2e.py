@@ -2,7 +2,7 @@
 
 This is a local binary integration check. It never launches a client fixture,
 contacts an upstream, queries an inference model, or proves official client E2E.
-All mutable state and the summary report are confined to a fresh G: owner root.
+Fixtures live in a fresh G: owner root and are removed after the compact receipt is captured.
 """
 from __future__ import annotations
 
@@ -15,7 +15,10 @@ import shutil
 import subprocess
 import sys
 import time
-import uuid
+from uuid import uuid4
+
+sys.dont_write_bytecode = True
+from owned_python_fixture import cleanup_owned_fixture, create_owned_fixture, fresh_receipt_path, write_receipt
 
 
 AGENTS = (
@@ -24,10 +27,18 @@ AGENTS = (
 )
 MODEL = "gpt-6.1-sol"
 SCHEMA = "ae-switch-core-features-cli-e2e-v1"
+OWNER_PURPOSE = "local-synthetic-cli-fixtures"
+WORKSPACE = Path(__file__).resolve().parents[2]
 
 
 class CheckFailure(Exception):
     """Contains only a fixed check label, never child output or native values."""
+
+
+class FixtureSetupFailure(CheckFailure):
+    def __init__(self, label, harness):
+        super().__init__(label)
+        self.harness = harness
 
 
 def require(condition: bool, label: str) -> None:
@@ -47,6 +58,15 @@ def g_path(value: Path) -> Path:
                     "reparse_point_path_rejected")
         current = current.parent
     return resolved
+
+
+def receipt_path(value: Path | None) -> Path | None:
+    if value is None:
+        return None
+    try:
+        return fresh_receipt_path(value)
+    except (ValueError, OSError):
+        raise CheckFailure("fresh_owned_report_required") from None
 
 
 def json_text(value: object) -> str:
@@ -69,22 +89,85 @@ def parse_json(path: Path) -> object:
         raise CheckFailure("persisted_json_readback_failed") from None
 
 
+def prove_no_owner_processes(harness):
+    environment = harness.environment.copy()
+    environment["AE_ACCEPTANCE_CLEANUP_ROOT"] = str(harness.owner)
+    for name, relative in {
+        "TEMP": "process-tmp", "TMP": "process-tmp", "TMPDIR": "process-tmp",
+        "HOME": "process-home", "USERPROFILE": "process-home",
+        "APPDATA": "process-home/AppData/Roaming", "LOCALAPPDATA": "process-home/AppData/Local",
+        "PSModuleAnalysisCachePath": "process-cache/module-analysis",
+    }.items():
+        location = harness.owner / relative
+        if name != "PSModuleAnalysisCachePath":
+            location.mkdir(parents=True, exist_ok=True)
+        environment[name] = str(location)
+    program = WORKSPACE / ".tools/pwsh/pwsh.exe"
+    require(program.is_file(), "cleanup_workspace_powershell_required")
+    # Query only. Raw command lines remain inside PowerShell and never enter
+    # child output, retained evidence, or a termination API.
+    script = r"""
+$ErrorActionPreference='Stop'
+$scope=[IO.Path]::GetFullPath($env:AE_ACCEPTANCE_CLEANUP_ROOT).TrimEnd('\','/')
+$matches=@(Get-CimInstance Win32_Process | Where-Object {
+  ($_.ExecutablePath -and ($_.ExecutablePath -ieq $scope -or $_.ExecutablePath.StartsWith($scope+'\',[StringComparison]::OrdinalIgnoreCase))) -or
+  ($_.CommandLine -and $_.CommandLine.IndexOf($scope,[StringComparison]::OrdinalIgnoreCase) -ge 0)
+})
+@{processesReferencingOwner=$matches.Count;processesStopped=0}|ConvertTo-Json -Compress
+"""
+    result = subprocess.run([str(program), "-NoProfile", "-NonInteractive", "-Command", script],
+                            env=environment, cwd=WORKSPACE, capture_output=True, text=True,
+                            encoding="utf-8", errors="replace", timeout=30,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), check=False)
+    require(result.returncode == 0, "cleanup_process_query_failed")
+    try:
+        proof = json.loads(result.stdout)
+    except ValueError:
+        raise RuntimeError("cleanup_process_proof_invalid") from None
+    require(proof.get("processesReferencingOwner") == 0 and proof.get("processesStopped") == 0,
+            "cleanup_live_owner_reference_refused")
+    return proof
+
+
+def finish_owned_fixture(harness):
+    if harness is None or harness.owner is None:
+        return {"passed": True, "removed": False, "created": False}
+    try:
+        proof = prove_no_owner_processes(harness)
+        cleanup_owned_fixture(harness.owner, harness.owner_id, OWNER_PURPOSE)
+    except CheckFailure as error:
+        return {"passed": False, "removed": False, "created": True, "failure": str(error)}
+    except Exception:
+        return {"passed": False, "removed": False, "created": True,
+                "failure": "owned_cleanup_refused_or_failed_raw_details_suppressed"}
+    return {"passed": True, "removed": True, "created": True,
+            "ownerMarkerVerified": True, "ordinaryTreeVerified": True, **proof}
+
+
 class Harness:
     def __init__(self, binary: Path, workspace: Path) -> None:
-        self.owner_id = uuid.uuid4().hex
-        self.owner = g_path(workspace / ".cache" / "core-features-cli-e2e" / self.owner_id)
-        require(not self.owner.exists(), "owner_root_must_be_new")
-        self.owner.mkdir(parents=True)
+        self.workspace = workspace
+        self.owner_id, self.owner, self.binary_sha256 = None, None, None
+        self.stage = "initialize"
+        self.command_count = 0
+        self.checks: list[str] = []
+        self.environment = os.environ.copy()
+        try:
+            self.initialize(binary)
+        except Exception as error:
+            self.cleanup = finish_owned_fixture(self)
+            label = str(error) if isinstance(error, CheckFailure) else "harness_setup_failed"
+            raise FixtureSetupFailure(label, self) from None
+
+    def initialize(self, binary: Path) -> None:
+        owner, owner_id = create_owned_fixture(self.workspace, OWNER_PURPOSE)
+        self.owner, self.owner_id = owner, owner_id
         self.portable = self.owner / "portable"
         self.portable.mkdir()
         self.binary = self.portable / "AE-Switch-core.exe"
         shutil.copy2(binary, self.binary)
         self.binary_sha256 = digest(self.binary)
         self.data = self.portable / "data"
-        self.stage = "initialize"
-        self.command_count = 0
-        self.checks: list[str] = []
-        self.environment = os.environ.copy()
         # The process bootstrap also redirects these variables, but setting the
         # originals prevents discovery from consulting an actual user profile.
         redirected = {
@@ -120,10 +203,6 @@ class Harness:
             "OPENCODE_CONFIG_CONTENT", "AE_SWITCH_TOOLS_DIR",
         ):
             self.environment.pop(variable, None)
-        write_text(self.owner / "owner.json", json_text({
-            "schema": SCHEMA, "ownerId": self.owner_id,
-            "purpose": "local-synthetic-cli-fixtures",
-        }))
         self.profiles: dict[str, dict[str, str]] = {}
         self.originals: dict[Path, bytes | None] = {}
         self.histories: dict[Path, bytes] = {}
@@ -390,28 +469,43 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=Path,
                         help="Compiled final AE Switch core CLI executable on G:")
-    parser.add_argument("--workspace", type=Path, default=Path(__file__).resolve().parents[2])
+    parser.add_argument("--workspace", type=Path, default=WORKSPACE)
+    parser.add_argument("--report", type=Path)
     args = parser.parse_args()
     harness = None
+    failure = None
+    cleanup = None
     started = time.monotonic()
+    try:
+        receipt = receipt_path(args.report)
+    except CheckFailure as error:
+        print(json_text({"schema": SCHEMA, "passed": False, "failure": str(error)}), end="")
+        return 1
     try:
         binary, workspace = g_path(args.binary), g_path(args.workspace)
         require(binary.is_file(), "compiled_cli_binary_missing")
         harness = Harness(binary, workspace)
         harness.run()
-        report = harness.report(True, None, time.monotonic() - started)
+    except FixtureSetupFailure as error:
+        harness, cleanup, failure = error.harness, error.harness.cleanup, str(error)
     except CheckFailure as error:
-        if harness is None:
-            print(json_text({"schema": SCHEMA, "passed": False, "failure": str(error)}), end="")
-            return 1
-        report = harness.report(False, str(error), time.monotonic() - started)
+        failure = str(error)
     except Exception:
-        # No Python traceback: it can include fixture values or subprocess text.
-        if harness is None:
-            print(json_text({"schema": SCHEMA, "passed": False, "failure": "harness_setup_failed"}), end="")
-            return 1
-        report = harness.report(False, "unexpected_harness_failure", time.monotonic() - started)
-    write_text(harness.owner / "report.json", json_text(report))
+        # Child output and raw errors may contain fixture values.
+        failure = "unexpected_harness_failure"
+    report = (harness.report(failure is None, failure, time.monotonic() - started) if harness else
+              {"schema": SCHEMA, "passed": False, "failure": failure})
+    report["cleanup"] = cleanup if cleanup is not None else finish_owned_fixture(harness)
+    if not report["cleanup"]["passed"]:
+        report["passed"] = False
+        report["failure"] = failure or "owned_cleanup_not_proved"
+    owner_id = harness.owner_id if harness and harness.owner_id else uuid4().hex
+    receipt = receipt or WORKSPACE / "artifacts/acceptance/core-features-cli-e2e" / f"{owner_id}.json"
+    try:
+        write_receipt(receipt, report)
+    except Exception:
+        report["passed"] = False
+        report["receiptFailure"] = "acceptance_receipt_not_written"
     print(json_text(report), end="")
     return 0 if report["passed"] else 1
 

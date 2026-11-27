@@ -161,6 +161,7 @@ struct Runtime {
     token: String,
     client: reqwest::Client,
     activity: activity::ActivityLog,
+    codex_turns: Arc<Mutex<agent_http::CodexTurns>>,
 }
 type HttpError = (StatusCode, Json<Value>);
 fn error(status: StatusCode, message: impl Into<String>) -> HttpError {
@@ -532,6 +533,7 @@ pub async fn serve(listener: TcpListener, route: Route, store: Arc<Mutex<Store>>
         token: route.token,
         client,
         activity: activity::ActivityLog::default(),
+        codex_turns: Arc::default(),
     };
     let app = Router::new()
         .merge(activity::routes())

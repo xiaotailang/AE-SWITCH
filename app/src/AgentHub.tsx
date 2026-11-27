@@ -146,11 +146,16 @@ export default function AgentHub() {
   const [baseUrl, setBaseUrl] = useState(DEFAULT_ENDPOINT);
   const [apiKey, setApiKey] = useState("");
   const [name, setName] = useState("");
+  const [nativeSwitchDraft, setNativeSwitchDraft] = useState<{
+    context: string;
+    value: boolean;
+  } | null>(null);
   const [reasoningChoice, setReasoningChoice] = useState<{
     context: string;
     value: string | null;
   } | null>(null);
   const [showKey, setShowKey] = useState(false);
+  const [modelSettingsOpen, setModelSettingsOpen] = useState(false);
   const [contextSelection, setContextSelection] = useState<{
     context: string;
     value: ContextPolicy;
@@ -389,6 +394,24 @@ export default function AgentHub() {
         )
       : [];
   const selectedModel = models.find((model) => model.id === discovery.model);
+  const showNativeModelSwitch = selectedAgent === "codex";
+  const canSwitchNativeModels =
+    showNativeModelSwitch &&
+    discovery.protocol === "openai" &&
+    models.length >= 2;
+  const nativeSwitchContext = JSON.stringify([
+    providerId,
+    baseUrl,
+    apiKey,
+    agent.configurationRevision,
+  ]);
+  const allowNativeModelSwitching =
+    canSwitchNativeModels &&
+    (nativeSwitchDraft?.context === nativeSwitchContext
+      ? nativeSwitchDraft.value
+      : agent.providerId || agent.configured
+        ? agent.allowNativeModelSwitching === true
+        : true);
   const declaredReasoningLevels = [
     ...new Set(selectedModel?.reasoningEfforts ?? []),
   ].filter((effort) => Object.hasOwn(reasoningLabels, effort));
@@ -759,6 +782,7 @@ export default function AgentHub() {
         providerId: saved.id,
         model: saved.model,
         ...(selectedProfile ? { profile: selectedProfile } : {}),
+        ...(showNativeModelSwitch ? { allowNativeModelSwitching } : {}),
       };
       if (action === "confirm") {
         stage = "configure";
@@ -1338,59 +1362,136 @@ export default function AgentHub() {
                 </div>
               </div>
 
-              <fieldset className="hub-reasoning-settings">
-                <legend>思考程度</legend>
-                <div className="hub-reasoning-options">
-                  {[null, ...reasoningLevels].map((effort) => (
-                    <label
-                      key={effort ?? "default"}
-                      className={`hub-reasoning-option ${reasoningEffort === effort ? "selected" : ""}`}
-                    >
-                      <input
-                        type="radio"
-                        name="hub-reasoning"
-                        value={effort ?? ""}
-                        checked={reasoningEffort === effort}
-                        disabled={!!busy || discovery.busy || !models.length}
-                        onChange={() => {
-                          setReasoningChoice({
-                            context: reasoningContext,
-                            value: effort,
-                          });
-                          setProbe(null);
-                          setNotice(null);
-                        }}
-                      />
-                      <span>
-                        {effort === null ? "默认" : reasoningLabels[effort]}
-                      </span>
-                    </label>
-                  ))}
-                </div>
-                <p className="hub-profile-note">
-                  {declaredReasoningLevels.length && reasoningLevels.length
-                    ? "仅显示供应商返回的模型等级。选择默认时保留客户端或供应商的设置；指定等级在确认连接后通过 AE 网关应用。"
-                    : discovery.protocol === "anthropic"
-                      ? "此连接暂不支持在 AE Switch 中设置思考等级，使用客户端或供应商的默认设置。"
-                      : selectedModel
-                        ? "端点未提供等级清单，以下为兼容选项，不代表已确认全部支持。可选择你已验证的等级，确认后通过 AE 网关传递，以端点响应为准；默认保留客户端设置。"
-                        : "选择模型后可设置思考程度。"}
-                </p>
-              </fieldset>
+              <details
+                className="hub-model-settings"
+                open={modelSettingsOpen}
+                onToggle={(event) =>
+                  setModelSettingsOpen(event.currentTarget.open)
+                }
+              >
+                <summary>
+                  模型设置
+                  {selectedModel && (
+                    <span>
+                      {[
+                        allowNativeModelSwitching ? "Codex 内可切换" : null,
+                        reasoningEffort
+                          ? reasoningLabels[reasoningEffort]
+                          : "默认思考程度",
+                        contextPolicy
+                          ? `压缩 ${contextPolicy.compactPercent}%`
+                          : null,
+                        contextPolicy?.longContextEnabled
+                          ? "已开启长上下文"
+                          : null,
+                      ]
+                        .filter(Boolean)
+                        .join(" · ")}
+                    </span>
+                  )}
+                </summary>
+                {modelSettingsOpen && (
+                  <>
+                    {showNativeModelSwitch && models.length > 0 && (
+                      <div className="hub-native-model-switch">
+                        <label className="hub-background-toggle">
+                          <input
+                            type="checkbox"
+                            checked={allowNativeModelSwitching}
+                            disabled={
+                              !desktopRuntime ||
+                              !!busy ||
+                              hub.isPending ||
+                              discovery.busy ||
+                              !canSwitchNativeModels
+                            }
+                            aria-describedby="hub-native-model-switch-note"
+                            onChange={(event) => {
+                              setNativeSwitchDraft({
+                                context: nativeSwitchContext,
+                                value: event.target.checked,
+                              });
+                              setNotice(null);
+                              setProbe(null);
+                            }}
+                          />
+                          允许在 Codex 内切换模型
+                        </label>
+                        <p
+                          className="hub-profile-note"
+                          id="hub-native-model-switch-note"
+                        >
+                          {!canSwitchNativeModels
+                            ? discovery.protocol === "anthropic"
+                              ? "此连接使用 Anthropic 协议，Codex 使用选定的默认模型。"
+                              : "同步到至少两个可用模型后可开启，当前连接使用默认模型。"
+                            : allowNativeModelSwitching
+                              ? `确认连接并重新载入 Codex 后，可在模型菜单或 /model 中切换这 ${models.length} 个模型。下方选择的思考程度和长上下文加价授权仅用于默认模型，其他模型从标准上下文和 80% 压缩阈值开始。`
+                              : "当前连接仅使用上方的默认模型。"}
+                        </p>
+                      </div>
+                    )}
 
-              <ContextPolicySettings
-                model={selectedModel}
-                value={contextPolicy}
-                disabled={!!busy || discovery.busy || !models.length}
-                agentId={selectedAgent}
-                baseUrl={contextEndpoint}
-                onChange={(value) => {
-                  setContextSelection({ context: contextKey, value });
-                  setProbe(null);
-                  setNotice(null);
-                }}
-              />
+                    <fieldset className="hub-reasoning-settings">
+                      <legend>思考程度</legend>
+                      <div className="hub-reasoning-options">
+                        {[null, ...reasoningLevels].map((effort) => (
+                          <label
+                            key={effort ?? "default"}
+                            className={`hub-reasoning-option ${reasoningEffort === effort ? "selected" : ""}`}
+                          >
+                            <input
+                              type="radio"
+                              name="hub-reasoning"
+                              value={effort ?? ""}
+                              checked={reasoningEffort === effort}
+                              disabled={
+                                !!busy || discovery.busy || !models.length
+                              }
+                              onChange={() => {
+                                setReasoningChoice({
+                                  context: reasoningContext,
+                                  value: effort,
+                                });
+                                setProbe(null);
+                                setNotice(null);
+                              }}
+                            />
+                            <span>
+                              {effort === null
+                                ? "默认"
+                                : reasoningLabels[effort]}
+                            </span>
+                          </label>
+                        ))}
+                      </div>
+                      <p className="hub-profile-note">
+                        {declaredReasoningLevels.length &&
+                        reasoningLevels.length
+                          ? "仅显示供应商返回的模型等级。选择默认时保留客户端或供应商的设置；指定等级在确认连接后通过 AE 网关应用。"
+                          : discovery.protocol === "anthropic"
+                            ? "此连接暂不支持在 AE Switch 中设置思考等级，使用客户端或供应商的默认设置。"
+                            : selectedModel
+                              ? "端点未提供等级清单，以下为兼容选项，不代表已确认全部支持。可选择你已验证的等级，确认后通过 AE 网关传递，以端点响应为准；默认保留客户端设置。"
+                              : "选择模型后可设置思考程度。"}
+                      </p>
+                    </fieldset>
 
+                    <ContextPolicySettings
+                      model={selectedModel}
+                      value={contextPolicy}
+                      disabled={!!busy || discovery.busy || !models.length}
+                      agentId={selectedAgent}
+                      baseUrl={contextEndpoint}
+                      onChange={(value) => {
+                        setContextSelection({ context: contextKey, value });
+                        setProbe(null);
+                        setNotice(null);
+                      }}
+                    />
+                  </>
+                )}
+              </details>
               <details className="hub-extra-settings">
                 <summary>已保存连接</summary>
                 <div className="hub-provider-switch">

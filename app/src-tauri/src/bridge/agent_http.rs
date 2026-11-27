@@ -1,8 +1,181 @@
 //! Authenticated agent gateway; native APIs stream without copying whole replies.
 #![forbid(unsafe_code)]
 use super::*;
-use crate::types::CodexProtocol;
+use crate::{agent_hub::CodexGatewaySelection, types::CodexProtocol};
 use sha2::{Digest, Sha256};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Instant,
+};
+use uuid::Uuid;
+
+mod input_tokens;
+
+const MAX_CODEX_TURNS: usize = 4096;
+const CODEX_TURN_IDLE: Duration = Duration::from_secs(60 * 60);
+const MAX_SUBAGENTS_PER_TURN: usize = 64;
+
+#[derive(Default)]
+pub(super) struct CodexTurns {
+    bindings: HashMap<Uuid, CodexTurn>,
+}
+
+struct CodexTurn {
+    selection: CodexGatewaySelection,
+    thread: Uuid,
+    model: String,
+    effort: Option<String>,
+    children: HashSet<Uuid>,
+    touched: Instant,
+}
+
+struct CodexRequestScope {
+    root_turn: Uuid,
+    thread: Uuid,
+    parent: Option<Uuid>,
+}
+
+enum CodexMetadata {
+    Identified(CodexRequestScope),
+    Malformed(Option<Uuid>),
+}
+
+fn request_scope(body: &Value) -> Option<CodexMetadata> {
+    let metadata = body.get("client_metadata").and_then(Value::as_object)?;
+    let uuid = |key: &str| {
+        metadata
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| value.len() == 36)
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .filter(|id| !id.is_nil())
+    };
+    let root = uuid("root_turn_id");
+    let thread = uuid("thread_id");
+    let linked = metadata.contains_key("x-openai-subagent")
+        || metadata.contains_key("x-codex-parent-thread-id")
+        || metadata.contains_key("parent_turn_id");
+    let parent = uuid("x-codex-parent-thread-id");
+    if linked && (root.is_none() || thread.is_none() || parent.is_none() || parent == thread)
+        || root.is_some() && thread.is_none()
+    {
+        return Some(CodexMetadata::Malformed(root));
+    }
+    root.zip(thread).map(|(root_turn, thread)| {
+        CodexMetadata::Identified(CodexRequestScope {
+            root_turn,
+            thread,
+            parent,
+        })
+    })
+}
+
+impl CodexTurns {
+    fn authorize(
+        &mut self,
+        selection: CodexGatewaySelection,
+        metadata: CodexMetadata,
+        model: &str,
+        effort: &mut Option<String>,
+        generation: bool,
+    ) -> std::result::Result<(), HttpError> {
+        let scope = match metadata {
+            CodexMetadata::Identified(scope) => scope,
+            CodexMetadata::Malformed(root) => {
+                let known = root.is_some_and(|id| {
+                    self.bindings
+                        .get(&id)
+                        .is_some_and(|turn| turn.touched.elapsed() < CODEX_TURN_IDLE)
+                });
+                if selection.allow_native_model_switching || known {
+                    return Err(error(
+                        StatusCode::BAD_REQUEST,
+                        "Codex 请求的父任务或子代理关联信息不完整",
+                    ));
+                }
+                return Ok(());
+            }
+        };
+        let key = scope.root_turn;
+        let now = Instant::now();
+        if self
+            .bindings
+            .get(&key)
+            .is_some_and(|turn| now.duration_since(turn.touched) >= CODEX_TURN_IDLE)
+        {
+            self.bindings.remove(&key);
+        }
+        let Some(turn) = self.bindings.get_mut(&key) else {
+            if scope.parent.is_some() {
+                return if selection.allow_native_model_switching {
+                    Err(error(
+                        StatusCode::CONFLICT,
+                        "Codex 子代理的父任务配置未能核对，请从父任务重新开始",
+                    ))
+                } else {
+                    Ok(())
+                };
+            }
+            if !generation {
+                return Ok(());
+            }
+            if self.bindings.len() >= MAX_CODEX_TURNS {
+                self.bindings
+                    .retain(|_, turn| now.duration_since(turn.touched) < CODEX_TURN_IDLE);
+                if self.bindings.len() >= MAX_CODEX_TURNS {
+                    return Err(error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Codex 路由跟踪容量已满，请稍后重试",
+                    ));
+                }
+            }
+            self.bindings.insert(
+                key,
+                CodexTurn {
+                    selection,
+                    thread: scope.thread,
+                    model: model.to_owned(),
+                    effort: effort.clone(),
+                    children: HashSet::new(),
+                    touched: now,
+                },
+            );
+            return Ok(());
+        };
+        if turn.selection != selection {
+            return Err(error(
+                StatusCode::CONFLICT,
+                "Codex 连接已重新配置，请开启新任务后继续",
+            ));
+        }
+        let thread_matches = scope.parent.map_or(scope.thread == turn.thread, |parent| {
+            scope.thread != turn.thread
+                && (parent == turn.thread || turn.children.contains(&parent))
+        });
+        if !(thread_matches && model == turn.model)
+            || effort.is_some() && effort.as_deref() != turn.effort.as_deref()
+        {
+            return Err(error(
+                StatusCode::CONFLICT,
+                "Codex 当前任务与父任务的模型或思考程度不同，请为新配置开启新任务",
+            ));
+        }
+        if scope.parent.is_some() && !turn.children.contains(&scope.thread) {
+            if turn.children.len() >= MAX_SUBAGENTS_PER_TURN {
+                return Err(error(
+                    StatusCode::CONFLICT,
+                    "Codex 当前任务的子代理数量超出路由记录上限",
+                ));
+            }
+            turn.children.insert(scope.thread);
+        }
+        if effort.is_none() {
+            *effort = turn.effort.clone();
+        }
+        turn.touched = now;
+        Ok(())
+    }
+}
 
 fn equal_token(left: &str, right: &str) -> bool {
     let left = Sha256::digest(left.as_bytes());
@@ -31,7 +204,7 @@ fn provider(
     runtime: &Runtime,
     headers: &HeaderMap,
     id: &str,
-) -> std::result::Result<StoredProvider, HttpError> {
+) -> std::result::Result<(StoredProvider, Option<CodexGatewaySelection>), HttpError> {
     if !authenticated(headers, &runtime.token) {
         return Err(error(StatusCode::UNAUTHORIZED, "Rust 接入服务认证失败"));
     }
@@ -39,7 +212,7 @@ fn provider(
         .store
         .lock()
         .map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "配置服务繁忙"))?;
-    crate::agent_hub::gateway_provider(&store, id)
+    crate::agent_hub::gateway_provider_with_policy(&store, id)
         .map_err(|e| error(StatusCode::NOT_FOUND, e.message))
 }
 
@@ -108,6 +281,127 @@ fn enforce_selected_model(
     ))
 }
 
+fn requested_codex_effort(body: &Value) -> std::result::Result<Option<String>, HttpError> {
+    if body
+        .get("reasoning")
+        .is_some_and(|value| !value.is_null() && !value.is_object())
+    {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "Codex 请求的 reasoning 必须是对象",
+        ));
+    }
+    let inputs = [
+        body.get("reasoning_effort"),
+        body.pointer("/reasoning/effort"),
+    ];
+    let mut result = None;
+    for value in inputs
+        .into_iter()
+        .flatten()
+        .filter(|value| !value.is_null())
+    {
+        let effort = value
+            .as_str()
+            .filter(|value| crate::types::valid_effort(value))
+            .ok_or_else(|| error(StatusCode::BAD_REQUEST, "Codex 请求的思考程度无效"))?;
+        if result.is_some_and(|previous| previous != effort) {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "Codex 请求包含不同的思考程度",
+            ));
+        }
+        result = Some(effort);
+    }
+    Ok(result.map(str::to_owned))
+}
+
+fn request_provider(
+    runtime: &Runtime,
+    headers: &HeaderMap,
+    id: &str,
+    body: &mut Value,
+    resource: &str,
+) -> std::result::Result<StoredProvider, HttpError> {
+    let (mut provider, codex) = provider(runtime, headers, id)?;
+    if codex.is_some_and(|selection| selection.allow_native_model_switching) {
+        select_codex_request_model(&mut provider, body, resource == "messages")?;
+    } else {
+        enforce_selected_model(id, &provider, body, resource.starts_with("messages"))?;
+    }
+    if !matches!(resource, "messages/count_tokens" | "responses") {
+        crate::context_policy::guard_request(&provider.summary, body)
+            .map_err(|e| error(StatusCode::PAYLOAD_TOO_LARGE, e.message))?;
+    }
+    if let Some((selection, metadata)) = codex.zip(request_scope(body)) {
+        runtime
+            .codex_turns
+            .lock()
+            .map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "Codex 路由记录暂时不可用"))?
+            .authorize(
+                selection,
+                metadata,
+                &provider.summary.model,
+                &mut provider.summary.reasoning_effort,
+                matches!(resource, "responses" | "chat/completions" | "messages"),
+            )?;
+    }
+    Ok(provider)
+}
+
+fn select_codex_request_model(
+    provider: &mut StoredProvider,
+    body: &Value,
+    translated_messages: bool,
+) -> std::result::Result<(), HttpError> {
+    let requested = body["model"]
+        .as_str()
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "Codex 请求缺少 model"))?;
+    let default = requested == provider.summary.model;
+    let model = provider
+        .summary
+        .codex_options
+        .models
+        .iter()
+        .find(|model| model.enabled && model.id == requested)
+        .ok_or_else(|| {
+            error(
+                StatusCode::BAD_REQUEST,
+                "请在 AE Switch 同步并启用这个 Codex 模型",
+            )
+        })?;
+    if !default || provider.summary.reasoning_effort.is_none() {
+        let explicit = requested_codex_effort(body)?;
+        let converted = translated_messages
+            .then(|| reverse::translated_reasoning_effort(body, requested))
+            .flatten();
+        if matches!((&explicit, converted), (Some(requested), Some(projected)) if requested != projected)
+        {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "Codex 请求包含不同的思考程度",
+            ));
+        }
+        let effort = explicit.or_else(|| converted.map(str::to_owned));
+        if effort.as_ref().is_some_and(|value| {
+            !model.reasoning_efforts.is_empty() && !model.reasoning_efforts.contains(value)
+        }) {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "此模型不支持 Codex 请求的思考程度",
+            ));
+        }
+        provider.summary.reasoning_effort = effort;
+    }
+    if !default {
+        provider.summary.codex_options.applied_context_policy =
+            crate::codex_switching::policy_for_model(&provider.summary, requested)
+                .map_err(|e| error(StatusCode::BAD_REQUEST, e.message))?;
+        provider.summary.model = requested.to_owned();
+    }
+    Ok(())
+}
+
 pub(super) fn apply_selected_reasoning_effort(
     provider: &StoredProvider,
     body: &mut Value,
@@ -166,6 +460,7 @@ async fn forward(
     resource: &str,
     mut body: Value,
     selected: bool,
+    allow_chat_fallback: bool,
 ) -> std::result::Result<Response, HttpError> {
     validate_model(&provider, &body)?;
     if selected && matches!(resource, "responses" | "chat/completions") {
@@ -211,7 +506,8 @@ async fn forward(
         })?;
     let status =
         StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    if resource == "responses" && matches!(status.as_u16(), 404 | 405 | 501) {
+    if allow_chat_fallback && resource == "responses" && matches!(status.as_u16(), 404 | 405 | 501)
+    {
         drop(response);
         return responses_via_chat(runtime, provider, body).await;
     }
@@ -282,10 +578,26 @@ pub(super) async fn responses(
     headers: HeaderMap,
     Json(mut body): Json<Value>,
 ) -> std::result::Result<Response, HttpError> {
-    let provider = provider(&runtime, &headers, &id)?;
-    enforce_selected_model(&id, &provider, &mut body, false)?;
-    crate::context_policy::guard_request(&provider.summary, &body)
-        .map_err(|e| error(StatusCode::PAYLOAD_TOO_LARGE, e.message))?;
+    let provider = request_provider(&runtime, &headers, &id, &mut body, "responses")?;
+    let selected = id.starts_with("selected:");
+    let mut counted = false;
+    if let Err(failure) = crate::context_policy::guard_request(&provider.summary, &body) {
+        if id != "selected:codex" || failure.code != "context_policy_limit" {
+            return Err(error(StatusCode::PAYLOAD_TOO_LARGE, failure.message));
+        }
+        apply_selected_reasoning_effort(&provider, &mut body, false);
+        if !input_tokens::authorize(&runtime, &provider, &mut body).await {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(json!({"error":{
+                    "type":"uni_switch_bridge_error",
+                    "code":"context_policy_limit",
+                    "message":"当前请求超出保守上下文上限，且同一端点未确认符合 Token 限额。请先压缩会话或使用具备 Responses 输入计数的端点"
+                }})),
+            ));
+        }
+        counted = true;
+    }
     let trace = runtime.activity.begin(&id, &provider, &body, "responses");
     let result = if provider.summary.upstream_protocol() == CodexProtocol::Anthropic {
         super::responses_with_provider(runtime, provider, body).await
@@ -296,7 +608,8 @@ pub(super) async fn responses(
             headers,
             "responses",
             body,
-            id.starts_with("selected:"),
+            selected,
+            !counted,
         )
         .await
     };
@@ -309,10 +622,7 @@ pub(super) async fn compact(
     headers: HeaderMap,
     Json(mut body): Json<Value>,
 ) -> std::result::Result<Response, HttpError> {
-    let provider = provider(&runtime, &headers, &id)?;
-    enforce_selected_model(&id, &provider, &mut body, false)?;
-    crate::context_policy::guard_request(&provider.summary, &body)
-        .map_err(|e| error(StatusCode::PAYLOAD_TOO_LARGE, e.message))?;
+    let provider = request_provider(&runtime, &headers, &id, &mut body, "responses/compact")?;
     let trace = runtime
         .activity
         .begin(&id, &provider, &body, "responses/compact");
@@ -328,6 +638,7 @@ pub(super) async fn compact(
             "responses/compact",
             body,
             id.starts_with("selected:"),
+            false,
         )
         .await
     };
@@ -340,10 +651,7 @@ pub(super) async fn messages(
     headers: HeaderMap,
     Json(mut body): Json<Value>,
 ) -> std::result::Result<Response, HttpError> {
-    let provider = provider(&runtime, &headers, &id)?;
-    enforce_selected_model(&id, &provider, &mut body, true)?;
-    crate::context_policy::guard_request(&provider.summary, &body)
-        .map_err(|e| error(StatusCode::PAYLOAD_TOO_LARGE, e.message))?;
+    let provider = request_provider(&runtime, &headers, &id, &mut body, "messages")?;
     let trace = runtime.activity.begin(&id, &provider, &body, "messages");
     let result = if provider.summary.upstream_protocol() == CodexProtocol::Openai {
         reverse_http::messages_with_provider(runtime, provider, body, id.starts_with("selected:"))
@@ -356,6 +664,7 @@ pub(super) async fn messages(
             "messages",
             body,
             id.starts_with("selected:"),
+            false,
         )
         .await
     };
@@ -368,8 +677,7 @@ pub(super) async fn count_tokens(
     headers: HeaderMap,
     Json(mut body): Json<Value>,
 ) -> std::result::Result<Response, HttpError> {
-    let provider = provider(&runtime, &headers, &id)?;
-    enforce_selected_model(&id, &provider, &mut body, true)?;
+    let provider = request_provider(&runtime, &headers, &id, &mut body, "messages/count_tokens")?;
     let trace = runtime
         .activity
         .begin(&id, &provider, &body, "messages/count_tokens");
@@ -383,6 +691,7 @@ pub(super) async fn count_tokens(
             "messages/count_tokens",
             body,
             id.starts_with("selected:"),
+            false,
         )
         .await
     };
@@ -394,9 +703,11 @@ pub(super) async fn models(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<Value>, HttpError> {
-    let provider = provider(&runtime, &headers, &id)?;
+    let (provider, codex) = provider(&runtime, &headers, &id)?;
     let mut ids = vec![provider.summary.model.as_str()];
-    if !id.starts_with("selected:") {
+    if !id.starts_with("selected:")
+        || codex.is_some_and(|selection| selection.allow_native_model_switching)
+    {
         ids.extend(
             provider
                 .summary
@@ -505,10 +816,7 @@ pub(super) async fn chat(
     headers: HeaderMap,
     Json(mut body): Json<Value>,
 ) -> std::result::Result<Response, HttpError> {
-    let provider = provider(&runtime, &headers, &id)?;
-    enforce_selected_model(&id, &provider, &mut body, false)?;
-    crate::context_policy::guard_request(&provider.summary, &body)
-        .map_err(|e| error(StatusCode::PAYLOAD_TOO_LARGE, e.message))?;
+    let provider = request_provider(&runtime, &headers, &id, &mut body, "chat/completions")?;
     let trace = runtime
         .activity
         .begin(&id, &provider, &body, "chat/completions");
@@ -558,6 +866,7 @@ async fn chat_response(
             "chat/completions",
             body,
             id.starts_with("selected:"),
+            false,
         )
         .await;
     }

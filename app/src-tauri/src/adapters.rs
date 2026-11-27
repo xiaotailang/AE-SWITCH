@@ -588,34 +588,46 @@ pub fn model_catalog(provider: &StoredProvider) -> Value {
     } else {
         provider.summary.codex_options.models.as_slice()
     };
-    let models: Vec<Value> = source.iter().filter(|m| m.enabled).enumerate().map(|(index, model)| {
-        let efforts: Vec<_> = model.reasoning_efforts.iter().map(|effort| json!({"effort": effort, "description": effort})).collect();
-        json!({
-            "slug": model.id, "display_name": model.id,
-            "description": "供应商模型 · uni-switch", "visibility": "list", "supported_in_api": true,
-            "priority": if model.id == provider.summary.model { 0 } else { index + 1 },
-            "default_reasoning_level": model.reasoning_efforts.first(), "supported_reasoning_levels": efforts,
-            "shell_type": "shell_command", "availability_nux": null, "upgrade": null,
-            "base_instructions": include_str!("../resources/codex-base-instructions.md"), "model_messages": null,
-            "support_verbosity": false, "default_verbosity": null, "apply_patch_tool_type": if provider.summary.codex_options.protocol == crate::types::CodexProtocol::Anthropic {json!("freeform")} else {Value::Null},
-            "supports_reasoning_summary_parameter": false, "default_reasoning_summary": "none",
-            "context_window": model.context_window.or(provider.summary.codex_options.context_window).unwrap_or(256_000),
-            "max_context_window": model.context_window.or(provider.summary.codex_options.context_window).unwrap_or(256_000),
-            "auto_compact_token_limit": model.context_window.or(provider.summary.codex_options.context_window).unwrap_or(256_000),
-            "truncation_policy": {"mode": "tokens", "limit": 10000},
-            "experimental_supported_tools": [], "input_modalities": if provider.summary.codex_options.protocol == crate::types::CodexProtocol::Anthropic {vec!["text", "image"]} else {vec!["text"]},
-            "supports_parallel_tool_calls": false,
-            "additional_speed_tiers": if provider.summary.codex_options.fast_mode == Some(true) { vec!["fast"] } else { vec![] },
-            "service_tiers": if provider.summary.codex_options.fast_mode == Some(true) { vec![json!({"id":"priority", "name":"Fast", "description":"供应商优先服务档位"})] } else { vec![] }
-        })
-    }).collect();
-    let mut catalog = json!({"models": models});
+    let mut catalog = catalog_document(
+        &provider.summary.model,
+        &provider.summary.codex_options,
+        source,
+    );
     if provider.summary.codex_options.repair_reasoning_levels
         && !catalog["models"].as_array().unwrap().is_empty()
     {
         repair_reasoning_catalog(&mut catalog).expect("generated model catalog is valid");
     }
     catalog
+}
+
+pub(crate) fn catalog_document(
+    preferred: &str,
+    options: &crate::types::CodexOptions,
+    source: &[crate::types::ProviderModel],
+) -> Value {
+    let models: Vec<Value> = source.iter().filter(|m| m.enabled).enumerate().map(|(index, model)| {
+        let efforts: Vec<_> = model.reasoning_efforts.iter().map(|effort| json!({"effort": effort, "description": effort})).collect();
+        json!({
+            "slug": model.id, "display_name": model.id,
+            "description": "供应商模型 · uni-switch", "visibility": "list", "supported_in_api": true,
+            "priority": if model.id == preferred { 0 } else { index + 1 },
+            "default_reasoning_level": model.reasoning_efforts.first(), "supported_reasoning_levels": efforts,
+            "shell_type": "shell_command", "availability_nux": null, "upgrade": null,
+            "base_instructions": include_str!("../resources/codex-base-instructions.md"), "model_messages": null,
+            "support_verbosity": false, "default_verbosity": null, "apply_patch_tool_type": if options.protocol == crate::types::CodexProtocol::Anthropic {json!("freeform")} else {Value::Null},
+            "supports_reasoning_summary_parameter": false, "default_reasoning_summary": "none",
+            "context_window": model.context_window.or(options.context_window).unwrap_or(256_000),
+            "max_context_window": model.context_window.or(options.context_window).unwrap_or(256_000),
+            "auto_compact_token_limit": model.context_window.or(options.context_window).unwrap_or(256_000),
+            "truncation_policy": {"mode": "tokens", "limit": 10000},
+            "experimental_supported_tools": [], "input_modalities": if options.protocol == crate::types::CodexProtocol::Anthropic {vec!["text", "image"]} else {vec!["text"]},
+            "supports_parallel_tool_calls": false,
+            "additional_speed_tiers": if options.fast_mode == Some(true) { vec!["fast"] } else { vec![] },
+            "service_tiers": if options.fast_mode == Some(true) { vec![json!({"id":"priority", "name":"Fast", "description":"供应商优先服务档位"})] } else { vec![] }
+        })
+    }).collect();
+    json!({"models": models})
 }
 
 /// Change only the Fast settings in the currently applied files. Preserve the

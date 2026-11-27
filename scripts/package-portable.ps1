@@ -174,7 +174,7 @@ try {
         $location = Join-Path $packageWorkspace "app/$name"
         if (Test-Path -LiteralPath $location -PathType Leaf) { Copy-PackageFile $location $name }
     }
-    Copy-PackageTree (Join-Path $packageWorkspace 'app') 'source/ae-switch/app' @('node_modules', 'dist', 'target', '.omx', 'data') @('*.pdb')
+    Copy-PackageTree (Join-Path $packageWorkspace 'app') 'source/ae-switch/app' @('node_modules', 'dist', 'target', '.omx', 'data', '.adaptive-sse-test-temp') @('*.pdb')
     Copy-PackageTree (Join-Path $packageWorkspace 'scripts') 'source/ae-switch/scripts'
     Copy-PackageTree (Join-Path $packageWorkspace 'docs') 'source/ae-switch/docs'
     Copy-PackageFile $packageLicense 'source/ae-switch/LICENSE'
@@ -198,7 +198,8 @@ AE Switch 0.1.0 便携端点配置工具（Windows x64）
 1. 将整个文件夹放到任意可写的本地目录，无需特定盘符；保留 tools/webview2 和所有子目录。
 2. 双击 Start-AE-Switch.cmd 或 AE-Switch.exe，无需安装 AE Switch。
 3. 客户端由用户自行安装；本包不携带、安装或修改客户端程序及其 Node、Python、PowerShell 或 Git 依赖。
-4. 选择已安装客户端及其配置目录，填写供应商 API 端点与 API Key，查询真实模型列表，再选择模型并确认配置。
+4. 选择客户端，填入 API 端点和 Key。AE 会查询模型并推荐默认值。唯一的客户端位置会自动选中，有多个位置时再选择，然后点「确认连接」。
+   新接入的 Codex 如果有至少两个启用的 OpenAI 兼容编码模型，重新加载 Codex 后即可使用 /model。要调整默认策略，展开「模型设置」。
 5. AE Switch 只更新端点、认证、模型及用户明确选择的相关设置；客户端对话、历史和其他配置应予保留。
 6. 配置、重启和真实推理的结果以界面提示及独立验收报告为准。打包完成本身不代表这些验收已经通过。
 
@@ -223,6 +224,7 @@ source/ae-switch 包含此修改版公开源码和构建资料，不包含用户
         Package-Log "Archive created: $archive"
     }
     Package-Log "Portable package assembled. Real inference remains unverified: $packageDestination"
+    Remove-Item -LiteralPath $packageLog -ErrorAction Stop
     Write-Output $packageDestination
 } catch {
     $packageManifest.status = 'packaging-failed'

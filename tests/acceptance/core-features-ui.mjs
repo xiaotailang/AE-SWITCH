@@ -339,6 +339,7 @@ try {
       providerId: null,
       model: null,
       reasoningEffort: null,
+      allowNativeModelSwitching: false,
       mode: "existing",
       profile: profile(id),
       configurationRevision: 0,
@@ -378,6 +379,9 @@ try {
       calls.push({
         command,
         agentId: args?.agentId || args?.input?.agentId || null,
+        ...(typeof args?.input?.allowNativeModelSwitching === "boolean"
+          ? { allowNativeModelSwitching: args.input.allowNativeModelSwitching }
+          : {}),
       });
     const safeSnapshot = () => ({
       calls: clone(calls),
@@ -489,6 +493,7 @@ try {
             providerId: input.providerId,
             model: input.model,
             reasoningEffort: provider.reasoningEffort,
+            allowNativeModelSwitching: input.allowNativeModelSwitching ?? false,
             profile: input.profile || profile(agent.id),
             launcher: profile(agent.id).executablePath,
             needsRestart: true,
@@ -713,6 +718,10 @@ try {
     .locator("#hub-model option[value='fixture-small']")
     .waitFor({ state: "attached" });
   await page.locator("#hub-model").selectOption("fixture-small");
+  const modelSettings = page.locator(".hub-model-settings");
+  assert.equal(await modelSettings.getAttribute("open"), null);
+  await modelSettings.getByText(/Codex 内可切换/).waitFor();
+  await modelSettings.locator("summary").click();
   const longContext = page.getByRole("switch", { name: "长上下文", exact: true });
   await longContext.waitFor({ state: "visible" });
   assert.equal(await longContext.isChecked(), false);
@@ -722,6 +731,8 @@ try {
   await page.getByText(/压缩阈值 204,800 Token（80%）/).waitFor();
   await longContext.uncheck();
   await page.getByText(/压缩阈值 51,200 Token（80%）/).waitFor();
+  await modelSettings.locator("summary").click();
+  assert.equal(await modelSettings.getAttribute("open"), null);
   assert.equal(await count("save_provider"), 0);
   check("long context defaults off, requires an explicit toggle, restores the short budget and does not save a draft");
   const search = page.getByRole("textbox", { name: "搜索模型" });
@@ -825,7 +836,14 @@ try {
     Object.keys(preference['["codex","synthetic-provider"]'].recent).length,
     1,
   );
-  const commands = (await state()).calls.map((call) => call.command);
+  const connectionCalls = (await state()).calls;
+  for (const command of ["configure_agent", "probe_agent"]) {
+    const call = connectionCalls.find((entry) => entry.command === command);
+    assert.equal(call?.agentId, "codex");
+    assert.equal(call?.allowNativeModelSwitching, true);
+  }
+  check("new Codex confirms with native switching enabled and its model settings collapsed");
+  const commands = connectionCalls.map((call) => call.command);
   assert(
     commands.indexOf("discover_provider_connection") <
       commands.indexOf("save_provider"),

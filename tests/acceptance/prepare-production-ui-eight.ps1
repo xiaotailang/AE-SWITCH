@@ -5,7 +5,8 @@ param(
     [Parameter(Mandatory)][string]$PackageDirectory,
     [string]$CredentialsFile,
     [string]$InstallationsManifest,
-    [switch]$UseNativeCodexEntry
+    [switch]$UseNativeCodexEntry,
+    [switch]$IsolatedCoreAutoCleanup
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -104,16 +105,39 @@ function Write-ProductionJson([string]$Name, $Value) {
     if (Test-Path -LiteralPath $destination) { throw ('Output already exists: '+$Name) }
     [IO.File]::WriteAllText($destination, ($Value | ConvertTo-Json -Depth 40)+"`n", $utf8)
 }
-Write-ProductionJson '.ae-production-ui-eight-owner.json' ([ordered]@{schemaVersion=2;ownerId=$OwnerId;workspace=$e2eWorkspace;createdAt=[DateTimeOffset]::UtcNow.ToString('o');purpose='Independent single-page production GUI eight-tool acceptance';sourceDigest=$sourceDigest;buildAuditId=$build.id;productionSha256=$binaries['AE-Switch.exe']})
-Protect-ProductionPrivateRoot
-$portable = Assert-E2eLocalPath (Get-E2ePortableInstallationRoot)
-& robocopy.exe $package $portable /E /XJ /R:1 /W:1 /COPY:DAT /DCOPY:DAT /NFL /NDL /NJH /NJS /NP *> (Join-Path $e2eSandbox 'package-copy.log')
-if ($LASTEXITCODE -ge 8) { throw 'Owned production package copy failed.' }
-foreach ($name in $binaries.Keys) { if ((Get-ProductionHash (Join-Path $portable $name)) -cne $binaries[$name]) { throw ('Copied production binary mismatch: '+$name) } }
-Copy-Item -LiteralPath $credentials -Destination (Join-Path $portable 'acceptance-credentials.txt')
-$fixtureArguments = @{ UseNativeCodexEntry = $UseNativeCodexEntry }
-if ($PSBoundParameters.ContainsKey('InstallationsManifest')) { $fixtureArguments.InstallationsManifest = $InstallationsManifest }
-$fixtures = Initialize-E2eInstalledClientFixtures @fixtureArguments
-$setup = [ordered]@{schemaVersion=2;ownerId=$OwnerId;workspace=$e2eWorkspace;root=$e2eSandbox;privateDataAclVerified=$true;portableRoot=$portable;productionProgram=(Join-Path $portable 'AE-Switch.exe');productionSha256=$binaries['AE-Switch.exe'];binaries=$binaries;buildAuditId=$build.id;sourceDigest=$sourceDigest;sourceFiles=[int]$build.sourceFiles;auditDirectory=$buildRoot;sourceManifest=$sourceFile;buildBindings=@($bindings);package=$package;fixtures=$fixtures;wrapper=$productionWrapper;wrapperSha256=(Get-ProductionHash $productionWrapper);importedFixtureFunctions=$imports.ToArray();prepareHelper=$PSCommandPath;prepareHelperSha256=(Get-ProductionHash $PSCommandPath);officialClientCodeModified=$false;productionStarted=$false;inferenceExecuted=$false;qaHooksUsed=$false;discoveryContextInjected=$false;canonicalReportsModified=$false}
-Write-ProductionJson 'setup.json' $setup
+$e2eCleanupMode = if ($IsolatedCoreAutoCleanup) { 'isolated-core-job' } else { 'preparation-only' }
+$e2eCleanupNonce = [Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(32)).ToLowerInvariant()
+$e2eMarker = Join-Path $e2eSandbox '.ae-production-ui-eight-owner.json'
+$cleanupCapability = @{ schemaVersion=1; mode=$e2eCleanupMode; nonce=$e2eCleanupNonce }
+Write-ProductionJson '.ae-production-ui-eight-owner.json' ([ordered]@{schemaVersion=2;ownerId=$OwnerId;workspace=$e2eWorkspace;createdAt=[DateTimeOffset]::UtcNow.ToString('o');purpose='Independent single-page production GUI eight-tool acceptance';sourceDigest=$sourceDigest;buildAuditId=$build.id;productionSha256=$binaries['AE-Switch.exe'];autoCleanup=$cleanupCapability})
+$e2eNativeMarkerHash = Get-ProductionHash $e2eMarker
+try {
+    Protect-ProductionPrivateRoot
+    $portable = Assert-E2eLocalPath (Get-E2ePortableInstallationRoot)
+    & robocopy.exe $package $portable /E /XJ /R:1 /W:1 /COPY:DAT /DCOPY:DAT /NFL /NDL /NJH /NJS /NP *> (Join-Path $e2eSandbox 'package-copy.log')
+    if ($LASTEXITCODE -ge 8) { throw 'Owned production package copy failed.' }
+    foreach ($name in $binaries.Keys) { if ((Get-ProductionHash (Join-Path $portable $name)) -cne $binaries[$name]) { throw ('Copied production binary mismatch: '+$name) } }
+    $fixtureArguments = @{ UseNativeCodexEntry = $UseNativeCodexEntry }
+    if ($PSBoundParameters.ContainsKey('InstallationsManifest')) { $fixtureArguments.InstallationsManifest = $InstallationsManifest }
+    $fixtures = Initialize-E2eInstalledClientFixtures @fixtureArguments
+    $setup = [ordered]@{schemaVersion=2;ownerId=$OwnerId;workspace=$e2eWorkspace;root=$e2eSandbox;privateDataAclVerified=$true;portableRoot=$portable;productionProgram=(Join-Path $portable 'AE-Switch.exe');productionSha256=$binaries['AE-Switch.exe'];binaries=$binaries;buildAuditId=$build.id;sourceDigest=$sourceDigest;sourceFiles=[int]$build.sourceFiles;auditDirectory=$buildRoot;sourceManifest=$sourceFile;buildBindings=@($bindings);package=$package;fixtures=$fixtures;wrapper=$productionWrapper;wrapperSha256=(Get-ProductionHash $productionWrapper);importedFixtureFunctions=$imports.ToArray();prepareHelper=$PSCommandPath;prepareHelperSha256=(Get-ProductionHash $PSCommandPath);officialClientCodeModified=$false;productionStarted=$false;inferenceExecuted=$false;qaHooksUsed=$false;discoveryContextInjected=$false;canonicalReportsModified=$false}
+    if ($IsolatedCoreAutoCleanup) { $setup.autoCleanup = $cleanupCapability }
+    # The consumer can only open setup.json after fixture initialization.
+    Copy-Item -LiteralPath $credentials -Destination (Join-Path $portable 'acceptance-credentials.txt')
+    Write-ProductionJson 'setup.json' $setup
+} catch {
+    $preparationError = $_
+    try {
+        . (Join-Path $PSScriptRoot 'production-core-lifecycle.ps1')
+        foreach ($definition in Import-ProductionCoreCleanup) { . ([ScriptBlock]::Create($definition)) }
+        $e2eOwnedNativeProcesses = @{}
+        $NativeUi = $true
+        $e2eReport = Join-Path $e2eWorkspace ('artifacts/acceptance/production-preparation-cleanup-' + $OwnerId + '.json')
+        $null = Assert-E2eLocalPath $e2eReport
+        if (Test-Path -LiteralPath $e2eReport) { throw 'Fresh preparation cleanup receipt required.' }
+        Remove-ProductionCoreFixture
+        [IO.File]::WriteAllText($e2eReport, (@{ ownerId=$OwnerId; preparationPassed=$false; removed=$true; clientStarted=$false } | ConvertTo-Json), $utf8)
+    } catch { Write-Warning 'Owned preparation cleanup could not be proved. The fresh root was retained for review.' }
+    throw $preparationError
+}
 Write-Output (@{prepared=$true;ownerId=$OwnerId;setup=(Join-Path $e2eSandbox 'setup.json');buildAuditId=$build.id;sourceFiles=$build.sourceFiles;productionStarted=$false;qaHooksUsed=$false;canonicalReportsModified=$false}|ConvertTo-Json -Compress)
